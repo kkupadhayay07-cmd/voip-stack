@@ -1,0 +1,8 @@
+[package]
+name = "sip-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native SIP stack (RFC 3261): parser, transactions, dialogs, transports"
+
+[dependencies]

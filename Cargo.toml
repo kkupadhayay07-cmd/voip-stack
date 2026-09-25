@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sip-core",
+    "crates/sdp",
+    "crates/rtp",
+    "crates/b2bua",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Z.ai VoIP Engineering"]
+
+[workspace.dependencies]
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+tokio = { version = "1", features = ["full"] }
+criterion = "0.5"
+
+sip-core = { path = "crates/sip-core" }
+sdp = { path = "crates/sdp" }
+rtp = { path = "crates/rtp" }
+b2bua = { path = "crates/b2bua" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+debug = true

@@ -1,0 +1,9 @@
+/target
+**/target
+Cargo.lock.bak
+*.swp
+.DS_Store
+fuzz/artifacts
+fuzz/coverage
+demo/*.log
+demo/*.pid
