@@ -10,6 +10,7 @@ members = [
     "crates/dtls",
     "crates/ice",
     "crates/sbc",
+    "crates/media",
     "crates/proxy",
     "crates/registrar",
 ]
@@ -40,6 +41,7 @@ sip-core = { path = "crates/sip-core" }
 sdp = { path = "crates/sdp" }
 rtp = { path = "crates/rtp" }
 codecs = { path = "crates/codecs" }
+media = { path = "crates/media" }
 b2bua = { path = "crates/b2bua" }
 srtp = { path = "crates/srtp" }
 dtls = { path = "crates/dtls" }
