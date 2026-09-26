@@ -2,8 +2,8 @@
 //! (rtcp-mux RFC 5761/6878, ICE RFC 5245/8445 fields, DTLS fingerprint RFC 8122,
 //! setup RFC 4145/5763, mid/BUNDLE RFC 5888/8843).
 
-use crate::types::*;
 use crate::static_rtpmap;
+use crate::types::*;
 use std::net::IpAddr;
 
 /// A codec capability offered by the local side (ordered by preference).
@@ -142,7 +142,12 @@ pub fn answer_direction(offer: Direction, caps: Direction) -> Direction {
 fn proto_supported(proto: &str) -> bool {
     matches!(
         proto,
-        "RTP/AVP" | "RTP/AVPF" | "RTP/SAVP" | "RTP/SAVPF" | "UDP/TLS/RTP/SAVP" | "UDP/TLS/RTP/SAVPF"
+        "RTP/AVP"
+            | "RTP/AVPF"
+            | "RTP/SAVP"
+            | "RTP/SAVPF"
+            | "UDP/TLS/RTP/SAVP"
+            | "UDP/TLS/RTP/SAVPF"
     )
 }
 
@@ -231,7 +236,11 @@ fn resolve_formats(
 }
 
 fn rejected_media(offer_m: &MediaDescription) -> MediaDescription {
-    let first_fmt = offer_m.formats.first().cloned().unwrap_or_else(|| "0".into());
+    let first_fmt = offer_m
+        .formats
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "0".into());
     MediaDescription {
         media: offer_m.media.clone(),
         port: 0,
@@ -317,7 +326,11 @@ pub fn answer_session(offer: &Session, caps: &[MediaCaps]) -> Result<Session, Ne
             port: 0,
             port_count: 1,
             proto: offer_m.proto.clone(),
-            formats: vec![offer_m.formats.first().cloned().unwrap_or_else(|| "0".into())],
+            formats: vec![offer_m
+                .formats
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "0".into())],
             info: None,
             connection: None,
             bandwidths: Vec::new(),
@@ -395,8 +408,7 @@ pub fn answer_session(offer: &Session, caps: &[MediaCaps]) -> Result<Session, Ne
         let offer_dir = offer_m.effective_direction(offer);
         let ans_dir = answer_direction(offer_dir, caps_m.direction);
         m.direction = Some(ans_dir);
-        m.attributes
-            .push(Attribute::new(ans_dir.as_str(), None));
+        m.attributes.push(Attribute::new(ans_dir.as_str(), None));
 
         // rtcp-mux: only if offered and supported
         let offered_mux = offer_m.rtcp_mux || offer.has_attr("rtcp-mux");
@@ -424,7 +436,10 @@ pub fn answer_session(offer: &Session, caps: &[MediaCaps]) -> Result<Session, Ne
         }
 
         // DTLS fingerprint echo + setup role
-        let offer_fp = offer_m.fingerprint.clone().or_else(|| offer.fingerprint.clone());
+        let offer_fp = offer_m
+            .fingerprint
+            .clone()
+            .or_else(|| offer.fingerprint.clone());
         if offer_fp.is_some() {
             if let Some(fp) = &caps_m.fingerprint {
                 m.fingerprint = Some(fp.clone());
@@ -448,7 +463,8 @@ pub fn answer_session(offer: &Session, caps: &[MediaCaps]) -> Result<Session, Ne
         // ptime echo when offered
         if let Some(p) = offer_m.ptime {
             m.ptime = Some(p);
-            m.attributes.push(Attribute::new("ptime", Some(p.to_string())));
+            m.attributes
+                .push(Attribute::new("ptime", Some(p.to_string())));
         }
 
         m.connection = Some(Connection {
@@ -563,10 +579,7 @@ a=ssrc:3520455752 cname:xyz\r\n";
         assert_eq!(m.mid.as_deref(), Some("0"));
         assert_eq!(m.ice_ufrag.as_deref(), Some("EsAw"));
         assert_eq!(m.setup, Some(SetupRole::Actpass));
-        assert_eq!(
-            m.fingerprint.as_ref().unwrap().hash_func,
-            "sha-256"
-        );
+        assert_eq!(m.fingerprint.as_ref().unwrap().hash_func, "sha-256");
         assert_eq!(m.rtpmaps[&111].encoding, "opus");
         assert_eq!(m.rtpmaps[&111].channels, Some(2));
         assert_eq!(m.ssrcs.len(), 1);
@@ -582,7 +595,9 @@ a=ssrc:3520455752 cname:xyz\r\n";
             vec![
                 CodecCap::new("PCMU", 8000, 0),
                 CodecCap::new("PCMA", 8000, 8),
-                CodecCap::new("opus", 48000, 111).with_channels(2).with_fmtp("minptime=10;useinbandfec=1"),
+                CodecCap::new("opus", 48000, 111)
+                    .with_channels(2)
+                    .with_fmtp("minptime=10;useinbandfec=1"),
             ],
         );
         c.telephone_event = Some(CodecCap::new("telephone-event", 8000, 101).with_fmtp("0-16"));
@@ -613,7 +628,10 @@ a=ssrc:3520455752 cname:xyz\r\n";
         assert!(m.rtpmaps.contains_key(&101));
         // static formats don't need rtpmap lines
         assert!(!m.attributes.iter().any(|a| a.name == "rtpmap"
-            && a.value.as_deref().map(|v| v.starts_with("0 PCMU")).unwrap_or(false)));
+            && a.value
+                .as_deref()
+                .map(|v| v.starts_with("0 PCMU"))
+                .unwrap_or(false)));
         assert_eq!(m.ice_ufrag.as_deref(), Some("ourfrag"));
         assert_eq!(m.connection.as_ref().unwrap().address, "10.0.0.5");
         let rt = parse(&answer.serialize()).unwrap();

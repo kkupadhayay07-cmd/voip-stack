@@ -1,18 +1,23 @@
 use bytes::{Bytes, BytesMut};
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BatchSize};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use rtp::jitter::{JitterBuffer, JitterConfig, PushResult};
-use rtp::rtcp::{parse_compound, RtcpPacket, ReportBlock, SenderInfo};
+use rtp::rtcp::{parse_compound, ReportBlock, RtcpPacket, SenderInfo};
 use rtp::RtpPacket;
 
 fn bench_rtp_parse(c: &mut Criterion) {
-    let pkt = RtpPacket::new(0, 42, 640, 0xCAFEBABE, false, Bytes::from(vec![0x55u8; 160]));
+    let pkt = RtpPacket::new(
+        0,
+        42,
+        640,
+        0xCAFEBABE,
+        false,
+        Bytes::from(vec![0x55u8; 160]),
+    );
     let wire = pkt.encode();
     c.bench_function("rtp_parse_160b", |b| {
         b.iter(|| RtpPacket::parse(black_box(&wire)).unwrap())
     });
-    c.bench_function("rtp_encode_160b", |b| {
-        b.iter(|| black_box(pkt.encode()))
-    });
+    c.bench_function("rtp_encode_160b", |b| b.iter(|| black_box(pkt.encode())));
 }
 
 fn bench_rtcp(c: &mut Criterion) {

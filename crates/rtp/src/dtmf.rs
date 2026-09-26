@@ -66,9 +66,7 @@ pub fn parse_event(payload: &[u8]) -> Result<DtmfEvent, RtpError> {
 pub fn encode_event(e: &DtmfEvent) -> [u8; 4] {
     let mut out = [0u8; 4];
     out[0] = e.event;
-    out[1] = if e.end { 0x80 } else { 0 }
-        | if e.reserved { 0x40 } else { 0 }
-        | (e.volume & 0x3F);
+    out[1] = if e.end { 0x80 } else { 0 } | if e.reserved { 0x40 } else { 0 } | (e.volume & 0x3F);
     out[2..4].copy_from_slice(&e.duration.to_be_bytes());
     out
 }

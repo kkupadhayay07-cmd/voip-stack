@@ -67,10 +67,7 @@ mod tests {
             col: 7,
             what: "bad thing".to_string(),
         };
-        assert_eq!(
-            e.to_string(),
-            "malformed at line 3, col 7: bad thing"
-        );
+        assert_eq!(e.to_string(), "malformed at line 3, col 7: bad thing");
         assert_eq!(
             ParseError::TooLarge { limit: 65536 }.to_string(),
             "message exceeds limit 65536"

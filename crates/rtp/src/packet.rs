@@ -1,7 +1,7 @@
 //! RTP packet layer (RFC 3550 §5) with RFC 8285 header extensions.
 
-use bytes::{Bytes, BytesMut};
 use bytes::BufMut;
+use bytes::{Bytes, BytesMut};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,7 +252,10 @@ mod tests {
         // version 1
         let mut v1 = vec![0x40u8, 0, 0, 1];
         v1.extend_from_slice(&[0u8; 8]);
-        assert!(matches!(RtpPacket::parse(&v1), Err(RtpError::BadVersion(1))));
+        assert!(matches!(
+            RtpPacket::parse(&v1),
+            Err(RtpError::BadVersion(1))
+        ));
         // bad csrc count (declares 15 but buffer too small)
         let mut bad = vec![0x8Fu8, 0, 0, 1];
         bad.extend_from_slice(&[0u8; 8]);

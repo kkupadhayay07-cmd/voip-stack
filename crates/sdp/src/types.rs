@@ -279,7 +279,10 @@ fn write_attr(out: &mut String, a: &Attribute) {
 }
 
 fn write_connection(out: &mut String, c: &Connection) {
-    out.push_str(&format!("c={} {} {}\r\n", c.net_type, c.addr_type, c.address));
+    out.push_str(&format!(
+        "c={} {} {}\r\n",
+        c.net_type, c.addr_type, c.address
+    ));
 }
 
 fn write_bandwidths(out: &mut String, bws: &[Bandwidth]) {

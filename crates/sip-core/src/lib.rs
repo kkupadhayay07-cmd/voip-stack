@@ -56,7 +56,7 @@ pub mod uri;
 pub use digest::{Algorithm, Qop};
 pub use error::{ParseError, Result};
 pub use headers::{
-    Allow, AllowEvents, AuthChallenge, AuthResponse, ContactList, ContentLength, ContentType, CSeq,
+    Allow, AllowEvents, AuthChallenge, AuthResponse, CSeq, ContactList, ContentLength, ContentType,
     Event, Expires, FromTo, HeaderMap, MaxForwards, MinSe, ProxyRequire, RAck, Reason, ReferTo,
     Require, RetryAfter, RouteSet, SessionExpires, SubscriptionState, Supported, TokenList, Via,
 };

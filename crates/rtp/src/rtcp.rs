@@ -81,15 +81,39 @@ pub struct SdesChunk {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RtcpPacket {
     SenderReport(SenderInfo, Vec<ReportBlock>),
-    ReceiverReport { ssrc: u32, blocks: Vec<ReportBlock> },
+    ReceiverReport {
+        ssrc: u32,
+        blocks: Vec<ReportBlock>,
+    },
     Sdes(Vec<SdesChunk>),
-    Bye { ssrcs: Vec<u32>, reason: Option<String> },
-    App { subtype: u8, ssrc: u32, name: [u8; 4], data: Vec<u8> },
+    Bye {
+        ssrcs: Vec<u32>,
+        reason: Option<String>,
+    },
+    App {
+        subtype: u8,
+        ssrc: u32,
+        name: [u8; 4],
+        data: Vec<u8>,
+    },
     /// Generic transport feedback: NACK (fmt=1), TWCC (fmt=15), etc.
-    Rtpfb { fmt: u8, sender_ssrc: u32, media_ssrc: u32, payload: Vec<u8> },
+    Rtpfb {
+        fmt: u8,
+        sender_ssrc: u32,
+        media_ssrc: u32,
+        payload: Vec<u8>,
+    },
     /// Payload-specific feedback: PLI (fmt=1), FIR (fmt=4), etc.
-    Psfb { fmt: u8, sender_ssrc: u32, media_ssrc: u32, payload: Vec<u8> },
-    Unknown { pt: u8, payload: Vec<u8> },
+    Psfb {
+        fmt: u8,
+        sender_ssrc: u32,
+        media_ssrc: u32,
+        payload: Vec<u8>,
+    },
+    Unknown {
+        pt: u8,
+        payload: Vec<u8>,
+    },
 }
 
 const RT: u8 = 0x80;
@@ -109,7 +133,12 @@ fn read_report_blocks(buf: &[u8], count: usize, off: usize) -> Result<Vec<Report
             ssrc: u32::from_be_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]),
             fraction_lost: buf[o + 4],
             cumulative_lost: u32::from_be_bytes([0, buf[o + 5], buf[o + 6], buf[o + 7]]),
-            highest_sequence: u32::from_be_bytes([buf[o + 8], buf[o + 9], buf[o + 10], buf[o + 11]]),
+            highest_sequence: u32::from_be_bytes([
+                buf[o + 8],
+                buf[o + 9],
+                buf[o + 10],
+                buf[o + 11],
+            ]),
             interarrival_jitter: u32::from_be_bytes([
                 buf[o + 12],
                 buf[o + 13],
@@ -180,7 +209,8 @@ pub fn parse_compound(buf: &[u8]) -> Result<Vec<RtcpPacket>, RtpError> {
                     if body.len() < co + 4 {
                         return Err(RtpError::Truncated);
                     }
-                    let ssrc = u32::from_be_bytes([body[co], body[co + 1], body[co + 2], body[co + 3]]);
+                    let ssrc =
+                        u32::from_be_bytes([body[co], body[co + 1], body[co + 2], body[co + 3]]);
                     co += 4;
                     let mut items = Vec::new();
                     loop {
@@ -205,7 +235,8 @@ pub fn parse_compound(buf: &[u8]) -> Result<Vec<RtcpPacket>, RtpError> {
                         if body.len() < co + 2 + ilen {
                             return Err(RtpError::Truncated);
                         }
-                        let val = String::from_utf8_lossy(&body[co + 2..co + 2 + ilen]).into_owned();
+                        let val =
+                            String::from_utf8_lossy(&body[co + 2..co + 2 + ilen]).into_owned();
                         items.push((itype, val));
                         co += 2 + ilen;
                     }
@@ -220,7 +251,12 @@ pub fn parse_compound(buf: &[u8]) -> Result<Vec<RtcpPacket>, RtpError> {
                     if body.len() < o + 4 {
                         return Err(RtpError::Truncated);
                     }
-                    ssrcs.push(u32::from_be_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]));
+                    ssrcs.push(u32::from_be_bytes([
+                        body[o],
+                        body[o + 1],
+                        body[o + 2],
+                        body[o + 3],
+                    ]));
                 }
                 // optional reason after SSRCs (padded)
                 let mut reason = None;
@@ -228,7 +264,9 @@ pub fn parse_compound(buf: &[u8]) -> Result<Vec<RtcpPacket>, RtpError> {
                 if body.len() > ro {
                     let rlen = body[ro] as usize;
                     if body.len() >= ro + 1 + rlen {
-                        reason = Some(String::from_utf8_lossy(&body[ro + 1..ro + 1 + rlen]).into_owned());
+                        reason = Some(
+                            String::from_utf8_lossy(&body[ro + 1..ro + 1 + rlen]).into_owned(),
+                        );
                     }
                 }
                 RtcpPacket::Bye { ssrcs, reason }
@@ -253,9 +291,19 @@ pub fn parse_compound(buf: &[u8]) -> Result<Vec<RtcpPacket>, RtpError> {
                 let media = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
                 let payload = body[8..].to_vec();
                 if pt == 205 {
-                    RtcpPacket::Rtpfb { fmt, sender_ssrc: sender, media_ssrc: media, payload }
+                    RtcpPacket::Rtpfb {
+                        fmt,
+                        sender_ssrc: sender,
+                        media_ssrc: media,
+                        payload,
+                    }
                 } else {
-                    RtcpPacket::Psfb { fmt, sender_ssrc: sender, media_ssrc: media, payload }
+                    RtcpPacket::Psfb {
+                        fmt,
+                        sender_ssrc: sender,
+                        media_ssrc: media,
+                        payload,
+                    }
                 }
             }
             other => RtcpPacket::Unknown {
@@ -304,7 +352,12 @@ pub fn encode_compound(packets: &[RtcpPacket]) -> Vec<u8> {
             RtcpPacket::SenderReport(si, blocks) => {
                 // body after the 4-byte header: ssrc(4) + sender info(20) + blocks
                 let body_len = 24 + blocks.len() * 24;
-                put_header(&mut out, blocks.len() as u8 & 0x1F, 200, body_words(body_len));
+                put_header(
+                    &mut out,
+                    blocks.len() as u8 & 0x1F,
+                    200,
+                    body_words(body_len),
+                );
                 out.extend_from_slice(&si.ssrc.to_be_bytes());
                 out.extend_from_slice(&si.ntp_sec.to_be_bytes());
                 out.extend_from_slice(&si.ntp_frac.to_be_bytes());
@@ -317,7 +370,12 @@ pub fn encode_compound(packets: &[RtcpPacket]) -> Vec<u8> {
             }
             RtcpPacket::ReceiverReport { ssrc, blocks } => {
                 let body_len = 4 + blocks.len() * 24;
-                put_header(&mut out, blocks.len() as u8 & 0x1F, 201, body_words(body_len));
+                put_header(
+                    &mut out,
+                    blocks.len() as u8 & 0x1F,
+                    201,
+                    body_words(body_len),
+                );
                 out.extend_from_slice(&ssrc.to_be_bytes());
                 for b in blocks {
                     encode_report_block(&mut out, b);
@@ -348,7 +406,12 @@ pub fn encode_compound(packets: &[RtcpPacket]) -> Vec<u8> {
                 if !rbytes.is_empty() {
                     body_len += 1 + rbytes.len();
                 }
-                put_header(&mut out, ssrcs.len() as u8 & 0x1F, 203, body_words(body_len));
+                put_header(
+                    &mut out,
+                    ssrcs.len() as u8 & 0x1F,
+                    203,
+                    body_words(body_len),
+                );
                 for s in ssrcs {
                     out.extend_from_slice(&s.to_be_bytes());
                 }
@@ -359,7 +422,12 @@ pub fn encode_compound(packets: &[RtcpPacket]) -> Vec<u8> {
                     out.extend(std::iter::repeat(0).take(pad));
                 }
             }
-            RtcpPacket::App { subtype, ssrc, name, data } => {
+            RtcpPacket::App {
+                subtype,
+                ssrc,
+                name,
+                data,
+            } => {
                 let body_len = 8 + data.len();
                 put_header(&mut out, subtype & 0x1F, 204, body_words(body_len));
                 out.extend_from_slice(&ssrc.to_be_bytes());
@@ -368,9 +436,23 @@ pub fn encode_compound(packets: &[RtcpPacket]) -> Vec<u8> {
                 let pad = pad4(data.len());
                 out.extend(std::iter::repeat(0).take(pad));
             }
-            RtcpPacket::Rtpfb { fmt, sender_ssrc, media_ssrc, payload }
-            | RtcpPacket::Psfb { fmt, sender_ssrc, media_ssrc, payload } => {
-                let pt = if matches!(p, RtcpPacket::Rtpfb { .. }) { 205 } else { 206 };
+            RtcpPacket::Rtpfb {
+                fmt,
+                sender_ssrc,
+                media_ssrc,
+                payload,
+            }
+            | RtcpPacket::Psfb {
+                fmt,
+                sender_ssrc,
+                media_ssrc,
+                payload,
+            } => {
+                let pt = if matches!(p, RtcpPacket::Rtpfb { .. }) {
+                    205
+                } else {
+                    206
+                };
                 let body_len = 8 + payload.len();
                 put_header(&mut out, *fmt & 0x1F, pt, body_words(body_len));
                 out.extend_from_slice(&sender_ssrc.to_be_bytes());

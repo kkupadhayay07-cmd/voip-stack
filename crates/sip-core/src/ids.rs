@@ -52,14 +52,18 @@ mod tests {
         let b = new_branch();
         assert!(b.starts_with("z9hG4bK"));
         assert_eq!(b.len(), 7 + 16);
-        assert!(b[7..].bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(b[7..]
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
     fn tag_shape() {
         let t = new_tag();
         assert_eq!(t.len(), 12);
-        assert!(t.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(t
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]

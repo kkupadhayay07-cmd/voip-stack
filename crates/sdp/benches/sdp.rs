@@ -31,9 +31,7 @@ fn bench_sdp_parse(c: &mut Criterion) {
 
 fn bench_sdp_roundtrip(c: &mut Criterion) {
     let sess = parse(OFFER).unwrap();
-    c.bench_function("sdp_serialize", |b| {
-        b.iter(|| black_box(sess.serialize()))
-    });
+    c.bench_function("sdp_serialize", |b| b.iter(|| black_box(sess.serialize())));
 }
 
 criterion_group!(benches, bench_sdp_parse, bench_sdp_roundtrip);

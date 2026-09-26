@@ -193,9 +193,7 @@ impl JitterBuffer {
     /// Due time (virtual ms) of the next expected slot.
     fn next_due_ms(&self) -> Option<f64> {
         let a = self.anchor.as_ref()?;
-        let grace = self.samples_to_ms(
-            self.frame_samples() * self.cfg.conceal_grace_frames as i64,
-        );
+        let grace = self.samples_to_ms(self.frame_samples() * self.cfg.conceal_grace_frames as i64);
         Some(self.due_ms(a, self.next_ts) + grace)
     }
 
@@ -624,7 +622,12 @@ mod tests {
         }
         push(&mut b, seq, ts, t + 300);
         let shrunk = b.target_delay_ms();
-        assert!(shrunk < grown - 5.0, "target did not shrink: {} -> {}", grown, shrunk);
+        assert!(
+            shrunk < grown - 5.0,
+            "target did not shrink: {} -> {}",
+            grown,
+            shrunk
+        );
         assert!(shrunk >= b.cfg.min_delay_ms as f64);
         assert!(grown <= b.cfg.max_delay_ms as f64);
     }

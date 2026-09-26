@@ -21,11 +21,9 @@ pub mod rtcp;
 
 pub use dtmf::{decode_digit, encode_digit, DtmfEvent};
 pub use g711::{pcma_decode, pcma_encode, pcmu_decode, pcmu_encode};
-pub use jitter::{JitterBuffer, JitterConfig, JbStats, PushResult, RtpFrame};
+pub use jitter::{JbStats, JitterBuffer, JitterConfig, PushResult, RtpFrame};
 pub use packet::{RtpError, RtpExtension, RtpHeader, RtpPacket};
-pub use rtcp::{
-    parse_compound, ReportBlock, RtcpPacket, SenderInfo, SdesChunk, SdesType,
-};
+pub use rtcp::{parse_compound, ReportBlock, RtcpPacket, SdesChunk, SdesType, SenderInfo};
 
 /// RFC 5761 §4: does this datagram look like RTCP rather than RTP?
 ///

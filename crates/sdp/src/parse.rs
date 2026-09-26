@@ -24,7 +24,11 @@ pub enum SdpErrorKind {
 
 impl std::fmt::Display for SdpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "sdp error (line {}): {:?}: {}", self.line, self.kind, self.msg)
+        write!(
+            f,
+            "sdp error (line {}): {:?}: {}",
+            self.line, self.kind, self.msg
+        )
     }
 }
 
@@ -573,11 +577,14 @@ fn apply_media_attr(m: &mut MediaBuilder, attr: Attribute, line: usize) -> Resul
         "ssrc" => {
             if let Some(v) = attr.value.as_deref() {
                 let mut it = v.splitn(2, ' ');
-                let ssrc = it.next().and_then(|s| s.parse::<u32>().ok()).ok_or(SdpError {
-                    kind: SdpErrorKind::InvalidValue,
-                    line,
-                    msg: format!("bad ssrc {:?}", v),
-                })?;
+                let ssrc = it
+                    .next()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .ok_or(SdpError {
+                        kind: SdpErrorKind::InvalidValue,
+                        line,
+                        msg: format!("bad ssrc {:?}", v),
+                    })?;
                 let rest = it.next().unwrap_or("");
                 let (aname, aval) = match rest.split_once(':') {
                     Some((n, v)) => (n, Some(v.to_owned())),
@@ -596,11 +603,14 @@ fn apply_media_attr(m: &mut MediaBuilder, attr: Attribute, line: usize) -> Resul
             if attr.name == "rtpmap" || attr.name == "fmtp" || attr.name == "rtcp-fb" {
                 let v = attr.value.as_deref().unwrap_or("");
                 let mut it = v.splitn(2, ' ');
-                let pt = it.next().and_then(|p| p.parse::<u8>().ok()).ok_or(SdpError {
-                    kind: SdpErrorKind::InvalidValue,
-                    line,
-                    msg: format!("bad payload type in {:?}", v),
-                })?;
+                let pt = it
+                    .next()
+                    .and_then(|p| p.parse::<u8>().ok())
+                    .ok_or(SdpError {
+                        kind: SdpErrorKind::InvalidValue,
+                        line,
+                        msg: format!("bad payload type in {:?}", v),
+                    })?;
                 let rest = it.next().unwrap_or("");
                 match attr.name.as_str() {
                     "rtpmap" => {
@@ -703,11 +713,15 @@ fn parse_rtpmap_value(value: &str, line: usize) -> Result<(String, u32, Option<u
                     msg: format!("bad channel count {:?}", ch),
                 })?),
             ),
-            None => (e, rest.parse::<u32>().map_err(|_| SdpError {
-                kind: SdpErrorKind::InvalidValue,
-                line,
-                msg: format!("bad clock rate {:?}", rest),
-            })?, None),
+            None => (
+                e,
+                rest.parse::<u32>().map_err(|_| SdpError {
+                    kind: SdpErrorKind::InvalidValue,
+                    line,
+                    msg: format!("bad clock rate {:?}", rest),
+                })?,
+                None,
+            ),
         },
         None => {
             return Err(SdpError {
@@ -787,7 +801,10 @@ mod tests {
         assert!(parse("o=- 1 1 IN IP4 x\r\ns=\r\nt=0 0\r\n").is_err()); // missing v
         assert!(parse("v=0\r\no=- 1 1 IN IP4 x\r\ns=\r\n").is_err()); // missing t
         assert!(parse("v=1\r\no=- 1 1 IN IP4 x\r\ns=\r\nt=0 0\r\n").is_err());
-        assert!(parse("v=0\r\no=- 1 1 IN IP4 x\r\ns=\r\nt=0 0\r\nm=audio notaport RTP/AVP 0\r\n").is_err());
+        assert!(
+            parse("v=0\r\no=- 1 1 IN IP4 x\r\ns=\r\nt=0 0\r\nm=audio notaport RTP/AVP 0\r\n")
+                .is_err()
+        );
         assert!(parse("v=0\r\no=- 1 1 IN IP4 x\r\ns=\r\nt=0 0\r\na=\r\n").is_err());
         // r= without t=
         assert!(parse("v=0\r\no=- 1 1 IN IP4 x\r\ns=\r\nr=604800\r\n").is_err());

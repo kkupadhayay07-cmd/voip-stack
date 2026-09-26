@@ -73,7 +73,12 @@ pub fn pcma_decode(code: u8) -> i16 {
 pub fn pcma_encode(sample: i16) -> u8 {
     let mut x = sample as i32;
     // internal sign bit: 0x80 = positive (A-law); wire = internal ^ 0x55
-    let sign: u32 = if x >= 0 { 0x80 } else { x = -x; 0x00 };
+    let sign: u32 = if x >= 0 {
+        0x80
+    } else {
+        x = -x;
+        0x00
+    };
     if x > 32_767 {
         x = 32_767;
     }
@@ -136,28 +141,55 @@ mod tests {
     fn pcmu_roundtrip_error_bounded() {
         // μ-law quantization: truncation error bounded by one segment step;
         // safe envelope: |s|/8 + 80
-        for s in [-32_768i16, -32_767, -10_000, -1_000, -256, -1, 0, 1, 8, 255, 256, 1_000, 12_345, 32_767] {
+        for s in [
+            -32_768i16, -32_767, -10_000, -1_000, -256, -1, 0, 1, 8, 255, 256, 1_000, 12_345,
+            32_767,
+        ] {
             let back = pcmu_decode(pcmu_encode(s));
             let err = (back as i32 - s as i32).abs();
-            assert!(err <= s.unsigned_abs() as i32 / 8 + 80, "pcmu roundtrip {} -> {} err {}", s, back, err);
+            assert!(
+                err <= s.unsigned_abs() as i32 / 8 + 80,
+                "pcmu roundtrip {} -> {} err {}",
+                s,
+                back,
+                err
+            );
         }
         // small amplitudes are tightly coded (segment 0 step = 8)
         for s in -64i16..=64 {
             let back = pcmu_decode(pcmu_encode(s));
-            assert!((back as i32 - s as i32).abs() <= 16, "pcmu small {} -> {}", s, back);
+            assert!(
+                (back as i32 - s as i32).abs() <= 16,
+                "pcmu small {} -> {}",
+                s,
+                back
+            );
         }
     }
 
     #[test]
     fn pcma_roundtrip_error_bounded() {
-        for s in [-32_768i16, -32_767, -10_000, -1_000, -256, -1, 0, 1, 128, 1_000, 12_345, 32_767] {
+        for s in [
+            -32_768i16, -32_767, -10_000, -1_000, -256, -1, 0, 1, 128, 1_000, 12_345, 32_767,
+        ] {
             let back = pcma_decode(pcma_encode(s));
             let err = (back as i32 - s as i32).abs();
-            assert!(err <= s.unsigned_abs() as i32 / 8 + 80, "pcma roundtrip {} -> {} err {}", s, back, err);
+            assert!(
+                err <= s.unsigned_abs() as i32 / 8 + 80,
+                "pcma roundtrip {} -> {} err {}",
+                s,
+                back,
+                err
+            );
         }
         for s in -64i16..=64 {
             let back = pcma_decode(pcma_encode(s));
-            assert!((back as i32 - s as i32).abs() <= 16, "pcma small {} -> {}", s, back);
+            assert!(
+                (back as i32 - s as i32).abs() <= 16,
+                "pcma small {} -> {}",
+                s,
+                back
+            );
         }
     }
 
