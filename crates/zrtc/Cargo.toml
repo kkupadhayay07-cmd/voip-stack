@@ -1,0 +1,46 @@
+[package]
+name = "zrtc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "zrtc daemon: single voice service wiring the native SIP + media library stack (SIP listeners over UDP/TCP/TLS/WSS, SBC, proxy, registrar, B2BUA, media, AI bridge, REST API)"
+
+[[bin]]
+name = "zrtc"
+path = "src/main.rs"
+
+[dependencies]
+sip-core = { workspace = true }
+sdp = { workspace = true }
+rtp = { workspace = true }
+codecs = { workspace = true }
+b2bua = { workspace = true }
+sbc = { workspace = true }
+proxy = { workspace = true }
+registrar = { workspace = true }
+cdr = { workspace = true }
+api = { path = "../api" }
+dialer = { workspace = true }
+media = { workspace = true }
+ai-bridge = { workspace = true }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = { workspace = true }
+axum = { workspace = true }
+futures-util = "0.3"
+
+# TLS (server + client) on top of the OpenSSL backend already used by `dtls`.
+openssl = "0.10"
+tokio-openssl = "0.6"
+
+# SIP-over-WSS (RFC 7118): WebSocket handshake on top of an established TLS
+# stream (server accept + client connect use the same OpenSSL backend).
+tokio-tungstenite = "0.24"
+
+# Config file parsing.
+toml = "0.8"

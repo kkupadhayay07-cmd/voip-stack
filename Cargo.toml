@@ -17,6 +17,7 @@ members = [
     "crates/cdr",
     "crates/proxy",
     "crates/registrar",
+    "crates/zrtc",
 ]
 
 [workspace.package]
