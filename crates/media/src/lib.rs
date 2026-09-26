@@ -236,6 +236,7 @@ impl Recorder {
 /// Energy + zero-crossing voice activity detector with hangover.
 #[derive(Debug)]
 pub struct Vad {
+    #[allow(dead_code)] // reserved for duration-aware decisions
     rate: u32,
     /// Energy threshold (RMS^2), auto-calibrated around a noise floor.
     energy_threshold: f32,

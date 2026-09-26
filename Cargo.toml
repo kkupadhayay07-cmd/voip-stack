@@ -11,6 +11,10 @@ members = [
     "crates/ice",
     "crates/sbc",
     "crates/media",
+    "crates/dialer",
+    "crates/ai-bridge",
+    "crates/api",
+    "crates/cdr",
     "crates/proxy",
     "crates/registrar",
 ]
@@ -35,6 +39,8 @@ hex = "0.4"
 md-5 = "0.10"
 sha2 = "0.10"
 async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+axum = { version = "0.8", features = ["ws"] }
 opus = "0.3"
 
 sip-core = { path = "crates/sip-core" }
@@ -42,6 +48,9 @@ sdp = { path = "crates/sdp" }
 rtp = { path = "crates/rtp" }
 codecs = { path = "crates/codecs" }
 media = { path = "crates/media" }
+dialer = { path = "crates/dialer" }
+ai-bridge = { path = "crates/ai-bridge" }
+cdr = { path = "crates/cdr" }
 b2bua = { path = "crates/b2bua" }
 srtp = { path = "crates/srtp" }
 dtls = { path = "crates/dtls" }

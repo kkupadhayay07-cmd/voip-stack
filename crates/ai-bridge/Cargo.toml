@@ -1,0 +1,20 @@
+[package]
+name = "ai-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AI bridge: AudioSocket TCP framing + WebSocket media tap, bidirectional streaming for STT→LLM→TTS pipelines, VAD events, barge-in"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+media = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

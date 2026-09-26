@@ -31,6 +31,7 @@ impl Default for ResamplerConfig {
 pub struct Resampler {
     from_hz: u32,
     to_hz: u32,
+    #[allow(dead_code)] // kept for runtime retuning
     config: ResamplerConfig,
     history: Vec<f32>,
     /// Absolute input position of `history[0]`.
