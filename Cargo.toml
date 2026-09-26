@@ -4,6 +4,7 @@ members = [
     "crates/sip-core",
     "crates/sdp",
     "crates/rtp",
+    "crates/codecs",
     "crates/b2bua",
 ]
 
@@ -21,10 +22,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
 tokio = { version = "1", features = ["full"] }
 criterion = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+md-5 = "0.10"
+sha2 = "0.10"
+async-trait = "0.1"
+opus = "0.3"
 
 sip-core = { path = "crates/sip-core" }
 sdp = { path = "crates/sdp" }
 rtp = { path = "crates/rtp" }
+codecs = { path = "crates/codecs" }
 b2bua = { path = "crates/b2bua" }
 
 [profile.release]

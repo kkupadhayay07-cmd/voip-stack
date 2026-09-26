@@ -210,7 +210,7 @@ impl MediaDescription {
     }
 
     /// Media-level attribute lookup, falling back to a session-level attribute.
-    pub fn attr<'s>(&self, session: &'s Session, name: &str) -> Option<&'s str> {
+    pub fn attr<'a>(&'a self, session: &'a Session, name: &str) -> Option<&'a str> {
         self.attributes
             .iter()
             .find(|a| a.name == name)

@@ -1,0 +1,17 @@
+[package]
+name = "codecs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native audio codec suite: Opus, G.711 (PCMU/PCMA), G.722, G.729, L16, CN, PLC, resampler"
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+opus = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+default = ["opus"]
+opus = ["dep:opus"]

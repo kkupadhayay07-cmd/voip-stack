@@ -6,3 +6,9 @@ license.workspace = true
 description = "Native SIP stack (RFC 3261): parser, transactions, dialogs, transports"
 
 [dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+md-5 = { workspace = true }
+sha2 = { workspace = true }

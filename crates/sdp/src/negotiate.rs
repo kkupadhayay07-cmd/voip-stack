@@ -359,7 +359,8 @@ pub fn answer_session(offer: &Session, caps: &[MediaCaps]) -> Result<Session, Ne
 
         let resolved = resolve_formats(offer_m, offer, caps_m);
         if resolved.is_empty() {
-            answer.medias.push(m);
+            // RFC 3264 §6: no acceptable codec ⇒ reject this m-line with port 0.
+            answer.medias.push(rejected);
             continue;
         }
 
@@ -371,10 +372,22 @@ pub fn answer_session(offer: &Session, caps: &[MediaCaps]) -> Result<Session, Ne
                     None => format!("{} {}/{}", r.pt, r.cap.name, r.cap.clock),
                 };
                 m.attributes.push(Attribute::new("rtpmap", Some(v)));
+                // Typed projection must mirror the wire attribute so that
+                // `stream_plans()` and callers see the negotiated codecs.
+                m.rtpmaps.insert(
+                    r.pt,
+                    RtpMap {
+                        payload: r.pt,
+                        encoding: r.cap.name.clone(),
+                        clock_rate: r.cap.clock,
+                        channels: r.cap.channels,
+                    },
+                );
             }
             if let Some(f) = &r.cap.fmtp {
                 m.attributes
                     .push(Attribute::new("fmtp", Some(format!("{} {}", r.pt, f))));
+                m.fmtps.insert(r.pt, f.clone());
             }
         }
 
@@ -386,7 +399,7 @@ pub fn answer_session(offer: &Session, caps: &[MediaCaps]) -> Result<Session, Ne
             .push(Attribute::new(ans_dir.as_str(), None));
 
         // rtcp-mux: only if offered and supported
-        let offered_mux = offer_m.rtcp_mux || offer.rtcp_mux;
+        let offered_mux = offer_m.rtcp_mux || offer.has_attr("rtcp-mux");
         if offered_mux && caps_m.rtcp_mux {
             m.rtcp_mux = true;
             m.attributes.push(Attribute::new("rtcp-mux", None));
@@ -496,7 +509,7 @@ pub fn stream_plans(session: &Session) -> Vec<StreamPlan> {
             remote_pt: first_pt.unwrap_or(0),
             codec,
             direction: dir,
-            rtcp_mux: m.rtcp_mux || session.rtcp_mux || m.has_attr(session, "rtcp-mux"),
+            rtcp_mux: m.rtcp_mux || m.has_attr(session, "rtcp-mux"),
             remote_addr,
             remote_port: m.port,
             telephone_event_pt: te_pt,

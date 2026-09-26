@@ -449,7 +449,7 @@ fn parse_media(value: &str, line: usize) -> Result<MediaBuilder, SdpError> {
         port,
         port_count,
         proto: parts[2].to_owned(),
-        formats: parts[3..].iter().map(|s| s.to_owned()).collect(),
+        formats: parts[3..].iter().map(|s| s.to_string()).collect(),
         ..Default::default()
     })
 }
