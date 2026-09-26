@@ -1,0 +1,18 @@
+[package]
+name = "dtls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DTLS-SRTP (RFC 5764/6347): WebRTC key exchange via OpenSSL DTLS 1.2, self-signed certs, SRTP profile negotiation, keying-material export, SDP fingerprint pinning"
+
+[dependencies]
+openssl = "0.10"
+srtp = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+rand = { workspace = true }
