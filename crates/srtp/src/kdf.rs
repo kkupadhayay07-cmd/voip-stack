@@ -82,7 +82,12 @@ pub fn derive(
     }
 
     // r = index DIV rate ("a DIV 0 = 0" per RFC 3711 §4.3.1).
-    let r: u64 = if rate == 0 { 0 } else { index / rate };
+    // r = index DIV rate; "a DIV 0 = 0" per RFC 3711 §4.3.1.
+    let r: u64 = if rate == 0 {
+        0
+    } else {
+        index.checked_div(rate).unwrap_or(0)
+    };
 
     // x = key_id XOR master_salt, right-aligned: key_id (7 bytes) occupies
     // the low-order bytes of the salt-width big-endian field.
