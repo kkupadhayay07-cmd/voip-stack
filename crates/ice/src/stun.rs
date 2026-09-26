@@ -136,10 +136,6 @@ impl Message {
 
     /// Append a raw attribute.
     pub fn add(&mut self, attr_type: u16, value: Vec<u8>) {
-        match attr_type {
-            MESSAGE_INTEGRITY => self.integrity_offset = None, // recomputed on encode
-            _ => {}
-        }
         self.attrs.push((attr_type, value));
     }
 
