@@ -864,7 +864,6 @@ fn parse_param_list(s: &str) -> Result<Vec<Param>> {
                 Some(i) => (&seg[..i], Some(seg[i + 1..].trim_matches('"').to_string())),
                 None => (seg, None),
             };
-            #[allow(clippy_manual_map)]
             if name.is_empty() {
                 return Err(ParseError::malformed("empty parameter name"));
             }

@@ -164,11 +164,7 @@ pub fn respond_to(
     let mut to = req.headers.get("To").unwrap_or("").to_string();
     if let Some(tag) = to_tag {
         if !to.contains(";tag=") {
-            if to.starts_with('<') || to.contains('<') {
-                to = format!("{to};tag={tag}");
-            } else {
-                to = format!("{to};tag={tag}");
-            }
+            to = format!("{to};tag={tag}");
         }
     }
     headers.add("To", to);
