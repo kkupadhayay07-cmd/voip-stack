@@ -91,3 +91,20 @@ PCMU/PCMA, which are native.)
 * `docs/SECURITY_NOTES.md` — dependency audit status.
 * `crates/b2bua/src/engine.rs` / `media.rs` — the call engine and the
   cross-connected media pumps that make this demo work.
+
+
+## Additional end-to-end scenarios (in-repo tests)
+
+Beyond the loopback call, each security/platform layer ships a runnable
+end-to-end scenario:
+
+| Scenario | Command | What is proven |
+|----------|---------|----------------|
+| B2BUA loopback call | `./demo/run_loopback_demo.sh` | Full SIP call + PCMU→PCMA transcoding + CDR trail |
+| DTLS-SRTP handshake | `cargo test -p dtls --test handshake` | Real DTLS 1.2 over UDP, fingerprint pinning, key export, loss recovery, SRTP media roundtrip on the exported keys |
+| ICE agent pair | `cargo test -p ice --test integration` | Host-candidate gathering, connectivity checks, nomination, keepalives |
+| STUN server | `cargo test -p ice --lib server` | Binding request → XOR-MAPPED-ADDRESS oracle |
+| TURN relay | `cargo test -p ice --test integration turn` | Authenticated allocation, permissions, Send/Data relay both directions |
+| SRTP conformance | `cargo test -p srtp` | RFC 3711 B.2/B.3 + RFC 7714 §16 vectors, replay/ROC behavior |
+| REST control plane | `cargo test -p api --test http` | CDR queries/filters, campaign stats, pacing preview, metrics |
+| Codec pipeline | `cargo test -p media --test pipeline` | PCMU decode → VAD → mix → 8k↔16k resample → WAV record |

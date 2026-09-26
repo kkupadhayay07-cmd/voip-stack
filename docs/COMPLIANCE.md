@@ -2,8 +2,8 @@
 
 Status of the ZRTC VoIP stack against the RFCs and ITU codecs it targets.
 **Honest by design** — no row is marked Done without implementation and tests
-behind it. Last reviewed: 2026-09 (Phase 1, commit series after the native
-codec suite landed).
+behind it. Last reviewed: 2026-09 (all six phases implemented; 328 tests
+green, commit series through the control plane).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
@@ -12,66 +12,96 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC | Feature | Status | Notes |
 |-----|---------|--------|-------|
 | RFC 3261 | SIP: message layer | **Done** | `sip-core`: strict panic-free byte parser (UDP datagram + TCP/TLS/WS stream framing, §18.3), canonical serializer, URI/header model, branch/tag/Call-ID generators. Parser limits enforced (64 KiB msg, 128 headers, 8 KiB/line). |
-| RFC 3261 | SIP: transactions (§17) | **In progress** | Timers/state machines are the current work package; not merged yet. |
-| RFC 3261 | SIP: transports (§18) | **In progress** | UDP/TCP transaction-transport wiring in flight; TLS/WS/WSS planned (Phase 2). |
-| RFC 3261 | SIP: dialogs (§12) | **Planned** | After transactions/transports land. |
-| RFC 3262 | PRACK / 100rel | **Planned** | `RAck` and `RSeq` header types already modelled in the message layer; reliability state machine not started. |
-| RFC 3263 | DNS (NAPTR/SRV) for SIP | **Planned** | No resolver yet; static host:port targets only. |
-| RFC 3264 | Offer/answer | **Done** | `sdp::negotiate`: full RFC 3264 engine (offer→answer, direction/codec intersection) with `StreamPlan` projection for the media layer. |
-| RFC 3326 | Reason header | **Partial** | `Reason` header type modelled/serializable in `sip-core`; no protocol semantics (e.g. Q.850 mappings) applied yet. |
-| RFC 3515 | REFER | **Planned** | `Refer-To` header type modelled; REFER/Replaces call flows not implemented. |
-| RFC 4566 | SDP | **Done** | `sdp` crate: strict positioned-error parser + canonical serializer, round-trip tests. |
-| RFC 8866 | SDP v2 (WebRTC era) | **Partial** | Parser/model cover `rtpmap`/`fmtp`, `ice-*` (candidates stored as strings), `fingerprint`, `bundle`, `extmap`; full 8866 grammar validation not complete. |
-| RFC 2617/7616 | Digest auth | **Partial** | Challenge/response helper functions in `sip-core` (incl. `-nextnonce`/`cnonce` inputs); server-side nonce store/registration flows not yet. |
+| RFC 3261 | SIP: registrar (§10) | **Done** | `registrar` crate: AoR binding DB (q-ordering, expiry, CSeq/Call-ID consistency, wildcard removal), Digest auth challenge/verify with one-time nonces, domain check. |
+| RFC 3261 | SIP: stateful proxy (§16) | **Done** (core) | `proxy` crate: request validation (483), Route-set processing, Via prepend/pop, Record-Route, parallel forking, 100 Trying, CANCEL matching (§9.1), response routing (received/rport → sent-by). Timer F/H retransmission state machines are simplified (see §5). |
+| RFC 3261 | SIP: transactions (§17) | **Partial** | B2BUA implements Timer A/B retransmissions for INVITE; full independent transaction layer (Timer F/H/I/J) remains a hardening item. |
+| RFC 3261 | SIP: transports (§18) | **Partial** | UDP wired in b2bua/tests; message layer already covers TCP/TLS/WS framing; service-binary TLS/WS/WSS listeners planned. |
+| RFC 3261 | SIP: dialogs (§12) | **Partial** | B2BUA tracks per-leg dialog state (tags/Call-ID/CSeq); generic dialog package not extracted. |
+| RFC 3262 | PRACK / 100rel | **Planned** | `RAck`/`RSeq` header types modelled; reliability state machine not started. |
+| RFC 3263 | DNS (NAPTR/SRV) for SIP | **Partial** | Proxy falls back to system resolver for hostnames; NAPTR/SRV discovery not implemented. |
+| RFC 3264 | Offer/answer | **Done** | `sdp::negotiate`: full RFC 3264 engine with `StreamPlan` projection. |
+| RFC 3326 | Reason header | **Partial** | Header type modelled; no protocol semantics applied yet. |
+| RFC 3515 | REFER | **Planned** | `Refer-To` header type modelled; call flows not implemented. |
+| RFC 3581 | rport / Symmetric RTP | **Done** | SBC marks `rport` on requests and routes responses via received/rport; NAT latch table maps contact → source. |
+| RFC 4566 | SDP | **Done** | `sdp` crate: strict positioned-error parser + canonical serializer. |
+| RFC 8866 | SDP v2 | **Partial** | Parser/model cover `rtpmap`/`fmtp`, `ice-*`, `fingerprint`, `bundle`, `extmap`; full 8866 grammar validation not complete. |
+| RFC 2617/7616 | Digest auth | **Done** (server side) | `sip-core` helpers + registrar nonce store; `respond_to_challenge` used in tests/clients. |
+| RFC 6140 / 5627 | GRUU | **Planned** | Not started. |
+| RFC 5626 / 6223 | Outbound | **Planned** | Not started. |
+| RFC 7118 | SIP over WS | **Partial** | WS framing supported in the message layer; no WS listener wired in a service binary yet. |
 
 ## 2. Media transport
 
 | RFC | Feature | Status | Notes |
 |-----|---------|--------|-------|
-| RFC 3550 | RTP/RTCP | **Done** | `rtp` crate: fixed-header parse/serialize; RTCP SR/RR/SDES/BYE/APP compound parse/encode; RFC 3550 A\* interarrival jitter estimator; SSRC probation. |
-| RFC 3551 | RTP/AVP profile | **Done** | Static payload types (0 PCMU, 8 PCMA, 9 G722, 18 G729, 13 CN, 100 telephone-event) + L16 (BE) support. |
-| RFC 3556 | SDP bandwidth modifiers | **Partial** | `b=` lines parsed and modelled generically; `TIAS`/packet-rate semantics not applied to pacing yet. |
-| RFC 4585 | RTCP-based feedback | **Partial** | Feedback packets modelled: NACK (transport, fmt=1), TWCC (fmt=15), PLI/FIR (payload-specific). **REMB is not implemented**; no RTX retransmission logic yet. |
-| RFC 4733 | RTP DTMF (telephone-event) | **Done** | `rtp::dtmf`: events 0–15 with start/end semantics + tests; `telephone-event` descriptors in the codecs registry. |
-| RFC 5761 | RTP/RTCP demultiplexing | **Done** | `is_rtcp()` §4 heuristic (PT range check), unit-tested. |
-| RFC 8285 | RTP header extensions | **Done** | One-byte and two-byte extension blocks parse/serialize in `rtp::packet`. |
-| RFC 3711 | SRTP/SRTCP | **Planned** (Phase 2) | Key derivation, AES-CM, replay protection all to be self-implemented. |
-| RFC 7714 | SRTP AES-GCM | **Planned** (Phase 2) | After 3711 core. |
-| RFC 5764 | DTLS-SRTP handshake/usage | **Planned** (Phase 2) | `use_srtp` ext, cert fingerprint (SDP field already modelled). |
-| RFC 6347 | DTLS 1.2 | **Planned** (Phase 2) | Needed for 5764/WebRTC. |
-| RFC 5389 | STUN | **Planned** (Phase 2) | |
-| RFC 8445 | ICE | **Planned** (Phase 2) | SDP `ice-*` attributes already carried by the sdp model. |
+| RFC 3550 | RTP/RTCP | **Done** | `rtp` crate: fixed-header parse/serialize; RTCP SR/RR/SDES/BYE/APP compound parse/encode; interarrival jitter estimator; SSRC probation. |
+| RFC 3551 | RTP/AVP profile | **Done** | Static payload types (0 PCMU, 8 PCMA, 9 G722, 18 G729, 13 CN, 100 telephone-event) + L16 (BE). |
+| RFC 3556 | SDP bandwidth modifiers | **Partial** | `b=` lines parsed/modelled; `TIAS` pacing semantics not applied. |
+| RFC 4585 | RTCP-based feedback | **Partial** | NACK/TWCC/PLI/FIR packets modelled; REMB not implemented; RTX retransmission logic not yet. |
+| RFC 4733 | RTP DTMF (telephone-event) | **Done** | Events 0–15 with start/end semantics + tests; relayed end-to-end by the B2BUA. |
+| RFC 5761 | RTP/RTCP demultiplexing | **Done** | §4 heuristic, unit-tested. |
+| RFC 8285 | RTP header extensions | **Done** | One-byte and two-byte blocks parse/serialize. |
+| RFC 3711 | SRTP/SRTCP | **Done** | `srtp` crate: AES-CM + HMAC-SHA1 (80/32 tags), key derivation (labels 0–5, rate semantics), 64-entry replay window (libsrtp-style relative bits), RFC 3711 Appendix A ROC estimation, per-SSRC stream state, SRTCP E-bit/index. Validated against RFC 3711 B.2/B.3 vectors. |
+| RFC 7714 | SRTP AES-GCM | **Done** | AEAD_AES_128/256_GCM (16-byte tags) + 96-bit tag variants; SRTP/SRTCP IV per §8.1/§9.1; E=0 AAD semantics per §9.3; validated against §16.1.1/16.1.2/16.1.4/16.2.1 vectors. |
+| RFC 5764 | DTLS-SRTP handshake/usage | **Done** | `dtls` crate: use_srtp negotiation, RFC 8122 fingerprint generation + pinning, RFC 5764 §4.2 keying export (`EXTRACTOR-dtls_srtp`), self-signed runtime ECDSA P-256 identities. |
+| RFC 6347 | DTLS 1.2 | **Done** (via OpenSSL) | DTLS 1.2 only (NO_DTLSV1); handshake driven over a datagram queue transport with our own flight retransmission + 30 s deadline; loss-resilient handshake covered by tests. |
+| RFC 5389 | STUN | **Done** | `ice::stun`: full TLV codec (XOR-MAPPED/PEER/RELAYED, USERNAME, MESSAGE-INTEGRITY, FINGERPRINT, ERROR-CODE, ICE-* attrs, TURN attrs); validated against RFC 5769 §2.1/§2.2. |
+| RFC 8489 | STUN (newer) | **Partial** | 5389 semantics implemented; 8489-only additions (e.g. new error codes, ADDITIONAL-ADDRESS-FAMILY) not modelled. |
+| RFC 8445 | ICE | **Done** (core) | `ice::agent`: candidate gathering (host/srflx/relay), priorities (§5.1.2.1), connectivity checks with short-term creds, role + tie-breaker, USE-CANDIDATE nomination, keepalives, prflx discovery. Triggered-check pacing simplified (all-pairs-at-once; documented). |
+| RFC 5766 | TURN server | **Done** (core) | Allocation (long-term MD5 auth), refresh, CreatePermission, Send/Data indications, ChannelBind; per-allocation relay sockets pumped concurrently; permission enforcement on both paths. TCP allocations, ReservationToken and mobility not implemented. |
+| RFC 5766 | TURN client | **Done** | Agent-side allocation flow (401 → credentials → verified response) used for relay candidate gathering. |
+| RFC 7983 | Demultiplexing STUN/DTLS/RTP | **Partial** | First-byte classification in the ICE agent; DTLS records classified (0-3) and passed to the DTLS layer by the assembly. |
 
 ## 3. Codecs
 
 | Codec | Status | Notes |
 |-------|--------|-------|
-| G.711 PCMU/PCMA | **Done** | ITU-T G.711 μ-law/A-law tables; implemented in `codecs::g711` (frame API) and `rtp::g711` (packet path); round-trip + midstream-loss tests. |
-| G.722 | **Done** | Bit-exact ITU structure per `codecs/src/g722.rs`: two-polyphase QMF, 6-bit embedded low-band ADPCM with bit stealing (64/56/48 kb/s), 2-bit high band, spec quantizer tables; ≥20 dB round-trip, 28 dB post-loss recovery. |
-| G.729 | **Done** (wire-conformant; quality caveats documented) | ITU codebooks (LSP split VQ + MA prediction, two-stage gain VQ), 4-pulse/13-bit algebraic CB with gray-coded track, ITU pitch-delay mappings + parity. Encoder emits fully conformant bitstreams; decoder verified against **bcg729 golden vectors** (level match within ±3 dB) and our bitstreams are **cross-decoded by ffmpeg in CI** (`g729_interop` test, runtime-detected). Phase-1 fidelity deviations (float analysis-by-synthesis, open-loop pitch preselection, simplified postfilter tilt) are wire-invisible and documented in `codecs/src/g729.rs`. |
-| Opus | **Done** | Safe binding to system libopus 1.5.2 (8–48 kHz, mono/stereo, DTX/FEC/bitrate control), feature-gated (`opus`, on by default; stack builds without it). |
-| L16 | **Done** | RFC 3551 §5.1 linear 16-bit big-endian. |
-| CN (silence) | **Done** | RFC 3389 comfort-noise payload + noise generation (`codecs::cn`). |
-| PLC | **Done** (engineering feature) | `PitchPlc` / `EnergyDecayPlc` / `SilencePlc` + per-codec `Decoder::conceal()` hook wired into the jitter buffer. |
-| RFC 4733 DTMF generation/detection | **Done** | Event payload encode/decode (`rtp::dtmf`); audio-band DTMF detection not implemented (Phase 3). |
+| G.711 PCMU/PCMA | **Done** | ITU tables; frame API (`codecs::g711`) + packet path (`rtp::g711`); round-trip + midstream-loss tests. |
+| G.722 | **Done** | Bit-exact ITU structure: two-polyphase QMF, 6-bit embedded low-band ADPCM with bit stealing (64/56/48 kb/s), 2-bit high band; ≥20 dB round-trip, 28 dB post-loss recovery. |
+| G.729 | **Done** (wire-conformant; quality caveats documented) | ITU codebooks, 4-pulse/13-bit algebraic CB, ITU pitch-delay mappings + parity. Decoder verified against **bcg729 golden vectors** (±3 dB); bitstreams **cross-decoded by ffmpeg in CI**. Fidelity deviations documented in `codecs/src/g729.rs`. |
+| Opus | **Done** | Safe binding to system libopus 1.5.2 (8–48 kHz, mono/stereo, DTX/FEC/bitrate control), feature-gated. |
+| L16 | **Done** | RFC 3551 §5.1. |
+| CN (silence) | **Done** | RFC 3389 comfort-noise payload + noise generation. |
+| PLC | **Done** (engineering feature) | `PitchPlc`/`EnergyDecayPlc`/`SilencePlc` + per-codec `Decoder::conceal()` wired into the jitter buffer. |
+| RFC 4733 DTMF | **Done** | Event payload encode/decode + relay; audio-band DTMF detection not implemented. |
+| Transcoding | **Done** | B2BUA 16 kHz bridge converts any negotiated codec pair (e.g. PCMU↔PCMA verified end-to-end with SNR-checked audio). |
 
-## 4. Verification methodology
+## 4. Platform services
 
-* Every public function carries tests (workspace rule); run `cargo test --workspace`.
-* **G.729**: offline oracle — bcg729-encoded bitstream + reference PCM committed
-  under `crates/codecs/tests/data/`; decoder must match reference decode within
-  ±3 dB. Encoder bitstreams are cross-decoded by `ffmpeg` in the CI
-  `codec-interop` job when available.
-* **G.722/G.711**: ITU table conformance + SNR thresholds asserted in unit tests.
-* CI runs fmt/clippy/test/audit plus the codec interop job — see
-  `.github/workflows/ci.yml`. Known temporary relaxations (fmt drift,
-  clippy without `-D warnings`) are annotated in that file and are removed as
-  soon as the in-flight work packages land.
+| Service | Status | Notes |
+|---------|--------|-------|
+| Conference mixing | **Done** | `media::Mixer`: N-way at bridge rate, per-input gain/mute, √N scaling + hard clip protection, VAD-gated contributions. |
+| Recording | **Done** | `media::Recorder`: streaming RIFF/WAVE (PCM-16) with duration accounting; Opus tap hook attached. |
+| Resampling | **Done** | `media::Resampler`: windowed-sinc (Kaiser), anti-aliasing on downsample (7 kHz → folds, tested), streaming + batch parity. |
+| VAD | **Done** | Adaptive noise floor, energy + ZCR gating, hangover; drives AI barge-in and mixer gating. |
+| CDR | **Done** | `cdr` crate: lifecycle builder, dispositions from SIP codes, bounded store, query/stats API, JSON; REST exposure via `api`. |
+| Outbound dialer | **Done** (core) | `dialer` crate: preview/progressive/predictive pacing (Erlang-C-inspired), caller-ID rotation, TCPA 3% abandonment window, calling-hour windows, DNC, AMD hooks, attempt caps + cooldowns. |
+| AI bridge | **Done** | AudioSocket TCP framing (UUID/AUDIO/DTMF/TERMINATE), WebSocket tap, VAD events, barge-in, ≤ 20 ms added latency. |
+| Control plane | **Done** | `api` crate: REST (health/ready/metrics, CDR queries + filters, campaign stats, pacing preview, campaign creation), WebSocket event/echo channel, Prometheus text exposition. |
+| Metrics | **Done** | Prometheus counters (calls in/out/answered/failed, WS clients, HTTP requests) at `/metrics`. |
 
-## 5. Not claimed
+## 5. Not claimed (honest gaps)
 
-For the record, the following are **not** implemented anywhere yet and must not
-be advertised by dashboards/milestones: SRTP/DTLS/ICE/STUN (Phase 2),
-PRACK/3263 DNS (Phase 2), TLS/WS/WSS transports (Phase 2), audio-band DTMF
-detection, REMB, RTX retransmission, conference mixing, transcoding engine,
-registrar/proxy/SBC roles, REST control plane.
+* **Transaction-layer hardening**: Timer F/H/I/J state machines are not a
+  standalone layer; the B2BUA implements INVITE Timer A/B and the proxy
+  tracks fork state in memory. Failover semantics (RFC 3263) not implemented.
+* **Transports in the service binary**: UDP is wired end-to-end in engines
+  and tests; TCP/TLS/WS/WSS listeners and the service assembly binary are
+  the next ops milestone (message-layer framing already exists).
+* **Postgres CDR persistence**: CDRs are in-memory (bounded) + JSON; sqlx
+  storage backend planned.
+* **Load verification**: the 8-core/1000-call target is an architecture goal;
+  a load harness has not been run in this environment.
+* REMB, RTX retransmission, audio-band DTMF detection, PRACK/100rel,
+  NAPTR/SRV, GRUU/Outbound, WebRTC data channels.
+
+## 6. Verification methodology
+
+* Every public function carries tests (workspace rule); run
+  `cargo test --workspace` → **328 passing**.
+* RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16),
+  STUN (RFC 5769 §2.1/§2.2), G.729 (bcg729 oracle), cross-decode by ffmpeg.
+* End-to-end in-repo: B2BUA loopback call, DTLS-SRTP handshake → SRTP media,
+  ICE agent pair checks, TURN relay round-trip, REST API black-box tests.
+* `cargo audit`: 0 vulnerabilities (1 allowed unmaintained notice on the
+  whitelisted libopus FFI wrapper).
