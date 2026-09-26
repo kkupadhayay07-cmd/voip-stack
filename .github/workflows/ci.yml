@@ -1,0 +1,108 @@
+# ZRTC VoIP stack — CI pipeline.
+#
+# Jobs: fmt-check, clippy, test, audit, codec-interop (G.729 vs ffmpeg).
+#
+# KNOWN STATE (see worklog / docs/COMPLIANCE.md):
+# - `sip-core` transaction/transport work packages are in flight, so
+#   `cargo test --workspace` is expected red until those land.
+# - The tree is not yet rustfmt-clean (drift in rtp/sdp committed earlier);
+#   fixing crate sources is outside the infra task's scope, so fmt-check is
+#   temporary `continue-on-error: true` — flip it to strict as soon as a
+#   formatting pass lands.
+# - Clippy is run WITHOUT `-D warnings` for the same reason. Once the
+#   workspace builds warning-free, tighten to:
+#     cargo clippy --workspace --all-targets -- -D warnings
+#
+# System deps: `opus 0.3` binds the system libopus via pkg-config, so every
+# job that compiles the workspace needs pkg-config + libopus-dev.
+
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Intentionally NOT setting CARGO_TARGET_DIR here: GitHub runners have
+  # plenty of disk and the default ./target layout keeps rust-cache effective.
+  # (The shared /tmp/voip-target convention is a local-sandbox thing only.)
+
+jobs:
+  fmt-check:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # TODO(infra): remove continue-on-error once `cargo fmt --all` is applied
+      # to the tree (see header comment).
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install system deps (libopus)
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libopus-dev
+      - uses: Swatinem/rust-cache@v2
+      # TODO: tighten to `-- -D warnings` once the workspace is warning-free
+      # (see header comment).
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system deps (libopus)
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libopus-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace
+
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit
+        continue-on-error: false
+        run: cargo audit
+
+  codec-interop:
+    name: G.729 interop (ffmpeg)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system deps (libopus, ffmpeg)
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libopus-dev ffmpeg
+      - uses: Swatinem/rust-cache@v2
+      # Golden vectors from bcg729 are committed under crates/codecs/tests/data;
+      # the test additionally cross-decodes our encoder bitstream with ffmpeg
+      # when available on PATH (runtime-detected).
+      - name: cargo test -p codecs --test g729_interop
+        run: cargo test -p codecs --test g729_interop

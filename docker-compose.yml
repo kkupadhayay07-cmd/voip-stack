@@ -1,0 +1,45 @@
+# ZRTC VoIP stack — local/staging compose file.
+#
+# Usage:
+#   docker compose up -d --build        # build + start zrtc-b2bua
+#   docker compose logs -f zrtc-b2bua
+#   docker compose down
+#
+# NOTE: the b2bua demo daemon (`voipd`) has not landed yet; the image currently
+# builds cleanly and exits immediately (placeholder CMD). Port mappings and
+# env below are already the intended production shape for Phase 2.
+
+services:
+  zrtc-b2bua:
+    build: .
+    image: zrtc/voip-stack:latest
+    container_name: zrtc-b2bua
+    init: true
+    restart: unless-stopped
+    environment:
+      RUST_LOG: info           # tracing env-filter, e.g. "info,b2bua=debug"
+    ports:
+      - "5060:5060/udp"        # SIP over UDP
+      - "5060:5060/tcp"        # SIP over TCP
+      # - "5061:5061/tcp"      # SIPS over TLS (uncomment in Phase 2)
+      - "8080:8080"            # HTTP / metrics / control plane (Phase 6)
+
+  # ── Reserved for later phases (CDR store, registrar state, dialer): ────────
+  # postgres:
+  #   image: postgres:16-alpine
+  #   container_name: zrtc-postgres
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER: zrtc
+  #     POSTGRES_PASSWORD: change-me
+  #     POSTGRES_DB: zrtc
+  #   volumes:
+  #     - zrtc-pgdata:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U zrtc"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #
+  # volumes:
+  #   zrtc-pgdata:
