@@ -42,10 +42,7 @@ fn invite_forks_to_targets_and_adds_via() {
     let sends: Vec<&SocketAddr> = actions
         .iter()
         .filter_map(|a| match a {
-            Action::Send(m, d) => match m {
-                SipMessage::Request(_) => Some(d),
-                _ => None,
-            },
+            Action::Send(SipMessage::Request(_), d) => Some(d),
             _ => None,
         })
         .collect();
@@ -54,23 +51,16 @@ fn invite_forks_to_targets_and_adds_via() {
     assert!(sends.contains(&&want));
 
     // 100 Trying upstream.
-    let trying = actions.iter().any(|a| match a {
-        Action::Send(m, _) => match m {
-            SipMessage::Response(r) => r.code == 100,
-            _ => false,
-        },
-        _ => false,
-    });
+    let trying = actions
+        .iter()
+        .any(|a| matches!(a, Action::Send(SipMessage::Response(r), _) if r.code == 100));
     assert!(trying);
 
     // The forwarded request carries our Via on top + Record-Route + reduced
     // Max-Forwards.
     let fwd = match &actions[0] {
-        Action::Send(m, _) => match m {
-            SipMessage::Request(r) => r.clone(),
-            _ => panic!(),
-        },
-        _ => panic!(),
+        Action::Send(SipMessage::Request(r), _) => r.clone(),
+        _ => panic!("expected a request send"),
     };
     let vias = fwd.headers.get_all("Via");
     assert_eq!(vias.len(), 2);
@@ -105,11 +95,8 @@ fn unknown_target_404() {
     let req = invite_req("sip:nobody@example.com", "nobody");
     let actions = proxy.process_request(&req, SRC);
     match &actions[0] {
-        Action::Send(m, _) => match m {
-            SipMessage::Response(r) => assert_eq!(r.code, 404),
-            _ => panic!(),
-        },
-        _ => panic!(),
+        Action::Send(SipMessage::Response(r), _) => assert_eq!(r.code, 404),
+        _ => panic!("expected a response send"),
     }
 }
 
@@ -186,11 +173,8 @@ fn response_path_pops_via_and_targets_next_hop() {
     // Take the forwarded request, serialize it, reparse (like the wire), and
     // fabricate the UAS's 200 which mirrors the vias.
     let fwd = match &actions[0] {
-        Action::Send(m, _) => match m {
-            SipMessage::Request(r) => serialize(&SipMessage::Request(r.clone())),
-            _ => panic!(),
-        },
-        _ => panic!(),
+        Action::Send(SipMessage::Request(r), _) => serialize(&SipMessage::Request(r.clone())),
+        _ => panic!("expected a request send"),
     };
     let reparsed = match parse_message(&fwd).unwrap() {
         SipMessage::Request(r) => r,

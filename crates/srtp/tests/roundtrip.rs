@@ -44,11 +44,13 @@ fn roundtrip_all_profiles() {
         let mut tx = SrtpSession::new(profile, &key, &salt).unwrap();
         let mut rx = SrtpSession::new(profile, &key, &salt).unwrap();
 
-        let mut rtcp_index_expected = 0u32;
         // Realistic monotonic sequence deltas (Appendix A estimation is only
         // defined for sender-style progression; huge forward jumps are
         // spec-correctly interpreted as previous-ROC tails and fail auth).
-        for seq in [1u16, 2, 500, 32767, 32768, 40000, 40001] {
+        for (rtcp_index_expected, seq) in [1u16, 2, 500, 32767, 32768, 40000, 40001]
+            .into_iter()
+            .enumerate()
+        {
             let mut pkt = rtp(seq, 0xCAFE, b"payload-in-the-vm");
             let sent = pkt.clone();
             let idx = tx.protect(&mut pkt).unwrap();
@@ -63,8 +65,7 @@ fn roundtrip_all_profiles() {
             tx.protect_rtcp(&mut c).unwrap();
             assert_eq!(c.len(), sent.len() + 4 + profile.tag_len());
             let idx = rx.unprotect_rtcp(&mut c).unwrap();
-            assert_eq!(idx, rtcp_index_expected);
-            rtcp_index_expected += 1;
+            assert_eq!(idx, rtcp_index_expected as u32);
             assert_eq!(c, sent, "{profile:?}: RTCP roundtrip must restore packet");
         }
     }

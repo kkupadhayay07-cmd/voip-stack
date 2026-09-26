@@ -37,13 +37,13 @@ fn sip_parser_survives_malformed_corpus() {
     };
     let long_header_line: Vec<u8> = {
         let mut v = b"INVITE sip:a@b SIP/2.0\r\nSubject: ".to_vec();
-        v.extend(std::iter::repeat(b'a').take(16 * 1024));
+        v.extend(std::iter::repeat_n(b'a', 16 * 1024));
         v.extend_from_slice(b"\r\nContent-Length: 0\r\n\r\n");
         v
     };
     let long_uri: Vec<u8> = {
         let mut v = b"INVITE sip:".to_vec();
-        v.extend(std::iter::repeat(b'a').take(4096));
+        v.extend(std::iter::repeat_n(b'a', 4096));
         v.extend_from_slice(b"@atlanta.com SIP/2.0\r\nContent-Length: 0\r\n\r\n");
         v
     };

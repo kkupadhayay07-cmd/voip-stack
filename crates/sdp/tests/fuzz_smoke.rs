@@ -31,7 +31,7 @@ fn sdp_parser_survives_malformed_corpus() {
     };
     let huge_line: String = {
         let mut s = String::from("v=0\r\ns=");
-        s.extend(std::iter::repeat('x').take(200_000));
+        s.extend(std::iter::repeat_n('x', 200_000));
         s.push_str("\r\n");
         s
     };
