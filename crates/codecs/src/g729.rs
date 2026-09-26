@@ -1882,7 +1882,7 @@ impl G729Decoder {
         let p = unpack_params(data);
 
         // ---- LSP / LSF path ----
-        
+
         let cur_lsf = if erasure {
             let q_out = restore_lsf(&self.lsf_mem, self.ma_prev, &self.lsf_prev);
             self.lsf_mem.push(q_out);

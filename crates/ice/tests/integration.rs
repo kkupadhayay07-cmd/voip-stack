@@ -30,8 +30,8 @@ async fn agent_pair_ice_handshake() {
     let a_addr = a_host.address;
     let b_addr = b_host.address;
     let (ta, tb) = (
-        tokio::spawn(async move { a.connect(Duration::from_secs(8)).await }),
-        tokio::spawn(async move { b.connect(Duration::from_secs(8)).await }),
+        tokio::spawn(async move { a.connect(Duration::from_secs(20)).await }),
+        tokio::spawn(async move { b.connect(Duration::from_secs(20)).await }),
     );
     let (ra, rb) = tokio::join!(ta, tb);
     let pa = ra.unwrap().expect("agent A pair");

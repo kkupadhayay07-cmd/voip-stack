@@ -129,12 +129,22 @@ impl CdrEvent {
                 side: s,
                 codec,
                 ..
-            } => (c.clone(), s.as_str().into(), "ANSWERED".into(), codec.clone()),
+            } => (
+                c.clone(),
+                s.as_str().into(),
+                "ANSWERED".into(),
+                codec.clone(),
+            ),
             CdrEvent::LegConfirmed {
                 call_id: c,
                 side: s,
                 ..
-            } => (c.clone(), s.as_str().into(), "CONFIRMED".into(), String::new()),
+            } => (
+                c.clone(),
+                s.as_str().into(),
+                "CONFIRMED".into(),
+                String::new(),
+            ),
             CdrEvent::LegTerminated {
                 call_id: c,
                 side: s,

@@ -298,12 +298,13 @@ impl Proxy {
         let key = Self::tx_key(&call_id, &ours, "INVITE");
         if let Some(tx) = self.transactions.get_mut(&key) {
             let code = resp.code;
-            // Track per-leg best response (branch of the remaining top via).
+            // Track per-leg best response (branch of the remaining top via):
+            // finals replace provisional, higher finals replace lower.
             if let Some(leg_branch) = resp.headers.first_via().and_then(|v| v.branch.clone()) {
                 let entry = tx.best.entry(leg_branch).or_insert(0);
-                if code > *entry || *entry >= 200 && code >= 600 {
-                    *entry = code;
-                } else if *entry < 200 && code > *entry {
+                let better = (code >= 200) >= (*entry >= 200) && code > *entry;
+                let _ = better;
+                if (*entry < 200 && code > *entry) || (code >= 200 && code > *entry) {
                     *entry = code;
                 }
             }

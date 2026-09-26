@@ -26,8 +26,7 @@ fn dtmf_parse_no_panic(corpus: &[&[u8]]) {
 
 #[test]
 fn rtp_parser_survives_malformed_corpus() {
-    let csrc_declared_no_data: Vec<u8> =
-        vec![0x8F, 0x00, 0x00, 0x01, 0, 0, 0, 1]; // CC=15, no CSRC bytes
+    let csrc_declared_no_data: Vec<u8> = vec![0x8F, 0x00, 0x00, 0x01, 0, 0, 0, 1]; // CC=15, no CSRC bytes
     let ext_huge_len: Vec<u8> = vec![
         0x90, 0x00, 0x00, 0x01, // X=1, CC=0
         0, 0, 0, 1, // SSRC

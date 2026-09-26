@@ -295,9 +295,7 @@ impl HeaderMap {
 
     /// `Allow` list.
     pub fn allow(&self) -> TokenList {
-        self.get("Allow")
-            .map(TokenList::parse)
-            .unwrap_or_default()
+        self.get("Allow").map(TokenList::parse).unwrap_or_default()
     }
 
     /// `Allow-Events` (k) list.
