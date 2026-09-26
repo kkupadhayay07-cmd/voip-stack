@@ -84,6 +84,9 @@ pub struct IceAgent {
     nominations: HashMap<[u8; 12], PendingCheck>,
     selected: Option<SelectedPair>,
     foundation_seed: u64,
+    /// Bumped whenever a role-conflict resolution changes the role so the
+    /// connect loop re-issues checks (RFC 8445 §7.3.1.1).
+    role_version: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +119,7 @@ impl IceAgent {
             nominations: HashMap::new(),
             selected: None,
             foundation_seed: 1,
+            role_version: 0,
         })
     }
 
@@ -359,9 +363,36 @@ impl IceAgent {
     pub async fn connect(&mut self, timeout: Duration) -> Result<SelectedPair, IceError> {
         let remote_pwd = self.remote_pwd.clone().ok_or(IceError::NoValidPair)?;
         let remote_ufrag = self.remote_ufrag.clone().ok_or(IceError::NoValidPair)?;
+        self.issue_checks(&remote_ufrag, &remote_pwd).await?;
 
-        // Issue checks for every candidate pair, best (highest priority)
-        // remote candidate first.
+        // Pump the socket until nominated, re-issuing checks when a role
+        // conflict forces a switch (RFC 8445 §7.3.1.1).
+        let buf = &mut [0u8; 1500];
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut role_version = self.role_version;
+        loop {
+            if let Some(sel) = &self.selected {
+                return Ok(sel.clone());
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(IceError::NoValidPair);
+            }
+            let recv = tokio::time::timeout(remaining, self.socket.recv_from(buf)).await;
+            let Ok(Ok((n, from))) = recv else {
+                return Err(IceError::NoValidPair);
+            };
+            self.handle_datagram(&buf[..n], from).await?;
+            if self.role_version != role_version {
+                role_version = self.role_version;
+                self.issue_checks(&remote_ufrag, &remote_pwd).await?;
+            }
+        }
+    }
+
+    /// (Re-)send checks to every remote candidate with the current role
+    /// (controlling agents nominate aggressively with USE-CANDIDATE).
+    async fn issue_checks(&mut self, remote_ufrag: &str, remote_pwd: &str) -> Result<(), IceError> {
         let mut remotes = self.remote.clone();
         remotes.sort_by_key(|c| std::cmp::Reverse(c.priority));
         for rc in &remotes {
@@ -392,24 +423,7 @@ impl IceAgent {
                 },
             );
         }
-
-        // Pump the socket until nominated.
-        let buf = &mut [0u8; 1500];
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if let Some(sel) = &self.selected {
-                return Ok(sel.clone());
-            }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(IceError::NoValidPair);
-            }
-            let recv = tokio::time::timeout(remaining, self.socket.recv_from(buf)).await;
-            let Ok(Ok((n, from))) = recv else {
-                return Err(IceError::NoValidPair);
-            };
-            self.handle_datagram(&buf[..n], from).await?;
-        }
+        Ok(())
     }
 
     async fn handle_datagram(&mut self, data: &[u8], from: SocketAddr) -> Result<(), IceError> {
@@ -454,8 +468,28 @@ impl IceAgent {
                 if !msg.verify_integrity(local_pwd.as_bytes())? {
                     return Ok(());
                 }
-                let controlling_peer = msg.tie_breaker(true).is_some();
-                let _ = controlling_peer;
+                // Role conflict resolution (RFC 8445 §7.3.1.1): the agent
+                // with the LOWER tie-breaker yields.
+                let peer_controlling = msg.tie_breaker(true).is_some();
+                let peer_tb = if peer_controlling {
+                    msg.tie_breaker(true).unwrap_or(0)
+                } else {
+                    msg.tie_breaker(false).unwrap_or(0)
+                };
+                if peer_controlling && self.controlling {
+                    if self.tie_breaker < peer_tb {
+                        // Yield: demote to controlled and re-issue checks.
+                        self.controlling = false;
+                        self.role_version += 1;
+                    }
+                } else if !peer_controlling && !self.controlling {
+                    // Both controlled (mirrored conflict): the HIGHER
+                    // tie-breaker must take the controlling role.
+                    if self.tie_breaker >= peer_tb {
+                        self.controlling = true;
+                        self.role_version += 1;
+                    }
+                }
 
                 // Remember the peer's reflexive address as a prflx candidate.
                 if !self.remote.iter().any(|c| c.address == from) {
