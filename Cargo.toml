@@ -6,6 +6,7 @@ members = [
     "crates/rtp",
     "crates/codecs",
     "crates/b2bua",
+    "crates/srtp",
 ]
 
 [workspace.package]
@@ -35,6 +36,7 @@ sdp = { path = "crates/sdp" }
 rtp = { path = "crates/rtp" }
 codecs = { path = "crates/codecs" }
 b2bua = { path = "crates/b2bua" }
+srtp = { path = "crates/srtp" }
 
 [profile.release]
 lto = "thin"
