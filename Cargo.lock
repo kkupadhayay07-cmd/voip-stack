@@ -471,6 +471,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ice"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "md-5",
+ "rand",
+ "sha1",
+ "srtp",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
