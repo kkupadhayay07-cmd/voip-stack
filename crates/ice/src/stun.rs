@@ -250,11 +250,14 @@ impl Message {
         if v.len() < 4 {
             return None;
         }
-        let class = v[1] & 0x07;
-        let number = v[2] as u16 | (((v[1] & 0x07) as u16) * 0); // low byte
-        let code = (class as u16) * 100 + v[2] as u16;
-        let _ = number;
-        Some((code, String::from_utf8_lossy(&v[3..]).into_owned()))
+        // Error class in bits 7-4 of byte 1, number in byte 2
+        // (RFC 5389 §15.6).
+        let class = (v[1] & 0x07) as u16;
+        let number = v[2] as u16;
+        Some((
+            class * 100 + number,
+            String::from_utf8_lossy(&v[3..]).into_owned(),
+        ))
     }
 
     pub fn add_error_code(&mut self, code: u16, reason: &str) {
