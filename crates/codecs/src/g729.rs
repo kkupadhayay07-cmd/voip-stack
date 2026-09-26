@@ -1882,11 +1882,11 @@ impl G729Decoder {
         let p = unpack_params(data);
 
         // ---- LSP / LSF path ----
-        let cur_lsf;
-        if erasure {
+        
+        let cur_lsf = if erasure {
             let q_out = restore_lsf(&self.lsf_mem, self.ma_prev, &self.lsf_prev);
             self.lsf_mem.push(q_out);
-            cur_lsf = self.lsf_prev;
+            self.lsf_prev
         } else {
             let (lsf, q_out) = decode_lsf(
                 p.l0 as usize,
@@ -1898,8 +1898,8 @@ impl G729Decoder {
             self.lsf_mem.push(q_out);
             self.ma_prev = p.l0 as usize;
             self.lsf_prev = lsf;
-            cur_lsf = lsf;
-        }
+            lsf
+        };
         let cur_cos: [f64; LP_ORDER] = std::array::from_fn(|i| cur_lsf[i].cos());
 
         // ---- Pitch delays ----
@@ -2480,6 +2480,6 @@ mod tests {
         assert!(super::make_encoder(16000).is_err());
         assert!(super::make_decoder(8000).is_ok());
         assert!(super::make_decoder(44100).is_err());
-        assert!(SUPPORTED);
+        const { assert!(SUPPORTED) };
     }
 }

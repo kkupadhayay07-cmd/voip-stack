@@ -111,67 +111,54 @@ pub struct CdrRecord {
 impl CdrEvent {
     /// Flattens the event into a storable record.
     pub fn to_record(&self) -> CdrRecord {
-        let mut call_id = String::new();
-        let mut side = "-".to_string();
-        let mut event = String::new();
-        let mut detail = String::new();
-        match self {
+        let (call_id, side, event, detail) = match self {
             CdrEvent::LegInvited {
                 call_id: c,
                 side: s,
                 from,
                 to,
                 ..
-            } => {
-                call_id = c.clone();
-                side = s.as_str().into();
-                event = "INVITED".into();
-                detail = format!("{from} -> {to}");
-            }
+            } => (
+                c.clone(),
+                s.as_str().into(),
+                "INVITED".into(),
+                format!("{from} -> {to}"),
+            ),
             CdrEvent::LegAnswered {
                 call_id: c,
                 side: s,
                 codec,
                 ..
-            } => {
-                call_id = c.clone();
-                side = s.as_str().into();
-                event = "ANSWERED".into();
-                detail = codec.clone();
-            }
+            } => (c.clone(), s.as_str().into(), "ANSWERED".into(), codec.clone()),
             CdrEvent::LegConfirmed {
                 call_id: c,
                 side: s,
                 ..
-            } => {
-                call_id = c.clone();
-                side = s.as_str().into();
-                event = "CONFIRMED".into();
-            }
+            } => (c.clone(), s.as_str().into(), "CONFIRMED".into(), String::new()),
             CdrEvent::LegTerminated {
                 call_id: c,
                 side: s,
                 reason,
                 ..
-            } => {
-                call_id = c.clone();
-                side = s.as_str().into();
-                event = "TERMINATED".into();
-                detail = reason.clone();
-            }
+            } => (
+                c.clone(),
+                s.as_str().into(),
+                "TERMINATED".into(),
+                reason.clone(),
+            ),
             CdrEvent::CallEnded {
                 call_id: c,
                 duration_ms,
                 frames_a_to_b,
                 frames_b_to_a,
                 ..
-            } => {
-                call_id = c.clone();
-                event = "CALL_ENDED".into();
-                detail =
-                    format!("duration_ms={duration_ms} a2b={frames_a_to_b} b2a={frames_b_to_a}");
-            }
-        }
+            } => (
+                c.clone(),
+                "-".to_string(),
+                "CALL_ENDED".into(),
+                format!("duration_ms={duration_ms} a2b={frames_a_to_b} b2a={frames_b_to_a}"),
+            ),
+        };
         CdrRecord {
             call_id,
             side,

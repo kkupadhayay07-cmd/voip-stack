@@ -66,13 +66,6 @@ async fn recv_msg(sock: &UdpSocket, buf: &mut [u8]) -> Option<(SipMessage, Socke
     }
 }
 
-fn as_request(msg: &SipMessage) -> Option<&sip_core::message::Request> {
-    match msg {
-        SipMessage::Request(r) => Some(r),
-        _ => None,
-    }
-}
-
 fn as_response(msg: &SipMessage) -> Option<&sip_core::message::Response> {
     match msg {
         SipMessage::Response(r) => Some(r),
@@ -354,13 +347,13 @@ async fn loopback_call_pcmu_to_pcma() {
     for lag in -64i64..=64 {
         let (mut sig, mut err) = (0f64, 0f64);
         let mut used = 0usize;
-        for i in 0..n {
+        for (i, &t) in tail.iter().enumerate().take(n) {
             let j = i as i64 + lag;
             if j < 0 || j >= reference.len() as i64 {
                 continue;
             }
             let x = f64::from(reference[j as usize]);
-            let y = f64::from(tail[i]);
+            let y = f64::from(t);
             sig += x * x;
             err += (x - y) * (x - y);
             used += 1;

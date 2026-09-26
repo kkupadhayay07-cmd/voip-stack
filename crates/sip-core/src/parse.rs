@@ -3,7 +3,7 @@
 
 use crate::error::{ParseError, Result};
 use crate::headers::{canonical_name, Header, HeaderMap};
-use crate::message::{reason_for_code, Method, Request, Response, SipMessage, Version};
+use crate::message::{reason_for_code, Method, Request, Response, SipMessage};
 use crate::uri::SipUri;
 
 /// Parser hard limits (RFC 3261 encourages limits; these bound memory use).
@@ -43,7 +43,7 @@ pub fn parse_stream(buf: &[u8]) -> Result<(SipMessage, usize)> {
     // ---- locate the end of the header section (CRLFCRLF, LF-tolerant) ----
     let text = std::str::from_utf8(buf)
         .map_err(|_| ParseError::malformed("message is not valid UTF-8"))?;
-    let (header_end, sep_len) = find_header_end(text).ok_or_else(|| ParseError::Truncated {
+    let (header_end, sep_len) = find_header_end(text).ok_or(ParseError::Truncated {
         expected: 0,
         got: buf.len(),
     })?;
@@ -54,7 +54,7 @@ pub fn parse_stream(buf: &[u8]) -> Result<(SipMessage, usize)> {
     let mut lines = head.split("\n");
     let start_line = lines
         .next()
-        .ok_or_else(|| ParseError::Truncated {
+        .ok_or(ParseError::Truncated {
             expected: 0,
             got: buf.len(),
         })?
@@ -98,7 +98,6 @@ pub fn parse_stream(buf: &[u8]) -> Result<(SipMessage, usize)> {
                 what: "continuation line with no preceding header".into(),
             });
         }
-        prev_continuation = false;
         let colon = line.find(':').ok_or_else(|| ParseError::Malformed {
             line: line_no,
             col: line.len(),

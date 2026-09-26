@@ -154,7 +154,6 @@ fn proto_supported(proto: &str) -> bool {
 struct ResolvedFmt {
     pt: u8,
     cap: CodecCap,
-    is_dynamic: bool,
     needs_rtpmap: bool,
 }
 
@@ -200,7 +199,6 @@ fn resolve_formats(
             out.push(ResolvedFmt {
                 pt,
                 cap,
-                is_dynamic,
                 // dynamic types always need rtpmap; static never do
                 needs_rtpmap: is_dynamic,
             });
@@ -219,7 +217,6 @@ fn resolve_formats(
                     out.push(ResolvedFmt {
                         pt,
                         cap: te.clone(),
-                        is_dynamic: true,
                         needs_rtpmap: true,
                     });
                     break;
@@ -505,8 +502,7 @@ pub fn stream_plans(session: &Session) -> Vec<StreamPlan> {
             .connection
             .as_ref()
             .or(session.connection.as_ref())
-            .map(|c| c.base_address().parse::<IpAddr>().ok())
-            .flatten();
+            .and_then(|c| c.base_address().parse::<IpAddr>().ok());
         let pts = m.payload_types();
         let first_pt = pts.first().copied();
         let codec = first_pt.and_then(|pt| match m.rtpmaps.get(&pt) {

@@ -172,6 +172,7 @@ dependencies = [
 name = "codecs"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "opus",
  "serde",
  "serde_json",

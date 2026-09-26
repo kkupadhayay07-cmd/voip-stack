@@ -127,6 +127,10 @@ pub fn start_with_socket(
     })
 }
 
+/// Per-leg media pump. Internal; the argument list mirrors the pump's
+/// disjoint resources (socket, codecs, channels) — a config struct would
+/// only obscure ownership.
+#[allow(clippy::too_many_arguments)]
 async fn run_pump(
     cfg: PumpConfig,
     rtp: Arc<UdpSocket>,

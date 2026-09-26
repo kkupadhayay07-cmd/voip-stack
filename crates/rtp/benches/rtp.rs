@@ -1,4 +1,4 @@
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use rtp::jitter::{JitterBuffer, JitterConfig, PushResult};
 use rtp::rtcp::{parse_compound, ReportBlock, RtcpPacket, SenderInfo};

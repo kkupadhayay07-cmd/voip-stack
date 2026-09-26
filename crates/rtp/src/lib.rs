@@ -37,7 +37,7 @@ pub fn looks_like_rtcp(buf: &[u8]) -> bool {
     let pt = buf[1];
     if (192..=223).contains(&pt) {
         // Classic RTCP range; also verify version 2 and 4-byte alignment.
-        return buf[0] >> 6 == 2 && buf.len() % 4 == 0;
+        return buf[0] >> 6 == 2 && buf.len().is_multiple_of(4);
     }
     false
 }

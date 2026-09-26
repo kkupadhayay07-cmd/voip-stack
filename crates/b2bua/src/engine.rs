@@ -66,7 +66,6 @@ const TIMER_B: Duration = Duration::from_millis(32_000);
 const TICK: Duration = Duration::from_millis(200);
 
 struct Leg {
-    side: Side,
     call_id: String,
     local_tag: String,
     remote_tag: Option<String>,
@@ -314,6 +313,9 @@ impl B2bua {
         }
     }
 
+    /// Handles an inbound INVITE. Internal but takes the full per-call
+    /// context; grouping into a struct would add indirection without value.
+    #[allow(clippy::too_many_arguments)]
     async fn on_invite(
         &self,
         sock: &Arc<UdpSocket>,
@@ -496,7 +498,6 @@ impl B2bua {
 
         let mut call = Call::new(answer.serialize());
         let leg_a = Leg {
-            side: Side::A,
             call_id: call_id.clone(),
             local_tag: new_tag(),
             remote_tag: from_tag,
@@ -518,7 +519,6 @@ impl B2bua {
             deadline: Instant::now() + TIMER_B,
         });
         call.leg_b = Some(Leg {
-            side: Side::B,
             call_id: b_call_id.clone(),
             local_tag: b_tag,
             remote_tag: None,
