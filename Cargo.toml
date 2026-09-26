@@ -9,6 +9,9 @@ members = [
     "crates/srtp",
     "crates/dtls",
     "crates/ice",
+    "crates/sbc",
+    "crates/proxy",
+    "crates/registrar",
 ]
 
 [workspace.package]
@@ -41,6 +44,9 @@ b2bua = { path = "crates/b2bua" }
 srtp = { path = "crates/srtp" }
 dtls = { path = "crates/dtls" }
 ice = { path = "crates/ice" }
+sbc = { path = "crates/sbc" }
+proxy = { path = "crates/proxy" }
+registrar = { path = "crates/registrar" }
 
 [profile.release]
 lto = "thin"
