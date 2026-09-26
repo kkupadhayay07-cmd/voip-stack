@@ -14,7 +14,7 @@ implemented natively, with **no `unsafe` anywhere**.
 | `crates/sdp` | RFC 4566/8866 SDP parser/serializer + RFC 3264 offer/answer engine (`StreamPlan` projection) | **Done** |
 | `crates/rtp` | RTP/RTCP (RFC 3550/3551), adaptive jitter buffer + PLC hooks, RFC 4733 DTMF, RFC 5761 demux, RFC 8285 extensions, RTCP feedback (NACK/PLI/FIR/TWCC) | **Core done**; REMB/RTX planned |
 | `crates/codecs` | G.711, G.722, G.729, Opus (system libopus), L16, CN (RFC 3389), PLC, resampler | **Done** (Phase-1 codec suite) |
-| `crates/b2bua` | B2BUA call engine with anchored RTP relay + `voipd` demo daemon | **Placeholder** — next work package |
+| `crates/b2bua` | B2BUA call engine: dual-leg SIP (UAS+UAC, Timer A/B), SDP offer/answer both legs, cross-connected media pumps with 16 kHz transcode bridge (any codec pair), DTMF relay, CDR events, `b2bua-demo` binary, full-loopback integration test | **Done** (Phase-1 engine) |
 
 ## Quick start
 
