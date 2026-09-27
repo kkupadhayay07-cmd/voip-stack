@@ -247,6 +247,10 @@ impl JitterBuffer {
     }
 
     /// Push a packet into the buffer. `now_ms` is virtual time in milliseconds.
+    ///
+    /// The argument list mirrors the RTP header + arrival time 1:1 on purpose;
+    /// callers already have those fields unpacked.
+    #[allow(clippy::too_many_arguments)]
     pub fn push(
         &mut self,
         ssrc: u32,

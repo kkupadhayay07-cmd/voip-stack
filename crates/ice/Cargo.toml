@@ -1,0 +1,19 @@
+[package]
+name = "ice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native STUN/ICE/TURN: RFC 5389 message codec with RFC 5769 vectors, RFC 8445 ICE agent (host/srflx/relay gathering, connectivity checks, nomination), RFC 5766 TURN server"
+
+[dependencies]
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+hmac = "0.12"
+sha1 = "0.10"
+md-5 = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+srtp = { workspace = true }

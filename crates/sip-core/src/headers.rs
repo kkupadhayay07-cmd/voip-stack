@@ -275,35 +275,33 @@ impl HeaderMap {
     /// `Supported` list.
     pub fn supported(&self) -> TokenList {
         self.get("Supported")
-            .map(|v| TokenList::parse(v))
+            .map(TokenList::parse)
             .unwrap_or_default()
     }
 
     /// `Require` list.
     pub fn require(&self) -> TokenList {
         self.get("Require")
-            .map(|v| TokenList::parse(v))
+            .map(TokenList::parse)
             .unwrap_or_default()
     }
 
     /// `Proxy-Require` list.
     pub fn proxy_require(&self) -> TokenList {
         self.get("Proxy-Require")
-            .map(|v| TokenList::parse(v))
+            .map(TokenList::parse)
             .unwrap_or_default()
     }
 
     /// `Allow` list.
     pub fn allow(&self) -> TokenList {
-        self.get("Allow")
-            .map(|v| TokenList::parse(v))
-            .unwrap_or_default()
+        self.get("Allow").map(TokenList::parse).unwrap_or_default()
     }
 
     /// `Allow-Events` (k) list.
     pub fn allow_events(&self) -> TokenList {
         self.get("Allow-Events")
-            .map(|v| TokenList::parse(v))
+            .map(TokenList::parse)
             .unwrap_or_default()
     }
 

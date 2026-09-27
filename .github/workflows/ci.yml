@@ -1,17 +1,16 @@
 # ZRTC VoIP stack — CI pipeline.
 #
-# Jobs: fmt-check, clippy, test, audit, codec-interop (G.729 vs ffmpeg).
+# Jobs: fmt-check, clippy, test, audit, fuzz-smoke, codec-interop (G.729 vs ffmpeg).
 #
-# KNOWN STATE (see worklog / docs/COMPLIANCE.md):
-# - `sip-core` transaction/transport work packages are in flight, so
-#   `cargo test --workspace` is expected red until those land.
-# - The tree is not yet rustfmt-clean (drift in rtp/sdp committed earlier);
-#   fixing crate sources is outside the infra task's scope, so fmt-check is
-#   temporary `continue-on-error: true` — flip it to strict as soon as a
-#   formatting pass lands.
-# - Clippy is run WITHOUT `-D warnings` for the same reason. Once the
-#   workspace builds warning-free, tighten to:
-#     cargo clippy --workspace --all-targets -- -D warnings
+# STATE (see worklog / docs/COMPLIANCE.md):
+# - The tree is rustfmt-clean and clippy-clean under `-D warnings`
+#   (fmt + clippy gate every push).
+# - Tests run PER CRATE sequentially (`cargo test --workspace` OOMs on
+#   constrained runners); the `test` job below uses the workspace target on
+#   GitHub runners (which have ample memory) but keeps per-crate invocations
+#   for portability. `fuzz-smoke` runs the deterministic malformed-input
+#   corpora (stable equivalent of the cargo-fuzz targets in fuzz/) — the fuzz
+#   crate itself is its own workspace and only builds under nightly libFuzzer.
 #
 # System deps: `opus 0.3` binds the system libopus via pkg-config, so every
 # job that compiles the workspace needs pkg-config + libopus-dev.
@@ -45,11 +44,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      # TODO(infra): remove continue-on-error once `cargo fmt --all` is applied
-      # to the tree (see header comment).
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
-        continue-on-error: true
 
   clippy:
     name: clippy
@@ -62,10 +58,8 @@ jobs:
       - name: Install system deps (libopus)
         run: sudo apt-get update && sudo apt-get install -y pkg-config libopus-dev
       - uses: Swatinem/rust-cache@v2
-      # TODO: tighten to `-- -D warnings` once the workspace is warning-free
-      # (see header comment).
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets
+      - name: cargo clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: test
@@ -76,8 +70,15 @@ jobs:
       - name: Install system deps (libopus)
         run: sudo apt-get update && sudo apt-get install -y pkg-config libopus-dev
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test
-        run: cargo test --workspace
+      # Per-crate, sequential: keeps the door open for memory-constrained
+      # runners and gives per-crate timing in the log.
+      - name: cargo test (per crate, sequential)
+        run: |
+          cargo test -p codecs
+          cargo test -p sip-core
+          cargo test -p sdp
+          cargo test -p rtp
+          cargo test -p b2bua
 
   audit:
     name: cargo-audit
@@ -91,6 +92,25 @@ jobs:
       - name: cargo audit
         continue-on-error: false
         run: cargo audit
+      # The one standing finding (RUSTSEC-2026-0150, audiopus_sys unmaintained)
+      # is an informational warning that exits 0; see docs/SECURITY_NOTES.md.
+
+  fuzz-smoke:
+    name: fuzz smoke (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Deterministic malformed-input corpora against the same public parser
+      # APIs the nightly libFuzzer targets exercise (see fuzz/README.md).
+      # No libopus needed: these crates have no codec deps. Sequential.
+      - name: sip-core corpus
+        run: cargo test -p sip-core --test fuzz_smoke
+      - name: sdp corpus
+        run: cargo test -p sdp --test fuzz_smoke
+      - name: rtp corpus (packets + DTMF)
+        run: cargo test -p rtp --test fuzz_smoke
 
   codec-interop:
     name: G.729 interop (ffmpeg)

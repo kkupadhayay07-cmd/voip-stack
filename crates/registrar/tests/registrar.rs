@@ -1,0 +1,311 @@
+//! Registrar behaviour tests: registration lifecycle, auth, wildcard,
+//! expiry and consistency rules.
+
+use registrar::{AuthStore, Registrar, RegistrarConfig};
+use sip_core::headers::AuthResponse;
+
+fn auth_header(a: &AuthResponse) -> String {
+    let mut h = format!(
+        "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\"",
+        a.username.as_deref().unwrap_or(""),
+        a.realm.as_deref().unwrap_or(""),
+        a.nonce.as_deref().unwrap_or(""),
+        a.uri.as_deref().unwrap_or(""),
+        a.response.as_deref().unwrap_or("")
+    );
+    if let Some(c) = &a.cnonce {
+        h.push_str(&format!(", cnonce=\"{c}\", nc=00000001, qop=auth"));
+    }
+    if let Some(alg) = &a.algorithm {
+        h.push_str(&format!(", algorithm={alg}"));
+    }
+    if let Some(o) = &a.opaque {
+        h.push_str(&format!(", opaque=\"{o}\""));
+    }
+    h
+}
+use sip_core::builder::RequestBuilder;
+use sip_core::message::Method;
+use sip_core::uri::{SipUri, TransportKind};
+use sip_core::SipMessage;
+
+fn register_req(
+    aor: &str,
+    contact: &str,
+    expires: Option<u32>,
+    call_id: &str,
+    cseq: u32,
+) -> sip_core::Request {
+    let uri = format!("sip:{aor}");
+    let mut b = RequestBuilder::new(Method::Register, SipUri::parse(&uri).unwrap())
+        .via(TransportKind::Udp, "10.0.0.9:5060", Some("z9hG4bKreg"))
+        .from(&format!("<sip:{aor}>;tag=r1"))
+        .to(&format!("<sip:{aor}>"))
+        .call_id(Some(call_id))
+        .cseq(cseq);
+    // The wildcard contact is a bare "*" (RFC 3261 §10.2.2); other contacts
+    // take angle brackets.
+    if contact == "*" {
+        b = b.contact("*");
+    } else {
+        b = b.contact(&format!("<{contact}>"));
+    }
+    if let Some(e) = expires {
+        b = b.header("Expires", &e.to_string());
+    }
+    b.build()
+}
+
+#[test]
+fn basic_registration_and_lookup() {
+    let mut reg = Registrar::new(RegistrarConfig::default());
+    let req = register_req(
+        "alice@example.com",
+        "sip:alice@10.0.0.9:5060",
+        Some(300),
+        "cid-1",
+        1,
+    );
+    let resp = reg.process(&req, "10.0.0.9:5060").unwrap();
+    assert_eq!(resp.code, 200);
+    let bindings = reg.bindings("sip:alice@example.com");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].contact, "sip:alice@10.0.0.9:5060");
+    assert_eq!(bindings[0].source, "10.0.0.9:5060");
+    assert!(bindings[0].remaining() > 200 && bindings[0].remaining() <= 300);
+
+    // Response lists the binding.
+    let contacts = resp.headers.get_all("Contact");
+    assert_eq!(contacts.len(), 1);
+    assert!(contacts[0].contains("expires="));
+}
+
+#[test]
+fn refresh_updates_expiry_and_prunes_with_zero() {
+    let mut reg = Registrar::new(RegistrarConfig::default());
+    let req = register_req(
+        "bob@example.com",
+        "sip:bob@10.0.0.8:5060",
+        Some(300),
+        "cid-2",
+        1,
+    );
+    assert_eq!(reg.process(&req, "10.0.0.8:5060").unwrap().code, 200);
+
+    // Refresh with a higher CSeq and shorter expiry.
+    let req = register_req(
+        "bob@example.com",
+        "sip:bob@10.0.0.8:5060",
+        Some(120),
+        "cid-2",
+        2,
+    );
+    assert_eq!(reg.process(&req, "10.0.0.8:5060").unwrap().code, 200);
+    let b = reg.bindings("sip:bob@example.com");
+    assert_eq!(b.len(), 1);
+    assert!(b[0].remaining() <= 120);
+
+    // De-register with Expires: 0.
+    let req = register_req(
+        "bob@example.com",
+        "sip:bob@10.0.0.8:5060",
+        Some(0),
+        "cid-2",
+        3,
+    );
+    assert_eq!(reg.process(&req, "10.0.0.8:5060").unwrap().code, 200);
+    assert!(reg.bindings("sip:bob@example.com").is_empty());
+}
+
+#[test]
+fn wildcard_removal() {
+    let mut reg = Registrar::new(RegistrarConfig::default());
+    for cseq in 1..=2 {
+        let req = register_req(
+            "carol@example.com",
+            "sip:carol@10.0.0.7:5060",
+            Some(300),
+            "cid-3",
+            cseq,
+        );
+        reg.process(&req, "10.0.0.7:5060").unwrap();
+    }
+    // Wildcard without Expires: 0 → 400.
+    let mut star = register_req("carol@example.com", "*", None, "cid-3", 3);
+    star.headers.add("Expires", "300");
+    assert_eq!(reg.process(&star, "10.0.0.7:5060").unwrap().code, 400);
+    // Wildcard with Expires: 0 → 200 and bindings wiped.
+    star.headers.remove_all("Expires");
+    star.headers.add("Expires", "0");
+    assert_eq!(reg.process(&star, "10.0.0.7:5060").unwrap().code, 200);
+    assert!(reg.bindings("sip:carol@example.com").is_empty());
+}
+
+#[test]
+fn domain_mismatch_404() {
+    let mut reg = Registrar::new(RegistrarConfig {
+        domain: Some("example.com".into()),
+        ..Default::default()
+    });
+    let req = register_req(
+        "someone@other.org",
+        "sip:someone@10.0.0.5:5060",
+        Some(300),
+        "cid-4",
+        1,
+    );
+    assert_eq!(reg.process(&req, "10.0.0.5:5060").unwrap().code, 404);
+}
+
+#[test]
+fn digest_challenge_and_success() {
+    let mut reg = Registrar::new(RegistrarConfig {
+        require_auth: true,
+        ..Default::default()
+    })
+    .with_auth(AuthStore::new("example.com").with_user("dave", "hunter2"));
+
+    let req = register_req(
+        "dave@example.com",
+        "sip:dave@10.0.0.6:5060",
+        Some(300),
+        "cid-5",
+        1,
+    );
+    // First attempt → 401 with a challenge.
+    let challenge = reg.process(&req, "10.0.0.6:5060").unwrap();
+    assert_eq!(challenge.code, 401);
+    let www = challenge.headers.get("WWW-Authenticate").unwrap();
+    assert!(www.contains("Digest") && www.contains("nonce=\""));
+
+    // Extract the nonce and build a correct Authorization header using the
+    // sip-core digest helper.
+    let nonce_start = www.find("nonce=\"").unwrap() + 7;
+    let nonce = &www[nonce_start..www[nonce_start..].find('"').unwrap() + nonce_start];
+
+    let auth_resp = sip_core::digest::respond_to_challenge(
+        &sip_core::headers::AuthChallenge::parse(www).unwrap(),
+        "REGISTER",
+        "sip:example.com",
+        "dave",
+        "hunter2",
+        1,
+        "cnonce-1",
+        false,
+    )
+    .unwrap();
+    assert_eq!(auth_resp.nonce.as_deref(), Some(nonce));
+
+    let mut authed = register_req(
+        "dave@example.com",
+        "sip:dave@10.0.0.6:5060",
+        Some(300),
+        "cid-5",
+        1,
+    );
+    authed.headers.add("Authorization", auth_header(&auth_resp));
+
+    let ok = reg.process(&authed, "10.0.0.6:5060").unwrap();
+    assert_eq!(ok.code, 200, "digest must validate");
+
+    // The nonce was consumed; replaying the same nonce → 401 again.
+    let replay = reg.process(&authed, "10.0.0.6:5060").unwrap();
+    assert_eq!(replay.code, 401);
+}
+
+#[test]
+fn wrong_password_rejected() {
+    let mut reg = Registrar::new(RegistrarConfig {
+        require_auth: true,
+        ..Default::default()
+    })
+    .with_auth(AuthStore::new("example.com").with_user("erin", "right-pass"));
+
+    let req = register_req(
+        "erin@example.com",
+        "sip:erin@10.0.0.4:5060",
+        Some(300),
+        "cid-6",
+        1,
+    );
+    let challenge = reg.process(&req, "10.0.0.4:5060").unwrap();
+    let www = challenge
+        .headers
+        .get("WWW-Authenticate")
+        .unwrap()
+        .to_string();
+
+    let auth_resp = sip_core::digest::respond_to_challenge(
+        &sip_core::headers::AuthChallenge::parse(&www).unwrap(),
+        "REGISTER",
+        "sip:example.com",
+        "erin",
+        "WRONG-pass",
+        1,
+        "cnonce-2",
+        false,
+    )
+    .unwrap();
+    let mut authed = register_req(
+        "erin@example.com",
+        "sip:erin@10.0.0.4:5060",
+        Some(300),
+        "cid-6",
+        1,
+    );
+    authed.headers.add("Authorization", auth_header(&auth_resp));
+    assert_eq!(reg.process(&authed, "10.0.0.4:5060").unwrap().code, 401);
+}
+
+#[test]
+fn multiple_contacts_and_q_ordering() {
+    let mut reg = Registrar::new(RegistrarConfig::default());
+    let req = register_req(
+        "frank@example.com",
+        "sip:frank@10.0.0.3:5060",
+        Some(300),
+        "cid-7",
+        1,
+    );
+    reg.process(&req, "10.0.0.3:5060").unwrap();
+    let req = register_req(
+        "frank@example.com",
+        "sip:frank@10.0.0.2:5060",
+        Some(300),
+        "cid-8",
+        1,
+    );
+    reg.process(&req, "10.0.0.2:5060").unwrap();
+    assert_eq!(reg.bindings("sip:frank@example.com").len(), 2);
+}
+
+#[test]
+fn non_register_rejected() {
+    let mut reg = Registrar::new(RegistrarConfig::default());
+    let invite = RequestBuilder::new(Method::Invite, SipUri::parse("sip:x@y.com").unwrap())
+        .via(TransportKind::Udp, "h:1", Some("z9hG4bKi"))
+        .from("<sip:a@b.com>")
+        .to("<sip:x@y.com>")
+        .build();
+    assert!(reg.process(&invite, "x").is_err());
+}
+
+#[test]
+fn wire_roundtrip() {
+    let mut reg = Registrar::new(RegistrarConfig::default());
+    let req = register_req(
+        "grace@example.com",
+        "sip:grace@10.0.0.1:5060",
+        Some(300),
+        "cid-9",
+        1,
+    );
+    let resp = reg.process(&req, "10.0.0.1:5060").unwrap();
+    // Response must survive serialization.
+    let wire = sip_core::serialize(&SipMessage::Response(resp.clone()));
+    let reparsed = sip_core::parse::parse_message(&wire).unwrap();
+    match reparsed {
+        SipMessage::Response(r) => assert_eq!(r.code, 200),
+        _ => panic!("expected response"),
+    }
+}

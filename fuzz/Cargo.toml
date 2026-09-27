@@ -1,0 +1,49 @@
+[package]
+name = "fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+sip-core = { path = "../crates/sip-core" }
+sdp = { path = "../crates/sdp" }
+rtp = { path = "../crates/rtp" }
+
+[[bin]]
+name = "parse_sip_message"
+path = "fuzz_targets/parse_sip_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_sdp"
+path = "fuzz_targets/parse_sdp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_rtp"
+path = "fuzz_targets/parse_rtp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_dtmf"
+path = "fuzz_targets/parse_dtmf.rs"
+test = false
+doc = false
+bench = false
+
+# The fuzz crate is its own workspace root (cargo-fuzz convention). It is
+# deliberately NOT a member of the parent workspace so that `cargo test
+# --workspace` and `cargo clippy --workspace` at the repo root never try to
+# build libfuzzer (which needs nightly).
+[workspace]

@@ -178,11 +178,11 @@ impl RtpPacket {
         out.put_u32(self.header.timestamp);
         out.put_u32(self.header.ssrc);
         for c in self.header.csrcs.iter().take(cc) {
-            out.put_u32(*c as u32);
+            out.put_u32(*c);
         }
         if let Some(ext) = &self.extension {
             out.put_u16(ext.profile);
-            let words = (ext.data.len() + 3) / 4;
+            let words = ext.data.len().div_ceil(4);
             out.put_u16(words as u16);
             out.extend_from_slice(&ext.data);
             let pad = words * 4 - ext.data.len();

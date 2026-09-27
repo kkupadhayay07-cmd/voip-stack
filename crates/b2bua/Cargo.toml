@@ -3,6 +3,22 @@ name = "b2bua"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "B2BUA call engine with anchored RTP relay"
+description = "B2BUA call engine: dual-leg SIP calls with transcoding media bridge"
+
+[[bin]]
+name = "b2bua-demo"
+path = "src/bin/b2bua-demo.rs"
 
 [dependencies]
+sip-core = { workspace = true }
+sdp = { workspace = true }
+rtp = { workspace = true }
+codecs = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

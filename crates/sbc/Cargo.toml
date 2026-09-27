@@ -1,0 +1,15 @@
+[package]
+name = "sbc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Session border controller: topology hiding, ACL, rate limiting, NAT latching"
+
+[dependencies]
+sip-core = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]

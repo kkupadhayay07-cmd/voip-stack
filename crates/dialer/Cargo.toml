@@ -1,0 +1,15 @@
+[package]
+name = "dialer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Outbound dialer: predictive/progressive/preview pacing (Erlang-C inspired), caller-ID rotation, TCPA compliance window, AMD hooks, lead management"
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+cdr = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]

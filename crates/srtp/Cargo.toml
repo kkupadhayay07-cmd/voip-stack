@@ -1,0 +1,17 @@
+[package]
+name = "srtp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SRTP/SRTCP: RFC 3711 AES-CM/HMAC-SHA1, RFC 7714 AES-GCM AEAD, KDF, replay protection, ROC estimation"
+
+[dependencies]
+aes = "0.8"
+aes-gcm = "0.10"
+hmac = "0.12"
+sha1 = "0.10"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+rand = { workspace = true }

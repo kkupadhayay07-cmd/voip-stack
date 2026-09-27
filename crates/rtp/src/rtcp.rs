@@ -393,7 +393,7 @@ pub fn encode_compound(packets: &[RtcpPacket]) -> Vec<u8> {
                     }
                     out.push(0);
                     let pad = pad4(out.len() - start);
-                    out.extend(std::iter::repeat(0).take(pad));
+                    out.extend(std::iter::repeat_n(0, pad));
                 }
                 // fix length
                 let total = out.len() - start;
@@ -419,7 +419,7 @@ pub fn encode_compound(packets: &[RtcpPacket]) -> Vec<u8> {
                     out.push(rbytes.len() as u8);
                     out.extend_from_slice(rbytes);
                     let pad = pad4(1 + rbytes.len());
-                    out.extend(std::iter::repeat(0).take(pad));
+                    out.extend(std::iter::repeat_n(0, pad));
                 }
             }
             RtcpPacket::App {
@@ -434,7 +434,7 @@ pub fn encode_compound(packets: &[RtcpPacket]) -> Vec<u8> {
                 out.extend_from_slice(name);
                 out.extend_from_slice(data);
                 let pad = pad4(data.len());
-                out.extend(std::iter::repeat(0).take(pad));
+                out.extend(std::iter::repeat_n(0, pad));
             }
             RtcpPacket::Rtpfb {
                 fmt,
@@ -459,13 +459,13 @@ pub fn encode_compound(packets: &[RtcpPacket]) -> Vec<u8> {
                 out.extend_from_slice(&media_ssrc.to_be_bytes());
                 out.extend_from_slice(payload);
                 let pad = pad4(payload.len());
-                out.extend(std::iter::repeat(0).take(pad));
+                out.extend(std::iter::repeat_n(0, pad));
             }
             RtcpPacket::Unknown { pt, payload } => {
                 put_header(&mut out, 0, *pt, body_words(payload.len()));
                 out.extend_from_slice(payload);
                 let pad = pad4(payload.len());
-                out.extend(std::iter::repeat(0).take(pad));
+                out.extend(std::iter::repeat_n(0, pad));
             }
         }
     }
