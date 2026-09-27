@@ -95,6 +95,8 @@ pub enum CdrEvent {
         duration_ms: u64,
         frames_a_to_b: u64,
         frames_b_to_a: u64,
+        /// PLC/concealment frames across both legs (same total diag reports).
+        concealed: u64,
         at: Instant,
     },
 }
@@ -161,12 +163,15 @@ impl CdrEvent {
                 duration_ms,
                 frames_a_to_b,
                 frames_b_to_a,
+                concealed,
                 ..
             } => (
                 c.clone(),
                 "-".to_string(),
                 "CALL_ENDED".into(),
-                format!("duration_ms={duration_ms} a2b={frames_a_to_b} b2a={frames_b_to_a}"),
+                format!(
+                    "duration_ms={duration_ms} a2b={frames_a_to_b} b2a={frames_b_to_a} concealed={concealed}"
+                ),
             ),
         };
         CdrRecord {

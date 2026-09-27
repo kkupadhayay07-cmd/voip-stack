@@ -1012,9 +1012,9 @@ fn cdr_log(_answer: String, call_id: String, duration_ms: u64, a2b: u64, b2a: u6
             duration_ms,
             frames_a_to_b: a2b,
             frames_b_to_a: b2a,
+            concealed,
             at: Instant::now(),
         });
-        let _ = concealed;
     }
 }
 

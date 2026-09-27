@@ -89,7 +89,7 @@ pub struct MediaStats {
     pub packets_tx: u64,
     pub packets_lost: u64,
     pub avg_jitter_ms: f32,
-    pub plc_events: u64,
+    pub concealed_events: u64,
     pub codec: Option<String>,
 }
 

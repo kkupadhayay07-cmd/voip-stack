@@ -50,6 +50,7 @@ pub async fn run(mut rx: UnboundedReceiver<CdrEvent>, store: CdrStore, outbound:
                 duration_ms,
                 frames_a_to_b,
                 frames_b_to_a,
+                concealed,
                 ..
             } => {
                 let direction = if outbound.lock().expect("outbound ids").contains(&call_id) {
@@ -70,6 +71,7 @@ pub async fn run(mut rx: UnboundedReceiver<CdrEvent>, store: CdrStore, outbound:
                     duration_ms,
                     frames_a_to_b,
                     frames_b_to_a,
+                    concealed,
                 );
                 tracing::info!(
                     call_id = %call_id,
@@ -93,6 +95,7 @@ fn build_record(
     duration_ms: u64,
     frames_a_to_b: u64,
     frames_b_to_a: u64,
+    concealed: u64,
 ) -> CallRecord {
     let talk_secs = duration_ms / 1000;
     let (code, canceled) = if st.answered { (200u16, false) } else { (487, false) };
@@ -106,7 +109,7 @@ fn build_record(
         packets_tx: frames_b_to_a,
         packets_lost: 0,
         avg_jitter_ms: 0.0,
-        plc_events: 0,
+        concealed_events: concealed,
         codec: st.codec.clone(),
     };
     rec
