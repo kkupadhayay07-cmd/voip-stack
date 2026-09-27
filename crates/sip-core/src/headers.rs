@@ -27,8 +27,44 @@ pub type Expires = u64;
 pub type MaxForwards = u32;
 /// `Min-SE` value.
 pub type MinSe = u64;
-/// `Session-Expires` value.
+/// `Session-Expires` value (interval part).
 pub type SessionExpires = u64;
+
+/// `refresher` parameter of `Session-Expires` (RFC 4028 §3): which UA sends
+/// the session refreshes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refresher {
+    /// The UAC refreshes the session (also the default when omitted).
+    Uac,
+    /// The UAS refreshes the session.
+    Uas,
+}
+
+impl Refresher {
+    /// Header text form (`uac` / `uas`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Refresher::Uac => "uac",
+            Refresher::Uas => "uas",
+        }
+    }
+
+    /// Parses a `refresher` parameter value (case-insensitive; anything
+    /// other than `uas` maps to the default `uac`).
+    pub fn parse(s: &str) -> Refresher {
+        if s.trim().eq_ignore_ascii_case("uas") {
+            Refresher::Uas
+        } else {
+            Refresher::Uac
+        }
+    }
+}
+
+impl fmt::Display for Refresher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 /// `Retry-After` value.
 pub type RetryAfter = u64;
 /// `Reason` value.
@@ -325,10 +361,28 @@ impl HeaderMap {
         self.get("Refer-To").and_then(|v| NameAddr::parse(v).ok())
     }
 
-    /// `Session-Expires` numeric value.
+    /// `Session-Expires` numeric value (interval part, params stripped).
     pub fn session_expires(&self) -> Option<u64> {
         self.get("Session-Expires")
             .and_then(|v| v.split(';').next().unwrap_or("").trim().parse().ok())
+    }
+
+    /// `Session-Expires` raw value (interval + optional parameters), so
+    /// callers can tell a present-but-garbage header from an absent one.
+    pub fn session_expires_raw(&self) -> Option<&str> {
+        self.get("Session-Expires")
+    }
+
+    /// `refresher` parameter of `Session-Expires` (RFC 4028 §3).
+    pub fn session_refresher(&self) -> Option<Refresher> {
+        self.get("Session-Expires").and_then(|v| {
+            v.split(';').find_map(|p| {
+                let p = p.trim();
+                p.strip_prefix("refresher=")
+                    .or_else(|| p.strip_prefix("REFRESHER="))
+                    .map(Refresher::parse)
+            })
+        })
     }
 
     /// `Min-SE` numeric value.
@@ -968,6 +1022,34 @@ mod tests {
         assert!(t.has("timer"));
         assert!(t.has("foo"));
         assert_eq!(t.to_string(), "100rel, timer, FOO");
+    }
+
+    #[test]
+    fn session_expires_accessors() {
+        let mut h = HeaderMap::new();
+        assert_eq!(h.session_expires_raw(), None);
+        assert_eq!(h.session_expires(), None);
+        assert_eq!(h.session_refresher(), None);
+
+        h.add("Session-Expires", "600;refresher=uas");
+        assert_eq!(h.session_expires(), Some(600));
+        assert_eq!(h.session_expires_raw(), Some("600;refresher=uas"));
+        assert_eq!(h.session_refresher(), Some(Refresher::Uas));
+
+        h.remove_all("Session-Expires");
+        h.add("Session-Expires", "1800");
+        assert_eq!(h.session_expires(), Some(1800));
+        // Default refresher when the parameter is absent is UAC (RFC 4028 §9).
+        assert_eq!(h.session_refresher(), None);
+
+        h.remove_all("Session-Expires");
+        h.add("Session-Expires", "90;refresher=UAC");
+        assert_eq!(h.session_refresher(), Some(Refresher::Uac));
+
+        h.remove_all("Session-Expires");
+        h.add("Session-Expires", "soon;refresher=uas");
+        assert_eq!(h.session_expires(), None);
+        assert_eq!(h.session_expires_raw(), Some("soon;refresher=uas"));
     }
 
     #[test]

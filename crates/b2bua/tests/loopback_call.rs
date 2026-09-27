@@ -161,6 +161,7 @@ async fn loopback_call_pcmu_to_pcma() {
         ],
         routes: Vec::new(),
         default_target: "sip:placeholder".into(), // replaced below
+        session_timer_min_se: b2bua::timers::DEFAULT_MIN_SE,
     };
 
     let b_sip = UdpSocket::bind("127.0.0.1:0").await.unwrap();

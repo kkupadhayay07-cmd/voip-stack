@@ -39,6 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
         routes: Vec::new(),
         default_target: target,
+        session_timer_min_se: b2bua::timers::DEFAULT_MIN_SE,
     };
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

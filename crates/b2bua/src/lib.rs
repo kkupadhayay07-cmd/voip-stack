@@ -32,6 +32,12 @@
 //! * Media: one pump task per leg owning its jitter buffer, decoder and
 //!   encoder; paced TX by encoder frame duration; latches the remote media
 //!   address from the first valid RTP datagram if SDP routing fails (NAT).
+//! * Session timers (RFC 4028, `timers` module): negotiated per leg on the
+//!   initial INVITE (`422`/`Min-SE` below the floor, `Session-Expires`
+//!   mirrored with an explicit `refresher`), refreshes as no-change
+//!   re-INVITEs or UPDATEs, expiry tears the call down with BYEs on both
+//!   legs. In-dialog re-INVITEs are answered with the cached answer when
+//!   they do not change the session and `488` otherwise.
 //!
 //! CDR events are emitted for every leg transition and call termination on an
 //! [`tokio::sync::mpsc::UnboundedSender`].
@@ -39,6 +45,7 @@
 pub mod engine;
 pub mod media;
 pub mod sdp_util;
+pub mod timers;
 
 use serde::{Deserialize, Serialize};
 use std::time::Instant;

@@ -206,6 +206,7 @@ pub async fn run(mut cfg: Config) -> Result<(), String> {
                 })
                 .collect(),
             default_target: cfg.b2bua.default_target.clone(),
+            session_timer_min_se: b2bua::timers::DEFAULT_MIN_SE,
         };
         let engine_sock = Arc::new(
             UdpSocket::bind(b2bua_bind)
