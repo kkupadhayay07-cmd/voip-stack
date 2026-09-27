@@ -80,6 +80,10 @@ impl Default for ProxyConfig {
 pub struct ForkedTransaction {
     pub call_id: String,
     pub top_branch: String,
+    /// Branch of the incoming request's top Via (below ours). CANCELs mirror
+    /// the upstream Via stack (RFC 3261 §9.1), so they are matched against
+    /// this — not against [`Self::top_branch`], which is ours.
+    pub incoming_branch: String,
     pub method: Method,
     /// Branch → branch-target (per fork leg).
     pub legs: Vec<String>,
@@ -92,7 +96,7 @@ pub struct ForkedTransaction {
 pub struct Proxy {
     pub routes: RouteTable,
     pub config: ProxyConfig,
-    /// call-id+branch → in-flight fork.
+    /// In-flight forks keyed by the shared transaction key (see [`Proxy::tx_key`]).
     pub transactions: HashMap<String, ForkedTransaction>,
     /// Registrar-fed lookup: user → contact URIs (used before static routes).
     pub bindings: HashMap<String, Vec<String>>,
@@ -108,7 +112,11 @@ impl Proxy {
         }
     }
 
-    fn tx_key(call_id: &str, branch: &str, method: &str) -> String {
+    /// The ONE transaction key builder, shared by the request path (insert /
+    /// CANCEL) and the response path (lookup): call-id + top-Via branch +
+    /// method (RFC 3261 §17.1.3 client-transaction identity). Both paths MUST
+    /// feed it the same dimensions or responses never find their forks.
+    fn tx_key(call_id: &str, branch: &str, method: &Method) -> String {
         format!("{call_id}|{branch}|{method}")
     }
 
@@ -134,7 +142,8 @@ impl Proxy {
         }
 
         // CANCEL: cancel in-flight fork and forward downstream (§16.7).
-        // The CANCEL mirrors the INVITE's incoming branch.
+        // The CANCEL mirrors the INVITE's incoming Via stack, so it is matched
+        // against the transaction's recorded incoming branch (§9.1).
         if req.method == Method::Cancel {
             let call_id = req.headers.call_id().unwrap_or("").to_string();
             let branch = req
@@ -142,8 +151,12 @@ impl Proxy {
                 .first_via()
                 .and_then(|v| v.branch.clone())
                 .unwrap_or_default();
-            let key = Self::tx_key(&call_id, &branch, "INVITE");
-            if let Some(tx) = self.transactions.remove(&key) {
+            let key = self
+                .transactions
+                .iter()
+                .find(|(_, tx)| tx.call_id == call_id && tx.incoming_branch == branch)
+                .map(|(k, _)| k.clone());
+            if let Some(tx) = key.and_then(|k| self.transactions.remove(&k)) {
                 // One CANCEL per forked leg, same branch semantics as the
                 // INVITE it cancels (§16.7 step 2).
                 for leg in &tx.legs {
@@ -255,13 +268,18 @@ impl Proxy {
 
         if req.method == Method::Invite {
             let call_id = req.headers.call_id().unwrap_or("").to_string();
-            let key = Self::tx_key(&call_id, &incoming_branch, "INVITE");
+            // Key by the branch WE put on top: responses echo it back in the
+            // top Via (§17.1.3), so the response path resolves with the same
+            // builder. The CANCEL-matchable incoming branch is recorded on
+            // the transaction itself.
+            let key = Self::tx_key(&call_id, &our_branch2, &req.method);
             self.transactions.insert(
                 key,
                 ForkedTransaction {
                     call_id,
                     top_branch: our_branch2,
-                    method: Method::Invite,
+                    incoming_branch,
+                    method: req.method.clone(),
                     legs,
                     best: HashMap::new(),
                     started: std::time::Instant::now(),
@@ -303,7 +321,15 @@ impl Proxy {
         }
 
         let call_id = resp.headers.call_id().unwrap_or("").to_string();
-        let key = Self::tx_key(&call_id, &ours, "INVITE");
+        // Same key builder as the insert path: our top-Via branch (echoed by
+        // the leg) plus the CSeq method of the transaction the response
+        // belongs to (§17.1.3).
+        let method = resp
+            .headers
+            .cseq()
+            .map(|c| c.method)
+            .unwrap_or(Method::Invite);
+        let key = Self::tx_key(&call_id, &ours, &method);
         if let Some(tx) = self.transactions.get_mut(&key) {
             let code = resp.code;
             // Track per-leg best response (branch of the remaining top via):

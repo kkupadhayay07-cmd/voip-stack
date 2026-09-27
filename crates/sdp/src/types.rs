@@ -308,7 +308,11 @@ impl fmt::Display for Session {
         if let Some(i) = &self.info {
             out.push_str(&format!("i={}\r\n", i));
         }
-        for (_, raw) in &self.extras {
+        // Extras are stored as (type letter, value): the value is the text
+        // AFTER the `<type>=` prefix, so the prefix must be re-emitted here.
+        for (typ, raw) in &self.extras {
+            out.push(*typ);
+            out.push('=');
             out.push_str(raw);
             out.push_str("\r\n");
         }
@@ -344,7 +348,10 @@ impl fmt::Display for Session {
             if let Some(i) = &m.info {
                 out.push_str(&format!("i={}\r\n", i));
             }
-            for (_, raw) in &m.extras {
+            // Media-level extras carry the same (type, value) pair shape.
+            for (typ, raw) in &m.extras {
+                out.push(*typ);
+                out.push('=');
                 out.push_str(raw);
                 out.push_str("\r\n");
             }
@@ -363,5 +370,62 @@ impl fmt::Display for Session {
 impl Session {
     pub fn serialize(&self) -> String {
         self.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::parse;
+
+    const BASE: &str = "v=0\r\n\
+        o=- 1 1 IN IP4 1.2.3.4\r\n\
+        s=-\r\n\
+        t=0 0\r\n\
+        c=IN IP4 1.2.3.4\r\n\
+        m=audio 5000 RTP/AVP 0\r\n\
+        a=rtpmap:0 PCMU/8000\r\n";
+
+    #[test]
+    fn extras_serialize_with_type_prefix() {
+        let mut s = parse(BASE).unwrap();
+        s.extras.push(('u', "https://example.com/call".into()));
+        s.extras.push(('e', "ops@example.com".into()));
+        s.extras.push(('p', "+1 555 0100".into()));
+        s.extras.push(('z', "0 3600 19830918".into()));
+        s.medias[0].extras.push(('k', "prompt".into()));
+
+        let out = s.serialize();
+        // Every extra must round-trip its `<type>=` prefix — the stored value
+        // alone is not wire form.
+        assert!(out.contains("u=https://example.com/call\r\n"), "{out}");
+        assert!(out.contains("e=ops@example.com\r\n"), "{out}");
+        assert!(out.contains("p=+1 555 0100\r\n"), "{out}");
+        assert!(out.contains("z=0 3600 19830918\r\n"), "{out}");
+        assert!(out.contains("k=prompt\r\n"), "{out}");
+        // The old bug: bare values without the prefix.
+        assert!(!out.contains("\r\nhttps://example.com/call\r\n"));
+
+        // Full parse→serialize→parse round trip reproduces the session.
+        let rt = parse(&out).unwrap();
+        assert_eq!(s, rt);
+    }
+
+    #[test]
+    fn custom_extras_serialize_verbatim() {
+        // `extras` is a public field: callers may park any (type letter,
+        // value) pair there (e.g. mirrored custom lines). Serialization must
+        // emit `<type>=<value>` for whatever letter was stored.
+        let mut s = parse(BASE).unwrap();
+        s.extras.push(('a', "mycustomvalue".into()));
+        s.extras.push(('b', "AS:64".into()));
+        s.medias[0].extras.push(('b', "TIAS:512000".into()));
+
+        let out = s.serialize();
+        assert!(out.contains("a=mycustomvalue\r\n"), "{out}");
+        assert!(out.contains("b=AS:64\r\n"), "{out}");
+        assert!(out.contains("b=TIAS:512000\r\n"), "{out}");
+        // Value never leaks without its prefix.
+        assert!(!out.contains("\r\nmycustomvalue\r\n"));
+        assert!(!out.contains("\r\nAS:64\r\n"));
     }
 }

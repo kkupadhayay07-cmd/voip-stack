@@ -26,9 +26,13 @@ struct MixerInput {
     /// Gain (1.0 = unity).
     gain: f32,
     muted: bool,
-    /// Whether the last frame was silent (VAD result) — inputs contributing
-    /// silence are skipped in the sum for loudness headroom.
+    /// Whether the last frame was silent (VAD result) — inactive inputs
+    /// contribute nothing to the mix.
     active: bool,
+    /// Mix periods elapsed since the last fresh frame was pushed. Inputs
+    /// not refreshed within the staleness window stop contributing (their
+    /// retained frame is never replayed indefinitely).
+    since_push: usize,
 }
 
 /// N-way conference mixer.
@@ -40,6 +44,12 @@ pub struct Mixer {
 }
 
 impl Mixer {
+    /// How many mix periods an un-refreshed input's last frame keeps
+    /// contributing before the input is treated as stale (a few packet
+    /// periods; a stream that stops producing must not be replayed
+    /// forever).
+    const STALE_AFTER_MIXES: usize = 3;
+
     /// Create a mixer at the bridge sample rate (e.g. 16000 Hz).
     pub fn new(rate: u32) -> Self {
         Mixer {
@@ -62,6 +72,7 @@ impl Mixer {
                 gain: 1.0,
                 muted: false,
                 active: false,
+                since_push: 0,
             });
         }
     }
@@ -88,18 +99,26 @@ impl Mixer {
         if let Some(i) = self.inputs.iter_mut().find(|i| i.id == id) {
             i.frame = frame.to_vec();
             i.active = active;
+            i.since_push = 0;
         }
     }
 
-    /// Mix one frame.  The longest active input frame defines the output
-    /// length; every contributing input is resampled by nearest-repetition
-    /// only when lengths disagree (normal operation: all legs share the
-    /// same packetization, so lengths match).
+    /// Mix one frame.  The longest contributing input frame defines the
+    /// output length; every contributing input is resampled by
+    /// nearest-repetition only when lengths disagree (normal operation: all
+    /// legs share the same packetization, so lengths match).
+    ///
+    /// An input contributes only when it is unmuted, VAD-active and fresh:
+    /// a stream that stopped producing is dropped after the staleness
+    /// window instead of having its last frame re-mixed forever.
     pub fn mix(&mut self) -> Vec<i16> {
+        let contributes =
+            |i: &MixerInput| !i.muted && i.active && i.since_push < Self::STALE_AFTER_MIXES;
+
         let width = self
             .inputs
             .iter()
-            .filter(|i| !i.muted && i.active)
+            .filter(|i| contributes(i))
             .map(|i| i.frame.len())
             .max()
             .or_else(|| self.inputs.iter().map(|i| i.frame.len()).max())
@@ -107,12 +126,12 @@ impl Mixer {
 
         let mut out = vec![0i16; width];
         // Count contributors for scaling.
-        let contributors = self.inputs.iter().filter(|i| !i.muted).count().max(1) as f32;
+        let contributors = self.inputs.iter().filter(|i| contributes(i)).count().max(1) as f32;
 
         // First pass: accumulate in f32 with per-input gain.
         let mut acc = vec![0f32; width];
         for i in &self.inputs {
-            if i.muted {
+            if !contributes(i) {
                 continue;
             }
             for (n, o) in acc.iter_mut().enumerate() {
@@ -135,6 +154,11 @@ impl Mixer {
                 v /= contributors.sqrt();
             }
             *o = v.clamp(-32767.0, 32767.0) as i16;
+        }
+
+        // Age every input by one mix period; push_frame resets the age.
+        for i in &mut self.inputs {
+            i.since_push = i.since_push.saturating_add(1);
         }
         out
     }
@@ -351,6 +375,44 @@ mod tests {
     fn mixer_no_inputs_is_silence() {
         let mut mixer = Mixer::new(16000);
         assert!(mixer.mix().is_empty());
+    }
+
+    // Regression 2.15(i): VAD-inactive inputs must not contribute.
+    #[test]
+    fn mixer_skips_inactive_input() {
+        let mut mixer = Mixer::new(16000);
+        mixer.add_input(1);
+        mixer.add_input(2);
+        mixer.push_frame(1, &vec![1000i16; 320], true);
+        mixer.push_frame(2, &vec![9000i16; 320], false); // inactive
+        let out = mixer.mix();
+        assert_eq!(out[0], 1000, "inactive input must not contribute");
+    }
+
+    // Regression 2.15(ii): a stream that stops producing contributes only
+    // within the staleness window, then goes silent (no infinite replay).
+    #[test]
+    fn mixer_stale_input_stops_contributing() {
+        let mut mixer = Mixer::new(16000);
+        mixer.add_input(1);
+        mixer.push_frame(1, &vec![1000i16; 160], true);
+        assert_eq!(mixer.mix()[0], 1000, "fresh frame contributes");
+        // No further pushes: the retained frame may replay for the rest of
+        // the staleness window (Mixer::STALE_AFTER_MIXES periods), no more.
+        for _ in 0..Mixer::STALE_AFTER_MIXES - 1 {
+            assert_eq!(mixer.mix()[0], 1000, "within staleness window");
+        }
+        for _ in 0..4 {
+            let out = mixer.mix();
+            assert!(
+                out.iter().all(|&s| s == 0),
+                "stale frame must expire, got {}",
+                out.first().copied().unwrap_or(0)
+            );
+        }
+        // A resumed stream contributes again.
+        mixer.push_frame(1, &vec![1000i16; 160], true);
+        assert_eq!(mixer.mix()[0], 1000, "stream resumed");
     }
 
     #[test]

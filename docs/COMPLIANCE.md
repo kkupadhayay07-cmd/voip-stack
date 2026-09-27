@@ -5,8 +5,11 @@ Status of the ZRTC VoIP stack against the RFCs and ITU codecs it targets.
 behind it. Last reviewed: 2026-09 (all six phases implemented plus the
 hardening series: `sip-tx` transaction layer, in-process observability,
 trunk auth, `zrtc` daemon transports, the TCP/TLS/WSS framing audit, RFC 4028
-session timers and RFC 3262 PRACK/100rel on both B2BUA legs; 396 tests green
-across 54 suites).
+session timers and RFC 3262 PRACK/100rel on both B2BUA legs, plus the
+external security/interop audit triage with its follow-up fix waves
+(Remote-DoS parser panics, SRTP payload authentication, G.729 postfilter
+output, ICE IPv6/TURN, SBC/proxy response maps, dialer/mixer/CDR data
+integrity); 446 tests green across 54 suites).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
@@ -20,14 +23,14 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC 3261 | SIP: transactions (§17) | **Done** (core) | `sip-tx` crate: client INVITE (Timers A/B/D), client non-INVITE (E/F/K), server INVITE (G/H/I), server non-INVITE (J); §17.1.3 response matching + §17.2.3 ACK matching; pure state machines, fake-clock tests at exact fire instants. The B2BUA drives both call legs through it. Failover (RFC 3263) remains open. |
 | RFC 3261 | SIP: transports (§18) | **Done** (core) | UDP/TCP/TLS/WSS listeners wired in the `zrtc` daemon (TLS via whitelisted OpenSSL, self-signed identity at startup, mTLS client certs for trunks); message layer covers datagram + stream framing incl. §18.3 robustness. |
 | RFC 3261 | SIP: dialogs (§12) | **Partial** | B2BUA tracks per-leg dialog state (tags/Call-ID/CSeq); generic dialog package not extracted. |
-| RFC 3262 | PRACK / 100rel | **Done** (core) | B2BUA, both legs. UAS: reliable 180 (`Require: 100rel` + `RSeq` from [1, 2³¹−1], To-tagged early dialog) when the caller advertises 100rel, Timer-G-style retransmission (T1 doubling to T2) until `PRACK`, 64·T1 give-up with 503 + BYE, the final 200 parked until the PRACK arrives (§3), RAck matching with 481/400 verdicts and idempotent 200 for retransmitted PRACKs. UAC: reliable 1xx answered with PRACK carrying `RAck` (own dialog CSeq), including retransmissions (lost-PRACK recovery), 421 Extension-Required dial retry once with `Supported: 100rel`; non-INVITE responses excluded from the INVITE transaction slot. |
+| RFC 3262 | PRACK / 100rel | **Done** (core) | B2BUA, both legs. UAS: reliable 180 (`Require: 100rel` + `RSeq` from [1, 2³¹−1], To-tagged early dialog) when the caller advertises 100rel, Timer-G-style retransmission (T1 doubling to T2) until `PRACK`, 64·T1 give-up with 503 + BYE, the final 200 parked until the PRACK arrives (§3), RAck matching with 481/400 verdicts and idempotent 200 for retransmitted PRACKs. UAC: only a 101–199 carrying BOTH `Require: 100rel` and `RSeq` is PRACKed (§4 — never a 100, never an unmarked 1xx), answered with PRACK carrying `RAck` (own dialog CSeq); a retransmitted 1xx (same `RSeq`) is answered by resending the STORED PRACK byte-identically (same CSeq number and branch, RFC 3261 §17.1.2); 421 Extension-Required dial retry once with the demanded extensions merged into `Supported` (§3); non-INVITE responses excluded from the INVITE transaction slot. |
 | RFC 3263 | DNS (NAPTR/SRV) for SIP | **Partial** | Proxy falls back to system resolver for hostnames; NAPTR/SRV discovery not implemented. |
-| RFC 3264 | Offer/answer | **Done** | `sdp::negotiate`: full RFC 3264 engine with `StreamPlan` projection. |
+| RFC 3264 | Offer/answer | **Done** | `sdp::negotiate`: full RFC 3264 engine with `StreamPlan` projection. Answer direction is the explicit §6.1 matrix clamped to what the offer permits (sendonly offers can never draw a receiving answer, etc.), rejected m-lines are answered with their own m-line at port 0 and a null `c=` line of the offer's address type (§6), port-0 offers are answered port 0. |
 | RFC 3326 | Reason header | **Partial** | Header type modelled; no protocol semantics applied yet. |
 | RFC 3515 | REFER | **Planned** | `Refer-To` header type modelled; call flows not implemented. |
 | RFC 3581 | rport / Symmetric RTP | **Done** | SBC marks `rport` on requests and routes responses via received/rport; NAT latch table maps contact → source. |
 | RFC 4028 | Session timers | **Done** | B2BUA, both legs: `Min-SE`/422 floor on inbound INVITEs, `Session-Expires`+`refresher` negotiation mirrored end-to-end on the 200s, half-interval refresh re-INVITEs (no-change offer), in-dialog UPDATE refresh, expiry teardown with BYEs on both legs, 422-retry with the peer's `Min-SE`, tag-checked in-dialog re-INVITE/UPDATE routing (481/491/488). |
-| RFC 4566 | SDP | **Done** | `sdp` crate: strict positioned-error parser + canonical serializer. |
+| RFC 4566 | SDP | **Done** | `sdp` crate: strict positioned-error parser + canonical serializer; session extras (`u=/e=/p=/k=/z=`) serialize with their `typ=` prefixes. |
 | RFC 8866 | SDP v2 | **Partial** | Parser/model cover `rtpmap`/`fmtp`, `ice-*`, `fingerprint`, `bundle`, `extmap`; full 8866 grammar validation not complete. |
 | RFC 2617/7616 | Digest auth | **Done** (server side) | `sip-core` helpers + registrar nonce store; `respond_to_challenge` used in tests/clients. |
 | RFC 6140 / 5627 | GRUU | **Planned** | Not started. |
@@ -46,14 +49,14 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC 5761 | RTP/RTCP demultiplexing | **Done** | §4 heuristic, unit-tested. |
 | RFC 8285 | RTP header extensions | **Done** | One-byte and two-byte blocks parse/serialize. |
 | RFC 3711 | SRTP/SRTCP | **Done** | `srtp` crate: AES-CM + HMAC-SHA1 (80/32 tags), key derivation (labels 0–5, rate semantics), 64-entry replay window (libsrtp-style relative bits), RFC 3711 Appendix A ROC estimation, per-SSRC stream state, SRTCP E-bit/index. Validated against RFC 3711 B.2/B.3 vectors. |
-| RFC 7714 | SRTP AES-GCM | **Done** | AEAD_AES_128/256_GCM (16-byte tags) + 96-bit tag variants; SRTP/SRTCP IV per §8.1/§9.1; E=0 AAD semantics per §9.3; validated against §16.1.1/16.1.2/16.1.4/16.2.1 vectors. |
+| RFC 7714 | SRTP AES-GCM | **Done** | AEAD_AES_128/256_GCM (16-byte tags) + 96-bit tag variants; SRTP/SRTCP IV per §8.1/§9.1; E=0 AAD semantics per §9.3 incl. authenticate-only acceptance of unencrypted SRTCP and the §9 tag-before-index wire order; validated against §16.1.1/16.1.2/16.1.4/16.2.1 and §17.1/§17.3 (SRTCP encrypted + tagging-only, tamper-tested) vectors. |
 | RFC 5764 | DTLS-SRTP handshake/usage | **Done** | `dtls` crate: use_srtp negotiation, RFC 8122 fingerprint generation + pinning, RFC 5764 §4.2 keying export (`EXTRACTOR-dtls_srtp`), self-signed runtime ECDSA P-256 identities. |
 | RFC 6347 | DTLS 1.2 | **Done** (via OpenSSL) | DTLS 1.2 only (NO_DTLSV1); handshake driven over a datagram queue transport with our own flight retransmission + 30 s deadline; loss-resilient handshake covered by tests. |
 | RFC 5389 | STUN | **Done** | `ice::stun`: full TLV codec (XOR-MAPPED/PEER/RELAYED, USERNAME, MESSAGE-INTEGRITY, FINGERPRINT, ERROR-CODE, ICE-* attrs, TURN attrs); validated against RFC 5769 §2.1/§2.2. |
 | RFC 8489 | STUN (newer) | **Partial** | 5389 semantics implemented; 8489-only additions (e.g. new error codes, ADDITIONAL-ADDRESS-FAMILY) not modelled. |
-| RFC 8445 | ICE | **Done** (core) | `ice::agent`: candidate gathering (host/srflx/relay), priorities (§5.1.2.1), connectivity checks with short-term creds, role + tie-breaker, USE-CANDIDATE nomination, keepalives, prflx discovery. Triggered-check pacing simplified (all-pairs-at-once; documented). |
+| RFC 8445 | ICE | **Done** (core) | `ice::agent`: candidate gathering (host/srflx/relay), priorities (§5.1.2.1), connectivity checks with short-term creds, role + tie-breaker, USE-CANDIDATE nomination, keepalives, prflx discovery; SDP candidate lines parse IPv6 (bare + bracketed, RFC 8839 §5.1). Triggered-check pacing simplified (all-pairs-at-once; documented). |
 | RFC 5766 | TURN server | **Done** (core) | Allocation (long-term MD5 auth), refresh, CreatePermission, Send/Data indications, ChannelBind; per-allocation relay sockets pumped concurrently; permission enforcement on both paths. TCP allocations, ReservationToken and mobility not implemented. |
-| RFC 5766 | TURN client | **Done** | Agent-side allocation flow (401 → credentials → verified response) used for relay candidate gathering. |
+| RFC 5766 | TURN client | **Done** | Agent-side allocation flow: 401 → credentials → verified response (MD5 long-term key pinned by independent known vectors), plus the unauthenticated path with idempotent re-Allocate per RFC 5766 §6.2; used for relay candidate gathering. |
 | RFC 7983 | Demultiplexing STUN/DTLS/RTP | **Partial** | First-byte classification in the ICE agent; DTLS records classified (0-3) and passed to the DTLS layer by the assembly. |
 
 ## 3. Codecs
@@ -111,15 +114,18 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **396 passing across 54 suites**.
-* RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16),
-  STUN (RFC 5769 §2.1/§2.2), G.729 (bcg729 oracle), cross-decode by ffmpeg.
+  `cargo test --workspace` → **446 passing across 54 suites**.
+* RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16 + §17.1/§17.3
+  SRTCP AEAD), STUN (RFC 5769 §2.1/§2.2; MD5 long-term keys + MESSAGE-INTEGRITY
+  against independent vectors), G.729 (bcg729 oracle), cross-decode by ffmpeg.
 * End-to-end in-repo: B2BUA loopback call, RFC 4028 session-timer flows
   (negotiation, refresh, 422 floor/retry, UPDATE, expiry BYEs), RFC 3262
   rel100 flows (reliable 180 with the parked 200, retransmission until
   PRACK, RAck verdicts 481/488, plain-180 path, both-legs PRACK incl.
-  retransmission recovery, 421 dial retry), DTLS-SRTP
-  handshake → SRTP media, ICE agent pair checks, TURN relay round-trip, REST
+  stored-PRACK retransmission recovery, §4 PRACK gates, 421 retry with
+  `Supported` merge), DTLS-SRTP
+  handshake → SRTP media, ICE agent pair checks (incl. IPv6 candidates),
+  TURN relay round-trip (authenticated + unauthenticated idempotent), REST
   API black-box tests.
 * `cargo audit`: 0 vulnerabilities (1 allowed unmaintained notice on the
   whitelisted libopus FFI wrapper).

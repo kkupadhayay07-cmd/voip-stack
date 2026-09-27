@@ -1,7 +1,6 @@
 //! ICE candidates and SDP candidate-line codec (RFC 8839, formerly 5245).
 
-use std::net::SocketAddr;
-use std::str::FromStr;
+use std::net::{IpAddr, SocketAddr};
 
 /// Candidate types in priority order (RFC 8445 §5.1.2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,17 +139,12 @@ impl Candidate {
         }
         let typ = CandidateType::from_str(tok[7]).ok_or(IceError::BadCandidate(line.len()))?;
         // connection-address and port are separate fields (RFC 8839 §5.1);
-        // bare IPv6 addresses are permitted without brackets.
+        // the address is a single token: bare IPv6, bracketed IPv6 or IPv4.
         let port: u16 = tok[5]
             .parse()
             .map_err(|_| IceError::BadCandidate(line.len()))?;
-        let ip_txt = if tok[4].starts_with('[') {
-            tok[4].trim_matches(|c| c == '[' || c == ']')
-        } else {
-            tok[4]
-        };
-        let address = SocketAddr::from_str(&format!("{ip_txt}:{port}"))
-            .map_err(|_| IceError::BadCandidate(line.len()))?;
+        let address =
+            parse_connection_address(tok[4], port).ok_or(IceError::BadCandidate(line.len()))?;
         let mut related = None;
         if typ != CandidateType::Host {
             // scan for raddr/rport pairs after the "typ x" pair; both are
@@ -168,8 +162,8 @@ impl Candidate {
             }
             if let Some(rip) = rip {
                 let port = rport.unwrap_or(0);
-                let addr = SocketAddr::from_str(&format!("{rip}:{port}"))
-                    .map_err(|_| IceError::BadCandidate(line.len()))?;
+                let addr = parse_connection_address(&rip, port)
+                    .ok_or(IceError::BadCandidate(line.len()))?;
                 related = Some(addr);
             }
         }
@@ -187,6 +181,16 @@ impl Candidate {
             related,
         })
     }
+}
+
+/// Parse a candidate connection-address token + port into a SocketAddr.
+/// The address is one whitespace-delimited field (RFC 8839 §5.1) and may be
+/// bare IPv6, a bracketed IPv6 literal or IPv4 — colons inside an IPv6
+/// address must never be mistaken for an `ip:port` separator.
+fn parse_connection_address(ip_txt: &str, port: u16) -> Option<SocketAddr> {
+    let ip_txt = ip_txt.trim_matches(|c| c == '[' || c == ']');
+    let ip: IpAddr = ip_txt.parse().ok()?;
+    Some(SocketAddr::new(ip, port))
 }
 
 /// Errors from the ICE layer.
@@ -247,5 +251,53 @@ mod tests {
     fn bad_candidates_rejected() {
         assert!(Candidate::from_sdp("candidate:1 1 udp 123").is_err());
         assert!(Candidate::from_sdp("candidate:1 1 udp 123 1.2.3.4 5 typ banana").is_err());
+    }
+
+    /// IPv6 host candidates: bare (the RFC 8839 form our to_sdp emits) and
+    /// bracketed, with the address taken as a single token.
+    #[test]
+    fn ipv6_host_candidates_parse() {
+        let c =
+            Candidate::from_sdp("candidate:1 1 UDP 2130706431 2001:db8::1 8998 typ host").unwrap();
+        assert_eq!(c.address.to_string(), "[2001:db8::1]:8998");
+        assert_eq!(c.component, 1);
+        assert_eq!(c.priority, 2130706431);
+        assert_eq!(c.transport, "udp");
+        assert_eq!(c.typ, CandidateType::Host);
+        assert!(c.related.is_none());
+
+        // Bracketed variant parses to the same address.
+        let c2 = Candidate::from_sdp("candidate:1 1 UDP 2130706431 [2001:db8::1] 8998 typ host")
+            .unwrap();
+        assert_eq!(c2.address, c.address);
+
+        // to_sdp emits the bare form and it re-parses.
+        let rt = Candidate::from_sdp(&c.to_sdp()).unwrap();
+        assert_eq!(rt.address, c.address);
+        assert_eq!(rt.typ, CandidateType::Host);
+    }
+
+    /// IPv6 server-reflexive candidate with an IPv6 related address.
+    #[test]
+    fn ipv6_srflx_with_related() {
+        let c = Candidate::from_sdp(
+            "candidate:4 1 UDP 1694498815 2001:db8::9 61000 typ srflx raddr 2001:db8::1 rport 8998",
+        )
+        .unwrap();
+        assert_eq!(c.typ, CandidateType::Srflx);
+        assert_eq!(c.address.to_string(), "[2001:db8::9]:61000");
+        assert_eq!(c.related.unwrap().to_string(), "[2001:db8::1]:8998");
+    }
+
+    /// Malformed IPv6 candidates are rejected (bad port, bad address).
+    #[test]
+    fn ipv6_bad_fields_rejected() {
+        assert!(
+            Candidate::from_sdp("candidate:1 1 UDP 2130706431 2001:db8::1 notaport typ host")
+                .is_err()
+        );
+        assert!(
+            Candidate::from_sdp("candidate:1 1 UDP 2130706431 2001:db8::zz 8998 typ host").is_err()
+        );
     }
 }

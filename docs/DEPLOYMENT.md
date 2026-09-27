@@ -194,9 +194,11 @@ configured bounds. Guidance:
    estimation, data channels (SCTP).
 5. **Container entrypoint** — wire `zrtc` as the image entrypoint with a
    mounted config + real healthcheck.
-6. **SDP hardening** (IPv6, BUNDLE, rejected m-lines), GRUU/Outbound,
+6. **SDP hardening** (IPv6, BUNDLE — rejected m-lines, port-0 answers and
+   the RFC 3264 §6.1 direction clamp are done), GRUU/Outbound,
    NAPTR/SRV for carrier-grade signaling. (PRACK/100rel shipped — see
-   `COMPLIANCE.md`.)
+   `COMPLIANCE.md`; external audit triage and its fix waves are tracked in
+   `docs/BUG_AUDIT_2026-09.md`.)
 
 See `docs/DESIGN.md` for the full architecture contract and
 `docs/COMPLIANCE.md` for the per-RFC status matrix.

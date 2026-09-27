@@ -345,9 +345,18 @@ async fn run_pump(
                         payload,
                     } => {
                         // Peer-leg DTMF: packetize with OUR telephone-event
-                        // PT and sequence, keep the original timestamp.
+                        // PT and sequence, keep the original timestamp. If
+                        // the peer leg negotiated no telephone-event codec,
+                        // the event cannot be represented on this dialog —
+                        // drop it rather than mislabelling an audio packet.
+                        let Some(te_pt) = cfg.te_pt_tx else {
+                            tracing::debug!(
+                                "peer leg has no telephone-event PT; DTMF event dropped"
+                            );
+                            continue;
+                        };
                         let relay = RtpPacket::new(
-                            cfg.te_pt_tx.unwrap_or(cfg.tx_pt),
+                            te_pt,
                             out_seq,
                             timestamp,
                             ssrc,

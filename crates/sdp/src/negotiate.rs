@@ -107,34 +107,36 @@ impl std::fmt::Display for NegotiateError {
 
 impl std::error::Error for NegotiateError {}
 
-/// Compute the answer direction given the offer direction and our maximal capability.
+/// Compute the answer direction from the offer direction and the direction
+/// our capabilities request (RFC 3264 §6.1).
 ///
-/// | offer    | caps     | answer   |
-/// |----------|----------|----------|
-/// | sendrecv | sendrecv | sendrecv |
-/// | sendrecv | sendonly | sendonly |
-/// | sendrecv | recvonly | recvonly |
-/// | sendonly | *        | recvonly |
-/// | recvonly | *        | sendonly |
-/// | inactive | *        | inactive |
+/// The result is always a *valid* answer for the offer, clamped to what we
+/// can actually do:
+///
+/// | offer    | requested (caps)  | answer   |
+/// |----------|-------------------|----------|
+/// | sendrecv | * (any of four)   | caps     |
+/// | sendonly | recvonly/sendrecv | recvonly |
+/// | sendonly | sendonly/inactive | inactive |
+/// | recvonly | sendonly/sendrecv | sendonly |
+/// | recvonly | recvonly/inactive | inactive |
+/// | inactive | *                 | inactive |
+///
+/// The clamp matters when the offer forbids our only usable direction: an
+/// answer may never claim to receive (offer sendonly) or send (offer
+/// recvonly) what the peer will not exchange, and it must not claim a
+/// direction our own caps lack — `inactive` is the only valid answer then.
 pub fn answer_direction(offer: Direction, caps: Direction) -> Direction {
-    match offer {
-        Direction::Inactive => Direction::Inactive,
-        Direction::SendOnly => {
-            if caps == Direction::Inactive {
-                Direction::Inactive
-            } else {
-                Direction::RecvOnly
-            }
-        }
-        Direction::RecvOnly => {
-            if caps == Direction::Inactive {
-                Direction::Inactive
-            } else {
-                Direction::SendOnly
-            }
-        }
-        Direction::SendRecv => caps,
+    match (offer, caps) {
+        (Direction::Inactive, _) => Direction::Inactive,
+        // Offerer only sends: we may only receive, and only if we can.
+        (Direction::SendOnly, Direction::RecvOnly | Direction::SendRecv) => Direction::RecvOnly,
+        (Direction::SendOnly, _) => Direction::Inactive,
+        // Offerer only receives: we may only send, and only if we can.
+        (Direction::RecvOnly, Direction::SendOnly | Direction::SendRecv) => Direction::SendOnly,
+        (Direction::RecvOnly, _) => Direction::Inactive,
+        // Fully bidirectional offer: any answer direction is valid.
+        (Direction::SendRecv, caps) => caps,
     }
 }
 
@@ -232,27 +234,36 @@ fn resolve_formats(
     out
 }
 
-fn rejected_media(offer_m: &MediaDescription) -> MediaDescription {
-    let first_fmt = offer_m
-        .formats
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "0".into());
+fn rejected_media(offer_m: &MediaDescription, offer: &Session) -> MediaDescription {
+    // RFC 3264 §6: a rejected stream keeps its m= line (same media/proto and
+    // the offered format list) with port zero and a null connection address;
+    // the null address follows the offer's address type.
+    let (addr_type, null_addr) = match offer_m.connection.as_ref().or(offer.connection.as_ref()) {
+        Some(c) if c.addr_type.eq_ignore_ascii_case("IP6") => ("IP6", "::"),
+        _ => ("IP4", "0.0.0.0"),
+    };
     MediaDescription {
         media: offer_m.media.clone(),
         port: 0,
         port_count: 1,
         proto: offer_m.proto.clone(),
-        formats: vec![first_fmt],
+        formats: offer_m.formats.clone(),
         info: None,
-        connection: None,
+        connection: Some(Connection {
+            net_type: "IN".into(),
+            addr_type: addr_type.into(),
+            address: null_addr.into(),
+        }),
         bandwidths: Vec::new(),
         attributes: Vec::new(),
         extras: Vec::new(),
         rtpmaps: Default::default(),
         fmtps: Default::default(),
         rtcp_fb: Default::default(),
-        direction: Some(Direction::Inactive),
+        // No direction attribute is emitted for a rejected stream (port 0
+        // alone signals rejection), so the typed mirror stays None — keeping
+        // the constructed answer equal to its own re-serialization.
+        direction: None,
         rtcp_mux: false,
         mid: offer_m.mid.clone(),
         ptime: None,
@@ -318,48 +329,18 @@ pub fn answer_session(offer: &Session, caps: &[MediaCaps]) -> Result<Session, Ne
 
     for (i, offer_m) in offer.medias.iter().enumerate() {
         let caps_m = &caps[i];
-        let rejected = MediaDescription {
-            media: offer_m.media.clone(),
-            port: 0,
-            port_count: 1,
-            proto: offer_m.proto.clone(),
-            formats: vec![offer_m
-                .formats
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "0".into())],
-            info: None,
-            connection: None,
-            bandwidths: Vec::new(),
-            attributes: Vec::new(),
-            extras: Vec::new(),
-            rtpmaps: Default::default(),
-            fmtps: Default::default(),
-            rtcp_fb: Default::default(),
-            direction: Some(Direction::Inactive),
-            rtcp_mux: false,
-            mid: offer_m.mid.clone(),
-            ptime: None,
-            maxptime: None,
-            ice_ufrag: None,
-            ice_pwd: None,
-            ice_options: None,
-            ice_candidates: Vec::new(),
-            fingerprint: None,
-            setup: None,
-            rtcp_addr: None,
-            extmaps: Vec::new(),
-            ssrcs: Vec::new(),
-        };
 
         let mut m = if caps_m.media == offer_m.media {
-            rejected_media(offer_m)
+            rejected_media(offer_m, offer)
         } else {
-            answer.medias.push(rejected);
+            answer.medias.push(rejected_media(offer_m, offer));
             continue;
         };
 
-        if !proto_supported(&offer_m.proto) || caps_m.port == 0 {
+        // RFC 3264 §6: a stream offered with port 0 must stay rejected, and
+        // streams we cannot support (transport or local port) are answered
+        // with port 0 — never omitted, or later m-line indices shift.
+        if offer_m.port == 0 || !proto_supported(&offer_m.proto) || caps_m.port == 0 {
             answer.medias.push(m);
             continue;
         }
@@ -370,7 +351,7 @@ pub fn answer_session(offer: &Session, caps: &[MediaCaps]) -> Result<Session, Ne
         let resolved = resolve_formats(offer_m, offer, caps_m);
         if resolved.is_empty() {
             // RFC 3264 §6: no acceptable codec ⇒ reject this m-line with port 0.
-            answer.medias.push(rejected);
+            answer.medias.push(rejected_media(offer_m, offer));
             continue;
         }
 
@@ -659,15 +640,139 @@ a=ssrc:3520455752 cname:xyz\r\n";
     }
 
     #[test]
-    fn direction_intersection_table() {
+    fn rejected_stream_keeps_mline_with_null_connection() {
+        // Two offered streams: audio (accepted) + video (kind mismatch →
+        // rejected). The answer must keep both m-lines in order.
+        let offer_str = "v=0\r\n\
+            o=- 1 1 IN IP4 1.2.3.4\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 1.2.3.4\r\n\
+            m=audio 5000 RTP/AVP 0 8\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            m=video 6000 RTP/AVP 96 97\r\n\
+            a=rtpmap:96 H264/90000\r\n";
+        let offer = parse(offer_str).unwrap();
+        let mut vcaps = caps_audio();
+        vcaps.media = "video".into(); // kind-mismatched → rejected
+        let answer = answer_session(&offer, &[caps_audio(), vcaps]).unwrap();
+
+        assert_eq!(
+            answer.medias.len(),
+            offer.medias.len(),
+            "every offered m-line gets an answer m-line"
+        );
+        let rej = &answer.medias[1];
+        assert_eq!(rej.media, "video");
+        assert_eq!(rej.port, 0);
+        assert_eq!(rej.proto, "RTP/AVP");
+        assert_eq!(
+            rej.formats,
+            vec!["96", "97"],
+            "rejected stream echoes the offered format list"
+        );
+        let c = rej.connection.as_ref().expect("rejected stream needs c=");
+        assert_eq!((c.net_type.as_str(), c.addr_type.as_str()), ("IN", "IP4"));
+        assert_eq!(c.address, "0.0.0.0");
+
+        // Wire form: the m= line stays in place (indices must not shift) and
+        // the null connection is at media level.
+        let out = answer.serialize();
+        assert!(out.contains("m=video 0 RTP/AVP 96 97\r\n"), "{out}");
+        assert!(out.contains("c=IN IP4 0.0.0.0\r\n"), "{out}");
+        let rt = parse(&out).unwrap();
+        assert_eq!(answer, rt);
+
+        // Rejected streams produce no active plan.
+        let plans = stream_plans(&answer);
+        assert!(plans[0].active);
+        assert!(!plans[1].active);
+    }
+
+    #[test]
+    fn offer_port_zero_is_answered_with_port_zero() {
+        // RFC 3264 §6: a stream the offerer offered with port 0 must be
+        // answered with port 0 — even when we could support it.
+        let offer_str = "v=0\r\n\
+            o=- 1 1 IN IP4 1.2.3.4\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 1.2.3.4\r\n\
+            m=audio 5000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            m=video 0 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n";
+        let offer = parse(offer_str).unwrap();
+        let mut vcaps = caps_audio();
+        vcaps.media = "video".into(); // we *could* answer this video stream
+        let answer = answer_session(&offer, &[caps_audio(), vcaps]).unwrap();
+
+        assert_eq!(answer.medias.len(), 2);
+        assert_eq!(answer.medias[0].port, 20000, "accepted stream unaffected");
+        let v = &answer.medias[1];
+        assert_eq!(
+            v.port, 0,
+            "a stream offered with port 0 must be answered with port 0"
+        );
+        assert_eq!(v.connection.as_ref().unwrap().address, "0.0.0.0");
+    }
+
+    #[test]
+    fn rejected_stream_null_connection_follows_offer_address_type() {
+        let offer_str = "v=0\r\n\
+            o=- 1 1 IN IP6 2001:db8::1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP6 2001:db8::1\r\n\
+            m=audio 5000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            m=video 6000 RTP/AVP 96\r\n\
+            a=rtpmap:96 H264/90000\r\n";
+        let offer = parse(offer_str).unwrap();
+        let mut vcaps = caps_audio();
+        vcaps.media = "video".into(); // kind-mismatched → rejected
+        let answer = answer_session(&offer, &[caps_audio(), vcaps]).unwrap();
+        let c = answer.medias[1].connection.as_ref().unwrap();
+        assert_eq!((c.addr_type.as_str(), c.address.as_str()), ("IP6", "::"));
+    }
+
+    #[test]
+    fn direction_matrix_valid_for_every_combination() {
         use Direction::*;
-        assert_eq!(answer_direction(SendRecv, SendRecv), SendRecv);
-        assert_eq!(answer_direction(SendRecv, SendOnly), SendOnly);
-        assert_eq!(answer_direction(SendRecv, RecvOnly), RecvOnly);
-        assert_eq!(answer_direction(SendOnly, SendRecv), RecvOnly);
-        assert_eq!(answer_direction(RecvOnly, SendRecv), SendOnly);
-        assert_eq!(answer_direction(SendOnly, Inactive), Inactive);
-        assert_eq!(answer_direction(Inactive, SendRecv), Inactive);
+        // (offer, requested/caps) → answer. Every pair must produce a valid
+        // RFC 3264 §6.1 answer: sendrecv accepts any; sendonly only
+        // recvonly/inactive; recvonly only sendonly/inactive; inactive only
+        // inactive — and the answer never claims a direction our caps lack.
+        let table = [
+            // offer sendrecv: any capability stands
+            (SendRecv, SendRecv, SendRecv),
+            (SendRecv, SendOnly, SendOnly),
+            (SendRecv, RecvOnly, RecvOnly),
+            (SendRecv, Inactive, Inactive),
+            // offer sendonly: we may only receive — if we can receive at all
+            (SendOnly, SendRecv, RecvOnly),
+            (SendOnly, RecvOnly, RecvOnly),
+            (SendOnly, SendOnly, Inactive), // recv-only would claim a capability we lack
+            (SendOnly, Inactive, Inactive),
+            // offer recvonly: we may only send — if we can send at all
+            (RecvOnly, SendRecv, SendOnly),
+            (RecvOnly, SendOnly, SendOnly),
+            (RecvOnly, RecvOnly, Inactive), // send-only would claim a capability we lack
+            (RecvOnly, Inactive, Inactive),
+            // offer inactive: the answer must be inactive
+            (Inactive, SendRecv, Inactive),
+            (Inactive, SendOnly, Inactive),
+            (Inactive, RecvOnly, Inactive),
+            (Inactive, Inactive, Inactive),
+        ];
+        for (offer, caps, want) in table {
+            assert_eq!(
+                answer_direction(offer, caps),
+                want,
+                "offer={offer} caps={caps}"
+            );
+        }
     }
 
     #[test]

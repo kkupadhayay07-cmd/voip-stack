@@ -3,8 +3,11 @@
 //! - RFC 3711 Appendix B.3: AES-CM key derivation (via the KDF unit tests
 //!   and through `SrtpSession::new` below)
 //! - RFC 7714 §16.1.1 / §16.1.2 / §16.1.4 / §16.2.1: SRTP AEAD_AES_128/256_GCM
+//! - RFC 7714 §17.1 / §17.3: SRTCP AEAD_AES_128_GCM (encrypted E=1 and
+//!   tagging-only E=0), pinning the `cipher || tag || E-flag|index` wire
+//!   order and the §9.3 authenticate-only path for unencrypted packets
 
-use srtp::{Profile, SessionKeySet, SrtpSession};
+use srtp::{Profile, SessionKeySet, SrtpError, SrtpSession};
 
 /// Build a session from raw session keys.  The RFC 7714 §16 vectors specify
 /// the session key/salt directly, with no RFC 3711 derivation step.
@@ -130,4 +133,95 @@ fn rfc3711_kdf_via_session_construction() {
     }
     // GCM profiles must reject the 14-octet salt.
     assert!(SrtpSession::new(Profile::AeadAes128Gcm, &mk, &ms).is_err());
+}
+
+/// RFC 7714 §17.1: SRTCP AEAD_AES_128_GCM encryption vector.  Pins the
+/// `header || ciphertext || GCM tag || E-flag|index` wire order and the
+/// `header || E-flag|index` AAD (the tag sits before the index word).
+#[test]
+fn rfc7714_17_1_srtcp_aes128_gcm_decrypt() {
+    let key = (0u8..=15).collect::<Vec<u8>>();
+    let salt = hex::decode("517569642070726f2071756f").unwrap(); // "Quid pro quo"
+    let mut session = session_from_raw(Profile::AeadAes128Gcm, &key, &salt);
+
+    let mut wire = hex::decode(concat!(
+        "81c8000d4d617273",
+        "63e94885dcdab67ca727d7662f6b7e99",
+        "7ff5c0f76c06f32dc676a5f1730d6fda",
+        "4ce09b4686303ded0bb9275b",
+        "c84aa45896cf4d2fc5abf87245d9eade",
+        "800005d4"
+    ))
+    .unwrap();
+    let idx = session.unprotect_rtcp(&mut wire).unwrap();
+    assert_eq!(idx, 0x5d4, "SRTCP index from the E-flag word");
+    assert_eq!(
+        wire,
+        hex::decode(concat!(
+            "81c8000d4d617273",
+            "4e5450314e545032",
+            "525450200000042a",
+            "0000e9304c756e61",
+            "deadbeefdeadbeefdeadbeefdeadbeef",
+            "deadbeef"
+        ))
+        .unwrap(),
+        "§17.1: decryption must restore the plaintext RTCP packet"
+    );
+}
+
+/// RFC 7714 §17.3: SRTCP AEAD_AES_128_GCM tagging-only vector (E=0).  The
+/// plaintext is empty, the whole packet (header || body || E-flag|index) is
+/// AAD, and the GCM tag sits before the E-flag|index word.
+#[test]
+fn rfc7714_17_3_srtcp_aes128_gcm_e0_tag_only() {
+    let key = (0u8..=15).collect::<Vec<u8>>();
+    let salt = hex::decode("517569642070726f2071756f").unwrap();
+    let mut session = session_from_raw(Profile::AeadAes128Gcm, &key, &salt);
+
+    let original = hex::decode(concat!(
+        "81c8000d4d617273",
+        "4e5450314e545032",
+        "525450200000042a",
+        "0000e9304c756e61",
+        "deadbeefdeadbeefdeadbeefdeadbeef",
+        "deadbeef"
+    ))
+    .unwrap();
+    let mut wire = original.clone();
+    wire.extend_from_slice(&hex::decode("841dd9683dd78ec92ae58790125f62b3").unwrap());
+    wire.extend_from_slice(&hex::decode("000005d4").unwrap()); // E=0, index 1492
+
+    let idx = session.unprotect_rtcp(&mut wire).unwrap();
+    assert_eq!(idx, 0x5d4);
+    assert_eq!(
+        wire, original,
+        "§17.3: E=0 packet must come back without the tag/index trailer"
+    );
+}
+
+/// §17.3 with a tampered body byte: E=0 SRTCP is authenticate-only, so any
+/// modification must fail tag verification.
+#[test]
+fn rfc7714_17_3_srtcp_e0_tamper_fails() {
+    let key = (0u8..=15).collect::<Vec<u8>>();
+    let salt = hex::decode("517569642070726f2071756f").unwrap();
+    let mut session = session_from_raw(Profile::AeadAes128Gcm, &key, &salt);
+
+    let mut wire = hex::decode(concat!(
+        "81c8000d4d617273",
+        "4e5450314e545032",
+        "525450200000042a",
+        "0000e9304c756e61",
+        "deadbeefdeadbeefdeadbeefdeadbeef",
+        "deadbeef",
+        "841dd9683dd78ec92ae58790125f62b3",
+        "000005d4"
+    ))
+    .unwrap();
+    wire[12] ^= 0x01; // flip one bit inside the authenticated body
+    assert_eq!(
+        session.unprotect_rtcp(&mut wire),
+        Err(SrtpError::AuthFailed)
+    );
 }

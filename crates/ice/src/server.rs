@@ -276,9 +276,20 @@ impl StunTurnServer {
             })
             .unwrap_or_default();
 
-        // Already allocated?
-        if self.allocations.read().await.contains_key(&from) {
+        // Already allocated?  RFC 5766 §6.2: a repeated Allocate for the
+        // same 5-tuple is answered with the EXISTING relayed address — a
+        // bare success without XOR-RELAYED-ADDRESS breaks idempotent
+        // clients (and unauthenticated re-allocates).
+        let existing_relayed = {
+            let allocs = self.allocations.read().await;
+            allocs
+                .get(&from)
+                .map(|alloc| alloc.relay.local_addr().unwrap_or(from))
+        };
+        if let Some(relayed) = existing_relayed {
             let mut resp = stun::Message::new_with_txid(stun::ALLOCATE_RESPONSE, msg.tx_id);
+            resp.add_xor_address(stun::XOR_RELAYED_ADDRESS, relayed);
+            resp.add_xor_address(stun::XOR_MAPPED_ADDRESS, from);
             resp.add_lifetime(self.config.default_lifetime.as_secs() as u32);
             if !key.is_empty() {
                 resp.add_message_integrity(&key);

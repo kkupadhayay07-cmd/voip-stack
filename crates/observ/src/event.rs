@@ -283,14 +283,20 @@ pub fn rtp_header_fields(bytes: &[u8]) -> Option<(u32, u16, u8)> {
 }
 
 /// Replaces the value of every `Authorization` / `Proxy-Authorization`
-/// header with `[REDACTED]`. Operates on raw serialized SIP bytes (header
-/// block only; bodies are untouched) so both pcap and trace outputs are
-/// safe by construction.
+/// header with `<scheme> [REDACTED]` (the scheme token is kept for
+/// debugging; everything after it is credential material). Obs-fold
+/// continuation lines (leading SP/HTAB) of those headers are redacted too
+/// — senders may split the credentials across folded lines, and unfolded
+/// values would otherwise leak into pcap/trace. Operates on raw
+/// serialized SIP bytes (header block only; bodies are untouched) so both
+/// pcap and trace outputs are safe by construction.
 pub fn redact_sip(bytes: &[u8]) -> Vec<u8> {
     let split = find_header_end(bytes);
     let (head, tail) = bytes.split_at(split);
     let mut out = Vec::with_capacity(bytes.len() + 16);
     let mut pos = 0usize;
+    // True while inside the folded continuation of an auth header.
+    let mut in_folded_auth = false;
     while pos < head.len() {
         let end = head[pos..]
             .iter()
@@ -298,17 +304,61 @@ pub fn redact_sip(bytes: &[u8]) -> Vec<u8> {
             .map(|i| pos + i + 1)
             .unwrap_or(head.len());
         let line = &head[pos..end];
+        let is_continuation = matches!(line.first(), Some(b' ') | Some(b'\t'));
         if is_auth_header(line) {
+            in_folded_auth = true;
             let name_end = line.iter().position(|&b| b == b':').unwrap_or(line.len());
             out.extend_from_slice(&line[..=name_end]);
-            out.extend_from_slice(b" [REDACTED]\r\n");
+            let content_end = line.len() - line_terminator(line).len();
+            let scheme = auth_scheme(&line[name_end + 1..content_end]);
+            if scheme.is_empty() {
+                out.extend_from_slice(b" [REDACTED]");
+            } else {
+                out.push(b' ');
+                out.extend_from_slice(scheme);
+                out.extend_from_slice(b" [REDACTED]");
+            }
+            out.extend_from_slice(line_terminator(line));
+        } else if in_folded_auth && is_continuation {
+            // Continuation of a folded auth header: credential fragments.
+            out.extend_from_slice(b" [REDACTED]");
+            out.extend_from_slice(line_terminator(line));
         } else {
+            if !is_continuation {
+                in_folded_auth = false;
+            }
             out.extend_from_slice(line);
         }
         pos = end;
     }
     out.extend_from_slice(tail);
     out
+}
+
+/// The line's terminator (CRLF, bare LF, or none at end of input).
+fn line_terminator(line: &[u8]) -> &[u8] {
+    if line.ends_with(b"\r\n") {
+        b"\r\n"
+    } else if line.ends_with(b"\n") {
+        b"\n"
+    } else {
+        b""
+    }
+}
+
+/// The auth scheme: the first token of the credential value (e.g. `Digest`
+/// or `Bearer`). The scheme is not secret and is kept for debugging.
+fn auth_scheme(value: &[u8]) -> &[u8] {
+    let start = value
+        .iter()
+        .position(|&b| b != b' ' && b != b'\t')
+        .unwrap_or(value.len());
+    let value = &value[start..];
+    let end = value
+        .iter()
+        .position(|&b| b == b' ' || b == b'\t' || b == b',')
+        .unwrap_or(value.len());
+    &value[..end]
 }
 
 fn find_header_end(bytes: &[u8]) -> usize {
@@ -338,14 +388,64 @@ mod tests {
         let msg = b"INVITE sip:1000@x SIP/2.0\r\nAuthorization: Digest username=\"u\", response=\"deadbeef\"\r\nCall-ID: abc\r\nProxy-Authorization: Bearer sk-123\r\n\r\nv=0\r\n";
         let out = redact_sip(msg);
         let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("Authorization: [REDACTED]"), "{s}");
-        assert!(s.contains("Proxy-Authorization: [REDACTED]"), "{s}");
+        // The scheme token is kept for debugging; the credentials are gone.
+        assert!(s.contains("Authorization: Digest [REDACTED]"), "{s}");
+        assert!(s.contains("Proxy-Authorization: Bearer [REDACTED]"), "{s}");
         assert!(!s.contains("deadbeef") && !s.contains("sk-123"));
+        assert!(!s.contains("username=\"u\""), "{s}");
         assert!(s.contains("Call-ID: abc"));
         assert!(s.contains("v=0"), "body preserved");
         // lowercase header name variant
         let out2 = redact_sip(b"REGISTER sip:x SIP/2.0\r\nauthorization: Basic Zm9v\r\n\r\n");
-        assert!(String::from_utf8_lossy(&out2).contains("[REDACTED]"));
+        let s2 = String::from_utf8_lossy(&out2);
+        assert!(s2.contains("authorization: Basic [REDACTED]"), "{s2}");
+        assert!(!s2.contains("Zm9v"), "{s2}");
+    }
+
+    // Regression 2.16(ii): obs-fold continuation lines of an auth header
+    // carry credential fragments and must be redacted like the header.
+    #[test]
+    fn redacts_folded_auth_continuation_lines() {
+        let msg = b"INVITE sip:1000@x SIP/2.0\r\nAuthorization: Digest username=\"u\",\r\n response=\"deadbeef\", uri=\"sip:x\"\r\nCall-ID: abc\r\n\r\n";
+        let out = redact_sip(msg);
+        let s = String::from_utf8_lossy(&out);
+        assert!(!s.contains("deadbeef"), "folded credential leaked: {s}");
+        assert!(!s.contains("username=\"u\""), "{s}");
+        assert!(s.contains("Authorization: Digest [REDACTED]"), "{s}");
+        assert!(s.contains(" [REDACTED]\r\n"), "continuation redacted: {s}");
+        assert!(s.contains("Call-ID: abc"), "{s}");
+    }
+
+    #[test]
+    fn folded_auth_never_reaches_serialized_event() {
+        let msg = b"REGISTER sip:x SIP/2.0\r\nProxy-Authorization:\r\n\tBearer sk-999\r\nCall-ID: c-auth\r\n\r\n";
+        let redacted = redact_sip(msg);
+        let s = String::from_utf8_lossy(&redacted);
+        assert!(!s.contains("sk-999"), "folded credential leaked: {s}");
+        // And the credential must not appear in the serialized event either.
+        let ev = Event::now(
+            "c-auth",
+            EventKind::SipRx {
+                peer: Peer {
+                    addr: "127.0.0.1:5060".parse().unwrap(),
+                    transport: Transport::Udp,
+                },
+                bytes: redacted,
+                plaintext: true,
+            },
+        );
+        let line = serde_json::to_string(&ev).unwrap();
+        // Bytes travel hex-encoded, so probe for the credential's hex too.
+        let hexed: String = b"sk-999".iter().map(|b| format!("{b:02x}")).collect();
+        assert!(!line.contains(&hexed), "{line}");
+        // Roundtrip: what consumers deserialized has no credential either.
+        let back: Event = serde_json::from_str(&line).unwrap();
+        match back.kind {
+            EventKind::SipRx { bytes, .. } => {
+                assert!(!String::from_utf8_lossy(&bytes).contains("sk-999"));
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
     }
 
     #[test]

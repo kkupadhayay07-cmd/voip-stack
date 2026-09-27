@@ -13,8 +13,11 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 396 tests passing across 54 suites in 19 crates;
-`clippy -D warnings` clean; `cargo audit` clean.**
+**Current state: 446 tests passing across 54 suites in 19 crates;
+`clippy -D warnings` clean; `cargo audit` clean. External security/interop
+audit (42 findings) triaged — every Critical/High confirmed finding either
+fixed with regression tests or tracked open in
+[`docs/BUG_AUDIT_2026-09.md`](docs/BUG_AUDIT_2026-09.md).**
 
 ## Workspace layout
 
@@ -46,7 +49,7 @@ observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 396 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 446 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -73,7 +76,13 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
   64·T1 timeouts), including retransmission absorption and non-2xx ACK.
 * **Reliable provisional responses (RFC 3262)**: reliable 180 with the final
   200 parked until PRACK, Timer-G retransmission until acknowledged, RAck
-  verdicts (481/400/488), lost-PRACK recovery on leg B, 421 dial retry.
+  verdicts (481/400/488), stored-PRACK resend on 1xx retransmission (same
+  CSeq and branch, RFC 3261 §17.1.2), §4 PRACK gates (100 and 1xx without
+  `Require: 100rel` never PRACKed), 421 dial retry with `Supported` merge.
+* **SDP offer/answer**: RFC 3264 §6.1 answer-direction matrix validated for
+  every offer/caps combination, rejected m-lines answered port 0 with a
+  null `c=` line (offer's address type), port-0 offers answered port 0,
+  SDP extras (`u=/e=/p=/k=/z=`) serialize with their `typ=` prefix.
 * **Codecs**: every codec round-trips; G.729 additionally validated against
   ITU reference (bcg729) oracle vectors; Opus via system libopus FFI.
 * **WebRTC path**: DTLS-SRTP handshake (self-signed P-256 certs, fingerprint
@@ -81,7 +90,11 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
   media; ICE agents complete checks over UDP loopback; TURN relays through
   our own server.
 * **Security primitives**: SRTP validated against RFC 3711 B.2/B.3 and
-  RFC 7714 §16 conformance vectors; STUN against RFC 5769 §2.1/§2.2.
+  RFC 7714 §16 conformance vectors; SRTCP AEAD against RFC 7714 §17.1/§17.3
+  (encrypted, tagging-only E=0, tamper); STUN against RFC 5769 §2.1/§2.2;
+  TURN long-term auth (MD5 key) against independent known vectors;
+  unauthenticated TURN Allocate is idempotent per RFC 5766 §6.2; IPv6 SDP
+  candidates (bare + bracketed) parse per RFC 8839 §5.1.
 * **Consistency**: per-leg diag counters, per-call traces and CDRs
   (`concealed_events`, `packets_lost`) come from the same pump counters —
   verified equal in the demo.
@@ -99,7 +112,9 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
   observability (pcap/traces/diag/CDR), trunk auth (IP/Digest/Bearer/mTLS),
   UDP/TCP/TLS/WSS listeners, TCP/TLS/WSS framing audit under adverse input,
   RFC 4028 session timers, RFC 3262 PRACK/100rel — both on both B2BUA
-  legs. ✅
+  legs, external audit triage (14+ findings fixed with regression tests:
+  remote-DoS panics, SRTP payload auth, G.729 postfilter output, ICE
+  IPv6/TURN, SBC/proxy response maps, dialer pacing, mixer, CDR). ✅
 
 ## Roadmap (next)
 
@@ -108,8 +123,9 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
 3. Postgres CDR persistence (sqlx) + retention policies.
 4. WebRTC hardening — RTX/NACK resend path, TWCC-driven bandwidth estimation,
    data channels (SCTP).
-5. SDP hardening (IPv6, BUNDLE, rejected m-lines), GRUU/Outbound, NAPTR/SRV
-   for carrier-grade signaling.
+5. SDP hardening — rejected m-lines, port-0 offers, RFC 3264 §6.1 direction
+   clamp and extras serialization **done**; remaining: IPv6/BUNDLE, plus
+   GRUU/Outbound, NAPTR/SRV for carrier-grade signaling.
 
 ## Documentation
 

@@ -125,7 +125,8 @@ verified by SNR on real audio).
 4. **Postgres CDR backend** (sqlx) + retention/archival policies.
 5. **WebRTC hardening** — RTX/NACK resend path, TWCC-driven bandwidth
    estimation, data channels (SCTP).
-6. **PRACK/100rel, GRUU/Outbound, NAPTR/SRV** for carrier-grade signaling.
+6. **PRACK/100rel** ✅ done (see addendum); **GRUU/Outbound, NAPTR/SRV**
+   still open for carrier-grade signaling.
 
 ---
 
@@ -149,12 +150,16 @@ addendum records what landed since, so the document stays honest.
 | SipUri host-only | `sip:atlanta.com` (no userinfo) parsed correctly — the split-on-`@` bug rejected RFC 3261 §19.1-valid URIs (found during the framing audit, blocked real-world REGISTERs); last-`@` boundary for unescaped user parts |
 | RFC 4028 | Session timers on both B2BUA legs — `Min-SE`/422 floor, `Session-Expires`+`refresher` negotiation mirrored end-to-end, half-interval no-change refresh re-INVITEs, UPDATE refresh, expiry teardown with BYEs on both legs, 422-retry with the peer's `Min-SE`; in-dialog re-INVITE/UPDATE routing with tag checks (481/491/488) — previously a post-2xx re-INVITE was silently ignored |
 | RFC 3262 | PRACK/100rel on both B2BUA legs — reliable 180 (`Require: 100rel` + `RSeq`, To-tagged early dialog) with Timer-G retransmission and 64·T1 give-up, the final 200 parked until PRACK (§3), RAck matching (200/481/400) + idempotent re-answer, leg B PRACKs reliable 1xx incl. retransmission recovery, 421 Extension-Required dial retry, non-INVITE responses excluded from the INVITE transaction slot; `sip-core`: `RSeq`/`RAckValue` typed accessors |
+| `97a4f05` | Workspace rustfmt normalization (style only, no behavior change) |
+| `909dc6a` | External audit triage (42 findings vs `c0d793a`) — every claim verified before fixing; 14 fixes with regression tests: remote-DoS parser panics (`percent_decode`, `parse_name_addr`, Cidr prefix), SRTP authenticated portion covers header+payload (RFC 3711 §3.1/§4.2), DTLS-SRTP null export context (RFC 5764 §4.2), STUN ERROR-CODE/CHANNEL-NUMBER wire layout, TURN relay concrete IP, DTMF bridged (not echoed), CANCEL per §9.1/§9.2, dialog-level Timer H, zrtc response-path/SBC/proxy-Via fixes; full triage table in `docs/BUG_AUDIT_2026-09.md` |
+| Audit fix wave 2 | Confirmed open findings closed with regression tests: G.729 postfilter output path (oracle gates unchanged/recalibrated), ICE IPv6 SDP candidates (RFC 8839 §5.1) + unauthenticated TURN Allocate idempotency (RFC 5766 §6.2) + MD5/MESSAGE-INTEGRITY known vectors, SRTCP E=0 authenticate-only + RFC 7714 §17.1/§17.3 wire-order vectors, SBC reverse Call-ID map + proxy unified transaction keying (RFC 3261 §17.1.3), dialer predictive deficit/answered-lead/DNC fixes, mixer inactive/stale input exclusion, CDR capacity-0 panic + obs-fold auth redaction, sip-tx Timer B/F reliable-transport regressions, b2bua PRACK §4 gates + stored-PRACK retransmission (RFC 3261 §17.1.2) + 421 `Supported` merge + CANCEL-481, SDP §6.1 direction matrix/rejected m-lines/port-0/extras `typ=` |
 
-**Current baseline (supersedes the header numbers):** 19 crates, **396 tests
+**Current baseline (supersedes the header numbers):** 19 crates, **446 tests
 across 54 suites**, `clippy -D warnings` clean, `cargo audit` clean.
 
 **§6 next-steps status:** item 1 (transaction layer) ✅ done as `sip-tx`;
-item 2 (service assembly binary) ✅ done as `zrtc`. Remaining: load harness,
-Postgres CDR backend, WebRTC hardening (RTX/NACK, TWCC, data channels),
-SDP hardening (IPv6/BUNDLE/rejected m-lines), GRUU/Outbound, NAPTR/SRV —
-see README "Roadmap (next)".
+item 2 (service assembly binary) ✅ done as `zrtc`; item 6 PRACK/100rel ✅
+done. Remaining: load harness, Postgres CDR backend, WebRTC hardening
+(RTX/NACK, TWCC, data channels), SDP hardening (IPv6/BUNDLE — rejected
+m-lines, port-0 and the §6.1 direction clamp are done), GRUU/Outbound,
+NAPTR/SRV — see README "Roadmap (next)".

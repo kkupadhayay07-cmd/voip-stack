@@ -10,12 +10,14 @@
 //!   `RAck` — or until we give up on the dialog attempt. The final response
 //!   to the INVITE must not go out while the reliable 1xx is unacknowledged
 //!   (RFC 3262 §3).
-//! * **UAC side** (leg B): a 1xx carrying `RSeq` must be acknowledged with a
-//!   `PRACK` carrying `RAck: RSeq CSeq INVITE` (§4). A retransmitted 1xx
-//!   (same `RSeq`) means our PRACK was lost and is answered with a fresh
-//!   PRACK carrying the same `RAck` values.
+//! * **UAC side** (leg B): a provisional response is acknowledged with a
+//!   `PRACK` carrying `RAck: RSeq CSeq INVITE` only when it is a 101–199
+//!   carrying BOTH `Require: 100rel` and `RSeq` (§4 — never a 100). A
+//!   retransmitted 1xx (same `RSeq`) means our PRACK was lost and is
+//!   answered by resending the SAME PRACK (same CSeq and branch, RFC 3261
+//!   §17.1.2).
 
-use sip_core::headers::RAckValue;
+use sip_core::headers::{RAckValue, TokenList};
 use sip_core::message::Method;
 use std::time::{Duration, Instant};
 
@@ -79,23 +81,50 @@ impl Reliable1xx {
 /// What a UAC does with a 1xx that may be reliable (RFC 3262 §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrackAction {
-    /// Not reliable (no `RSeq`) or stale (already acknowledged): nothing.
+    /// Not PRACKable at all: 100, a 1xx without `Require: 100rel`, no
+    /// `RSeq`, or a stale (older than acknowledged) `RSeq`. Nothing to do.
     Ignore,
-    /// Send a PRACK with `RAck` for this `RSeq`. Also used when the peer
-    /// retransmitted a 1xx we already acknowledged (our PRACK was lost) —
-    /// the same `RAck` values go out on a fresh PRACK.
+    /// A NEW reliable 1xx (first, or `RSeq` advanced): send a fresh PRACK
+    /// with `RAck` for this `RSeq` (new dialog CSeq, new branch).
     Send { rseq: u32 },
+    /// The 1xx is a retransmission of the one we already PRACKed (same
+    /// `RSeq`): our PRACK was lost — resend the stored PRACK verbatim
+    /// (same CSeq number and same branch, RFC 3261 §17.1.2).
+    Retransmit,
 }
 
-/// Decision matrix for an incoming 1xx given the last `RSeq` we PRACKed.
-pub fn prack_action(incoming_rseq: Option<u32>, last_acked: Option<u32>) -> PrackAction {
+/// Decision matrix for an incoming provisional response given the last
+/// `RSeq` we PRACKed. A PRACK is generated only for a 101–199 that carries
+/// BOTH `Require: 100rel` and an `RSeq` (RFC 3262 §4).
+pub fn prack_action(
+    code: u16,
+    require_100rel: bool,
+    incoming_rseq: Option<u32>,
+    last_acked: Option<u32>,
+) -> PrackAction {
+    if !(101..=199).contains(&code) || !require_100rel {
+        return PrackAction::Ignore;
+    }
     match (incoming_rseq, last_acked) {
         (None, _) => PrackAction::Ignore,
         (Some(r), None) => PrackAction::Send { rseq: r },
         (Some(r), Some(last)) if r > last => PrackAction::Send { rseq: r },
-        (Some(r), Some(last)) if r == last => PrackAction::Send { rseq: r },
+        (Some(r), Some(last)) if r == last => PrackAction::Retransmit,
         (Some(_), Some(_)) => PrackAction::Ignore,
     }
+}
+
+/// Merges the extensions a 421 `Extension Required` demanded into our
+/// `Supported` header value (RFC 3262 §3): union of both token lists,
+/// deduplicated case-insensitively, existing order kept first.
+pub fn merge_supported(existing: &str, require_tokens: &str) -> String {
+    let mut out = TokenList::parse(existing).0;
+    for t in TokenList::parse(require_tokens).0 {
+        if !out.iter().any(|e| e.eq_ignore_ascii_case(&t)) {
+            out.push(t);
+        }
+    }
+    out.join(", ")
 }
 
 /// Whether a PRACK's `RAck` matches the outstanding reliable 1xx (§4): the
@@ -151,23 +180,72 @@ mod tests {
 
     #[test]
     fn prack_action_matrix() {
+        const REQ: bool = true;
         // No RSeq → nothing to acknowledge.
-        assert_eq!(prack_action(None, None), PrackAction::Ignore);
-        assert_eq!(prack_action(None, Some(9)), PrackAction::Ignore);
+        assert_eq!(prack_action(180, REQ, None, None), PrackAction::Ignore);
+        assert_eq!(prack_action(180, REQ, None, Some(9)), PrackAction::Ignore);
         // First reliable 1xx → PRACK.
-        assert_eq!(prack_action(Some(7), None), PrackAction::Send { rseq: 7 });
-        // New RSeq → PRACK.
         assert_eq!(
-            prack_action(Some(8), Some(7)),
-            PrackAction::Send { rseq: 8 }
-        );
-        // Same RSeq again → retransmission of the 1xx: PRACK again.
-        assert_eq!(
-            prack_action(Some(7), Some(7)),
+            prack_action(180, REQ, Some(7), None),
             PrackAction::Send { rseq: 7 }
         );
+        // New RSeq → PRACK.
+        assert_eq!(
+            prack_action(180, REQ, Some(8), Some(7)),
+            PrackAction::Send { rseq: 8 }
+        );
+        // Same RSeq again → the 1xx was retransmitted: our PRACK was lost,
+        // so the STORED PRACK is resent (same CSeq and branch).
+        assert_eq!(
+            prack_action(180, REQ, Some(7), Some(7)),
+            PrackAction::Retransmit
+        );
         // Older RSeq → stale, ignore.
-        assert_eq!(prack_action(Some(6), Some(7)), PrackAction::Ignore);
+        assert_eq!(
+            prack_action(180, REQ, Some(6), Some(7)),
+            PrackAction::Ignore
+        );
+    }
+
+    #[test]
+    fn prack_action_gates_per_rfc3262_section4() {
+        const RSEQ: Option<u32> = Some(9);
+        // 100 is never PRACKed, even with Require + RSeq.
+        assert_eq!(prack_action(100, true, RSEQ, None), PrackAction::Ignore);
+        // Final responses are not provisional.
+        assert_eq!(prack_action(200, true, RSEQ, None), PrackAction::Ignore);
+        // 1xx without `Require: 100rel` is unreliable.
+        assert_eq!(prack_action(183, false, RSEQ, None), PrackAction::Ignore);
+        assert_eq!(prack_action(180, false, RSEQ, None), PrackAction::Ignore);
+        // 101–199 with both markers is PRACKable (bounds included).
+        assert_eq!(
+            prack_action(101, true, RSEQ, None),
+            PrackAction::Send { rseq: 9 }
+        );
+        assert_eq!(
+            prack_action(199, true, RSEQ, None),
+            PrackAction::Send { rseq: 9 }
+        );
+        // Retransmission decision still applies above 100.
+        assert_eq!(prack_action(183, true, RSEQ, RSEQ), PrackAction::Retransmit);
+    }
+
+    #[test]
+    fn merge_supported_unions_and_dedupes() {
+        // The 421's tokens are folded into the retry's Supported header.
+        assert_eq!(merge_supported("100rel", "100rel"), "100rel");
+        assert_eq!(merge_supported("100rel", "100rel, timer"), "100rel, timer");
+        assert_eq!(merge_supported("100rel", "timer, 100rel"), "100rel, timer");
+        // Case-insensitive dedup, existing order kept first.
+        assert_eq!(merge_supported("100rel", "100REL, foo"), "100rel, foo");
+        // Empty Require changes nothing; empty Supported adopts the tokens.
+        assert_eq!(merge_supported("100rel", ""), "100rel");
+        assert_eq!(merge_supported("", "precondition"), "precondition");
+        // Whitespace tolerated on both sides.
+        assert_eq!(
+            merge_supported(" 100rel , timer ", "precondition"),
+            "100rel, timer, precondition"
+        );
     }
 
     #[test]

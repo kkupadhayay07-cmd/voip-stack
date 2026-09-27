@@ -216,9 +216,18 @@ pub struct CdrQuery {
 }
 
 /// Thread-safe in-memory CDR store.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CdrStore {
     inner: Arc<RwLock<CdrStoreInner>>,
+}
+
+impl Default for CdrStore {
+    /// Default-bounded store. A hand-rolled impl (instead of deriving) so
+    /// the default capacity is a real bound — deriving gave capacity 0,
+    /// which panicked on the first insert (drain past the empty buffer).
+    fn default() -> Self {
+        CdrStore::new(Self::DEFAULT_CAPACITY)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -229,6 +238,9 @@ struct CdrStoreInner {
 }
 
 impl CdrStore {
+    /// Capacity used by `CdrStore::default()`.
+    pub const DEFAULT_CAPACITY: usize = 1024;
+
     pub fn new(capacity: usize) -> Self {
         CdrStore {
             inner: Arc::new(RwLock::new(CdrStoreInner {
@@ -248,11 +260,18 @@ impl CdrStore {
             },
         );
         let mut inner = self.inner.write().await;
-        if inner.records.len() >= inner.capacity {
-            let overflow = inner.records.len() + 1 - inner.capacity;
-            inner.records.drain(..overflow);
+        // A zero-capacity store retains nothing. The eviction below must
+        // never compute a drain range larger than the buffer (the old
+        // `len() + 1 - capacity` arithmetic drained past the end of an
+        // empty capacity-0 store and panicked).
+        if inner.capacity == 0 {
+            return;
         }
         inner.records.push(record);
+        if inner.records.len() > inner.capacity {
+            let overflow = inner.records.len() - inner.capacity;
+            inner.records.drain(..overflow);
+        }
     }
 
     /// Query with filters, newest first.
@@ -438,5 +457,49 @@ mod tests {
         store.insert(rec).await;
         assert!(store.get(&id).await.is_some());
         assert!(store.get("missing").await.is_none());
+    }
+
+    // Regression 2.16(i): `CdrStore::default()` must survive an empty
+    // flush and its first inserts; the derived `Default` had capacity 0,
+    // so the very first insert drained past the end of the empty buffer
+    // and panicked.
+    #[tokio::test]
+    async fn default_store_empty_flush_and_inserts_are_panic_free() {
+        let empty = CdrStore::default();
+        assert_eq!(empty.query(&CdrQuery::default()).await.len(), 0);
+        let store = CdrStore::default();
+        store
+            .insert(
+                CallRecordBuilder::new(Direction::Outbound, "sip:a@x", "sip:b@y")
+                    .a_call_id("cid-d1")
+                    .finish(200, false, 7),
+            )
+            .await;
+        store
+            .insert(
+                CallRecordBuilder::new(Direction::Outbound, "sip:a@x", "sip:b@y")
+                    .a_call_id("cid-d2")
+                    .finish(486, false, 0),
+            )
+            .await;
+        let all = store.query(&CdrQuery::default()).await;
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].a_call_id, "cid-d2", "newest first");
+    }
+
+    // Regression 2.16(i) companion: an explicit zero-capacity store keeps
+    // nothing and never panics on insert.
+    #[tokio::test]
+    async fn zero_capacity_store_retains_nothing_without_panic() {
+        let store = CdrStore::new(0);
+        for i in 0..3u64 {
+            store
+                .insert(
+                    CallRecordBuilder::new(Direction::Inbound, "sip:a@x", "sip:b@y")
+                        .finish(200, false, i),
+                )
+                .await;
+        }
+        assert_eq!(store.query(&CdrQuery::default()).await.len(), 0);
     }
 }

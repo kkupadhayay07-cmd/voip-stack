@@ -133,6 +133,37 @@ async fn turn_allocate_and_relay() {
     assert_eq!(ind.get(stun::DATA).unwrap(), b"pong");
 }
 
+/// TURN allocate against a server that does not require authentication:
+/// the initial Allocate must succeed directly and return the relayed
+/// address (no 401 round trip); re-gathering on the same socket is
+/// idempotent (RFC 5766 §6.2).
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_allocate_without_auth() {
+    let config = StunTurnConfig {
+        require_auth: false,
+        ..Default::default()
+    };
+    let server = StunTurnServer::bind("127.0.0.1:0", config).await.unwrap();
+    let turn_addr = server.local_addr().unwrap();
+    tokio::spawn(async move { server.run().await });
+
+    let mut agent = IceAgent::new(shuffle_credentials(0xe)).await.unwrap();
+    let relay = agent
+        .gather_relay(turn_addr, "bob", "unused")
+        .await
+        .unwrap();
+    assert_eq!(relay.typ, ice::CandidateType::Relay);
+    assert_ne!(relay.address, agent.local_addr().unwrap());
+
+    // A second Allocate for the same 5-tuple must return the same
+    // relayed address.
+    let again = agent
+        .gather_relay(turn_addr, "bob", "unused")
+        .await
+        .unwrap();
+    assert_eq!(again.address, relay.address);
+}
+
 /// Candidate line exchange sanity across the agent boundary.
 #[tokio::test]
 async fn candidate_lines_roundtrip() {

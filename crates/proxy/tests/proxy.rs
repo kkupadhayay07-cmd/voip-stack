@@ -232,3 +232,91 @@ fn loose_route_stripped_when_pointing_at_us() {
     assert_eq!(routes.len(), 1, "our Route removed");
     assert!(routes[0].contains("downstream"));
 }
+
+/// Build a response exactly as a downstream leg would: mirror the forwarded
+/// request's Via stack (so the proxy's own via is on top), serialize, and
+/// reparse like the wire does.
+fn leg_response(fwd_request: &sip_core::Request, code: u16, reason: &str) -> sip_core::Response {
+    let resp = sip_core::builder::respond_to(fwd_request, code, reason, Vec::new(), None);
+    let wire = serialize(&SipMessage::Response(resp));
+    match parse_message(&wire).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!("expected a response"),
+    }
+}
+
+#[test]
+fn response_matches_transaction_inserted_by_request_path() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    proxy
+        .routes
+        .exact
+        .insert("bob".into(), vec!["10.5.5.5:5060".into()]);
+    let req = invite_req("sip:bob@example.com", "bob");
+    let actions = proxy.process_request(&req, SRC);
+    assert_eq!(proxy.transactions.len(), 1);
+
+    // The forwarded request (our via on top) is what the leg answers, so the
+    // response's top via branch is OURS. The response handler must compute
+    // the same key the insert path used.
+    let fwd = match &actions[0] {
+        Action::Send(SipMessage::Request(r), _) => r.clone(),
+        _ => panic!("expected a request send"),
+    };
+    let resp = leg_response(&fwd, 183, "Session Progress");
+    proxy
+        .process_response(&resp, "10.5.5.5:5060".parse().unwrap())
+        .expect("response must forward");
+
+    assert_eq!(proxy.transactions.len(), 1, "fork survives provisional");
+    let tx = proxy.transactions.values().next().unwrap();
+    assert_eq!(
+        tx.best.values().copied().max(),
+        Some(183),
+        "response must be tracked against its transaction"
+    );
+
+    // A final response from the same leg updates the same transaction.
+    let resp200 = leg_response(&fwd, 200, "OK");
+    proxy
+        .process_response(&resp200, "10.5.5.5:5060".parse().unwrap())
+        .expect("final response must forward");
+    let tx = proxy.transactions.values().next().unwrap();
+    assert_eq!(tx.best.values().copied().max(), Some(200));
+}
+
+#[test]
+fn response_method_scopes_transaction_match() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    proxy
+        .routes
+        .exact
+        .insert("bob".into(), vec!["10.5.5.5:5060".into()]);
+    let req = invite_req("sip:bob@example.com", "bob");
+    let actions = proxy.process_request(&req, SRC);
+    let fwd = match &actions[0] {
+        Action::Send(SipMessage::Request(r), _) => r.clone(),
+        _ => panic!("expected a request send"),
+    };
+
+    // A response whose CSeq names a different method (e.g. a stray BYE
+    // response) must not be folded into the INVITE fork: the method is part
+    // of the transaction key.
+    let mut resp = leg_response(&fwd, 480, "Temporarily Unavailable");
+    resp.headers.remove_all("CSeq");
+    resp.headers.add("CSeq", "2 BYE");
+    let wire = serialize(&SipMessage::Response(resp));
+    let resp = match parse_message(&wire).unwrap() {
+        SipMessage::Response(r) => r,
+        _ => panic!(),
+    };
+    proxy
+        .process_response(&resp, "10.5.5.5:5060".parse().unwrap())
+        .expect("response still forwards upstream");
+
+    let tx = proxy.transactions.values().next().unwrap();
+    assert!(
+        tx.best.is_empty(),
+        "foreign-method response must not touch the INVITE fork"
+    );
+}

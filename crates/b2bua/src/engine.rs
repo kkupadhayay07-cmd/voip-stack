@@ -110,8 +110,17 @@ struct Leg {
     confirmed: bool,
     /// RFC 4028 session-timer state (engaged legs only).
     timer: Option<LegTimers>,
-    /// RFC 3262 (UAC side): last reliable 1xx `RSeq` we PRACKed.
-    pracked_rseq: Option<u32>,
+    /// RFC 3262 (UAC side): the PRACK we sent for the last reliable 1xx.
+    /// A retransmitted 1xx (same `RSeq`) must be answered by RESENDING it
+    /// verbatim — same CSeq number and same branch (RFC 3261 §17.1.2).
+    last_prack: Option<SentPrack>,
+}
+
+/// The PRACK a leg last sent for a reliable 1xx, kept as exact wire bytes
+/// so a retransmitted 1xx is answered byte-identically.
+struct SentPrack {
+    rseq: u32,
+    bytes: Vec<u8>,
 }
 
 /// Which INVITE the leg-B client transaction slot currently carries.
@@ -551,6 +560,16 @@ impl B2bua {
                         if let Some(b) = c.leg_b.as_mut() {
                             Self::send_bye(sock, b).await;
                         }
+                    } else if let Some(b_tx) = c.b_tx.as_ref() {
+                        // Leg B is still ringing: CANCEL the outstanding
+                        // dial INVITE (§9.1) so it does not answer into a
+                        // dead call (and so its CSeq/Via state stays sane).
+                        if let Some(b) = c.leg_b.as_ref() {
+                            let cancel = build_cancel(b_tx.request());
+                            let _ = sock
+                                .send_to(&serialize(&SipMessage::Request(cancel)), b.remote_sip)
+                                .await;
+                        }
                     }
                 }
                 teardown(calls, b_to_a, &id, "PRACK never arrived");
@@ -704,11 +723,13 @@ impl B2bua {
                         }
                     } else {
                         // 421 Extension Required on the initial dial: the
-                        // peer insists on 100rel — retry once with it in
-                        // `Supported` (RFC 3262 §3).
+                        // peer insists on 100rel — retry once, merging the
+                        // 421's `Require` tokens into `Supported` (RFC 3262 §3).
                         let retried = kind == BInviteKind::Dial
                             && r.code == 421
-                            && self.retry_b_421(sock, local, calls, &a_id, &call_id).await;
+                            && self
+                                .retry_b_421(sock, local, calls, &a_id, &call_id, &r)
+                                .await;
                         if retried {
                             continue;
                         }
@@ -1106,7 +1127,7 @@ impl B2bua {
             media: None,
             confirmed: false,
             timer: leg_a_timer,
-            pracked_rseq: None,
+            last_prack: None,
         };
         call.leg_a = Some(leg_a);
         call.a_tx = Some(a_tx);
@@ -1125,7 +1146,7 @@ impl B2bua {
             media: None,
             confirmed: false,
             timer: None,
-            pracked_rseq: None,
+            last_prack: None,
         });
         b_to_a.insert(b_call_id, call_id.clone());
         self.cdr
@@ -1490,20 +1511,43 @@ impl B2bua {
         call_id: String,
         src: SocketAddr,
     ) {
-        // 200 to the CANCEL itself.
+        let Some(c) = calls.get_mut(&call_id) else {
+            // §9.2: a CANCEL for a transaction we cannot find gets 481.
+            let resp = sip_core::builder::respond_to(
+                req,
+                481,
+                "Call/Transaction Does Not Exist",
+                Vec::new(),
+                None,
+            );
+            let _ = sock
+                .send_to(&serialize(&SipMessage::Response(resp)), src)
+                .await;
+            return;
+        };
+        // RFC 3261 §9.2: a CANCEL has no effect on an INVITE whose final
+        // response is already out — an answered call must survive it, and
+        // the CANCEL belongs to no open transaction (481).
+        if c.leg_a.as_ref().map(|a| a.confirmed).unwrap_or(false) {
+            let resp = sip_core::builder::respond_to(
+                req,
+                481,
+                "Call/Transaction Does Not Exist",
+                Vec::new(),
+                None,
+            );
+            let _ = sock
+                .send_to(&serialize(&SipMessage::Response(resp)), src)
+                .await;
+            return;
+        }
+        // The INVITE transaction is still unanswered: 200 to the CANCEL
+        // itself, then 487 to A through the server transaction when it is
+        // still open.
         let resp = sip_core::builder::respond_to(req, 200, "OK", Vec::new(), None);
         let _ = sock
             .send_to(&serialize(&SipMessage::Response(resp)), src)
             .await;
-        let Some(c) = calls.get_mut(&call_id) else {
-            return;
-        };
-        // RFC 3261 §9.2: a CANCEL has no effect on an INVITE whose final
-        // response is already out — an answered call must survive it.
-        if c.leg_a.as_ref().map(|a| a.confirmed).unwrap_or(false) {
-            return;
-        }
-        // 487 to A through the server transaction when it is still open.
         if let Some(a) = &c.leg_a {
             if let Some(invite) = &a.invite {
                 let resp487 = sip_core::builder::respond_to(
@@ -1522,29 +1566,16 @@ impl B2bua {
                 }
             }
         }
-        // §9.1: CANCEL the outgoing dial INVITE (same CSeq + top Via branch).
-        if let Some(b) = c.leg_b.as_ref() {
-            if let Some(b_tx) = c.b_tx.as_ref() {
-                let orig = b_tx.request();
-                let top_branch = via_branch(orig).unwrap_or_default();
-                let cancel = RequestBuilder::new(Method::Cancel, orig.uri.clone())
-                    .via(TransportKind::Udp, &via_sent_by(), Some(&top_branch))
-                    .from(
-                        orig.headers
-                            .get("From")
-                            .map(str::to_string)
-                            .unwrap_or_else(|| "<sip:zrtc@b2bua>".into())
-                            .as_str(),
-                    )
-                    .to(orig
-                        .headers
-                        .get("To")
-                        .map(str::to_string)
-                        .unwrap_or_else(|| "<sip:peer>".into())
-                        .as_str())
-                    .call_id(Some(&b.call_id))
-                    .cseq(orig.headers.cseq().map(|x| x.seq).unwrap_or(1))
-                    .build();
+        // §9.1: CANCEL the outgoing dial INVITE while leg B is still
+        // ringing; a leg B that already answered (its 200 is parked on the
+        // PRACK, RFC 3262 §3) is confirmed and gets a BYE instead.
+        if c.leg_b.as_ref().map(|b| b.confirmed).unwrap_or(false) {
+            if let Some(b) = c.leg_b.as_mut() {
+                Self::send_bye(sock, b).await;
+            }
+        } else if let Some(b_tx) = c.b_tx.as_ref() {
+            if let Some(b) = c.leg_b.as_ref() {
+                let cancel = build_cancel(b_tx.request());
                 let _ = sock
                     .send_to(&serialize(&SipMessage::Request(cancel)), b.remote_sip)
                     .await;
@@ -2066,9 +2097,10 @@ impl B2bua {
     }
 
     /// RFC 3262 §4 (UAC side): a reliable 1xx on the leg-B dial is answered
-    /// with PRACK carrying `RAck`. The peer retransmitting the 1xx (same
-    /// RSeq) means our PRACK was lost — a fresh PRACK with the same RAck
-    /// values goes out.
+    /// with PRACK carrying `RAck` — but only for a 101–199 that carries BOTH
+    /// `Require: 100rel` and an `RSeq`. The peer retransmitting the 1xx
+    /// (same RSeq) means our PRACK was lost — the STORED PRACK is resent
+    /// verbatim (same CSeq number and same branch, RFC 3261 §17.1.2).
     async fn prack_leg_b_1xx(
         &self,
         sock: &Arc<UdpSocket>,
@@ -2076,50 +2108,74 @@ impl B2bua {
         a_id: &str,
         r1xx: &Response,
     ) {
-        let Some(rseq) = r1xx.headers.rseq() else {
-            return;
-        };
         let Some(call) = calls.get_mut(a_id) else {
             return;
         };
         let Some(b) = call.leg_b.as_mut() else {
             return;
         };
-        if let rel100::PrackAction::Send { rseq } = rel100::prack_action(Some(rseq), b.pracked_rseq)
-        {
-            // Early dialog: the 1xx's To tag is the peer's dialog tag.
-            if b.remote_tag.is_none() {
-                b.remote_tag = r1xx.headers.to().and_then(|t| t.tag);
+        let action = rel100::prack_action(
+            r1xx.code,
+            r1xx.headers.require().has("100rel"),
+            r1xx.headers.rseq(),
+            b.last_prack.as_ref().map(|p| p.rseq),
+        );
+        match action {
+            rel100::PrackAction::Ignore => {}
+            rel100::PrackAction::Retransmit => {
+                // Resend the stored PRACK byte-identical: same CSeq, same
+                // branch (RFC 3261 §17.1.2) — the peer matches it by branch.
+                let Some(stored) = b.last_prack.as_ref() else {
+                    return;
+                };
+                tracing::debug!(
+                    call_id = %a_id,
+                    "retransmitted 1xx (RSeq {}): resending stored PRACK",
+                    stored.rseq
+                );
+                let _ = sock.send_to(&stored.bytes, b.remote_sip).await;
             }
-            let invite_cseq = r1xx.headers.cseq().map(|c| c.seq).unwrap_or(1);
-            let req_uri = b
-                .contact
-                .clone()
-                .and_then(|c| extract_uri(&c))
-                .unwrap_or_else(|| SipUri::parse(&format!("sip:peer@{}", b.remote_sip)).unwrap());
-            let cseq = take_cseq(b);
-            let prack = RequestBuilder::new(Method::Prack, req_uri)
-                .via(TransportKind::Udp, &via_sent_by(), Some(&new_branch()))
-                .from(&format!("<sip:zrtc@b2bua>;tag={}", b.local_tag))
-                .to(&format!(
-                    "<sip:peer>;tag={}",
-                    b.remote_tag.clone().unwrap_or_default()
-                ))
-                .call_id(Some(&b.call_id))
-                .cseq(cseq)
-                .header("RAck", &format!("{rseq} {invite_cseq} INVITE"))
-                .build();
-            b.pracked_rseq = Some(rseq);
-            let bytes = serialize(&SipMessage::Request(prack));
-            let _ = sock.send_to(&bytes, b.remote_sip).await;
-            tracing::debug!(call_id = %a_id, "PRACK sent for RSeq {rseq}");
+            rel100::PrackAction::Send { rseq } => {
+                // Early dialog: the 1xx's To tag is the peer's dialog tag.
+                if b.remote_tag.is_none() {
+                    b.remote_tag = r1xx.headers.to().and_then(|t| t.tag);
+                }
+                let invite_cseq = r1xx.headers.cseq().map(|c| c.seq).unwrap_or(1);
+                let req_uri = b
+                    .contact
+                    .clone()
+                    .and_then(|c| extract_uri(&c))
+                    .unwrap_or_else(|| {
+                        SipUri::parse(&format!("sip:peer@{}", b.remote_sip)).unwrap()
+                    });
+                let cseq = take_cseq(b);
+                let prack = RequestBuilder::new(Method::Prack, req_uri)
+                    .via(TransportKind::Udp, &via_sent_by(), Some(&new_branch()))
+                    .from(&format!("<sip:zrtc@b2bua>;tag={}", b.local_tag))
+                    .to(&format!(
+                        "<sip:peer>;tag={}",
+                        b.remote_tag.clone().unwrap_or_default()
+                    ))
+                    .call_id(Some(&b.call_id))
+                    .cseq(cseq)
+                    .header("RAck", &format!("{rseq} {invite_cseq} INVITE"))
+                    .build();
+                let bytes = serialize(&SipMessage::Request(prack));
+                b.last_prack = Some(SentPrack {
+                    rseq,
+                    bytes: bytes.clone(),
+                });
+                let _ = sock.send_to(&bytes, b.remote_sip).await;
+                tracing::debug!(call_id = %a_id, "PRACK sent for RSeq {rseq}");
+            }
         }
     }
 
     /// 421 Extension Required from leg B on the dial: the peer insists on
     /// `100rel` (RFC 3262 §3 — a UAS requiring it answers 421 carrying
-    /// `Require: 100rel`). Retries once with `Supported: 100rel`. Returns
-    /// false when the retry was already spent or is impossible.
+    /// `Require`). Retries once, merging the 421's `Require` tokens into the
+    /// retry's `Supported` header. Returns false when the retry was already
+    /// spent or is impossible.
     async fn retry_b_421(
         &self,
         sock: &Arc<UdpSocket>,
@@ -2127,6 +2183,7 @@ impl B2bua {
         calls: &mut HashMap<String, Call>,
         a_id: &str,
         b_call_id: &str,
+        resp: &Response,
     ) -> bool {
         let Some(call) = calls.get_mut(a_id) else {
             return false;
@@ -2150,7 +2207,18 @@ impl B2bua {
         let to_text = format!("<{target}>");
         let (b_local_tag, offer, b_se) = (b.local_tag.clone(), call.b_offer.clone(), call.b_se);
         let cseq = take_cseq(call.leg_b.as_mut().unwrap());
-        tracing::info!(call_id = %a_id, "leg B 421: retrying with Supported: 100rel");
+        // Merge what the 421 demanded into our Supported (keep "100rel" and
+        // "timer" — the peer may demand more than it announced so far).
+        let base = if b_se.is_some() {
+            "100rel, timer"
+        } else {
+            "100rel"
+        };
+        let supported = rel100::merge_supported(base, &resp.headers.require().to_string());
+        tracing::info!(
+            call_id = %a_id,
+            "leg B 421: retrying with Supported: {supported}"
+        );
         let mut builder = RequestBuilder::new(Method::Invite, target)
             .via(TransportKind::Udp, &local.to_string(), Some(&new_branch()))
             .from(&format!(
@@ -2163,11 +2231,9 @@ impl B2bua {
             .cseq(cseq)
             .contact(&format!("<sip:zrtc@{}>", local_ip(local)))
             .header("Allow", "INVITE, ACK, BYE, CANCEL, OPTIONS, UPDATE, PRACK")
-            .header("Supported", "100rel");
+            .header("Supported", &supported);
         if let Some(se) = b_se {
-            builder = builder
-                .header("Session-Expires", &format!("{se};refresher=uac"))
-                .header("Supported", "100rel, timer");
+            builder = builder.header("Session-Expires", &format!("{se};refresher=uac"));
         }
         let invite = builder.body("application/sdp", offer.into_bytes()).build();
         let mut tx = ClientInviteTx::new(invite, TxTransport::Udp);
@@ -2337,6 +2403,31 @@ fn take_cseq(leg: &mut Leg) -> u32 {
     let c = leg.next_cseq;
     leg.next_cseq = c.saturating_add(1);
     c
+}
+
+/// Builds the CANCEL for an outstanding INVITE (RFC 3261 §9.1): same
+/// Request-URI, the INVITE's top Via verbatim (so sent-by and branch match
+/// the INVITE transaction), the INVITE's CSeq number with method CANCEL,
+/// mirrored From/To/Call-ID and the INVITE's Route set.
+fn build_cancel(invite: &Request) -> Request {
+    let mut cancel = RequestBuilder::new(Method::Cancel, invite.uri.clone())
+        .from(invite.headers.get("From").unwrap_or("<sip:zrtc@b2bua>"))
+        .to(invite.headers.get("To").unwrap_or("<sip:peer>"))
+        .call_id(invite.headers.call_id())
+        .cseq(invite.headers.cseq().map(|c| c.seq).unwrap_or(1))
+        .build();
+    cancel.headers.remove_all("Via");
+    if let Some(via) = invite.headers.get("Via") {
+        cancel.headers.add("Via", via);
+    }
+    let routes = invite.headers.get_all("Route");
+    if !routes.is_empty() {
+        cancel.headers.remove_all("Route");
+        for r in routes {
+            cancel.headers.add("Route", r);
+        }
+    }
+    cancel
 }
 
 /// What a leg's RFC 4028 clock wants done right now.
@@ -2584,5 +2675,53 @@ impl B2bua {
     pub fn stats_handle(
     ) -> &'static std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<CdrEvent>> {
         &CDR_SINK
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sip_core::uri::TransportKind;
+
+    /// The CANCEL for an outstanding INVITE mirrors the Request-URI, the
+    /// top Via verbatim (so sent-by + branch match the INVITE transaction),
+    /// From/To/Call-ID, the INVITE's CSeq number with method CANCEL and the
+    /// Route set (RFC 3261 §9.1).
+    #[test]
+    fn build_cancel_matches_the_invite_transaction() {
+        let mut invite = RequestBuilder::new(
+            Method::Invite,
+            SipUri::parse("sip:1000@10.1.2.3:5070").unwrap(),
+        )
+        .via(TransportKind::Udp, "10.0.0.9:5060", Some("z9hG4bKdial"))
+        .from("<sip:zrtc@10.0.0.9>;tag=ourtag")
+        .to("<sip:1000@gw>")
+        .call_id(Some("call-1"))
+        .cseq(7)
+        .header("Route", "<sip:proxyA;lr>")
+        .build();
+        invite.headers.add("Route", "<sip:proxyB;lr>");
+
+        let cancel = build_cancel(&invite);
+        assert_eq!(cancel.method, Method::Cancel);
+        assert_eq!(cancel.uri, invite.uri);
+        // Top Via copied verbatim: identical sent-by AND branch.
+        assert_eq!(cancel.headers.get("Via"), invite.headers.get("Via"));
+        assert_eq!(via_branch(&cancel).as_deref(), Some("z9hG4bKdial"));
+        // From/To/Call-ID mirrored, CSeq kept with method CANCEL.
+        assert_eq!(
+            cancel.headers.get("From"),
+            Some("<sip:zrtc@10.0.0.9>;tag=ourtag")
+        );
+        assert_eq!(cancel.headers.get("To"), Some("<sip:1000@gw>"));
+        assert_eq!(cancel.headers.call_id(), Some("call-1"));
+        let cseq = cancel.headers.cseq().unwrap();
+        assert_eq!(cseq.seq, 7);
+        assert_eq!(cseq.method, Method::Cancel);
+        // Route set carried over in order.
+        assert_eq!(
+            cancel.headers.get_all("Route"),
+            vec!["<sip:proxyA;lr>", "<sip:proxyB;lr>"]
+        );
     }
 }

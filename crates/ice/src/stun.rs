@@ -263,8 +263,9 @@ impl Message {
     pub fn add_error_code(&mut self, code: u16, reason: &str) {
         // RFC 5389 §15.6: 4-byte header [0, 0, class, number] before the
         // reason phrase (the old 3-byte form shifted everything by one byte
-        // on the wire).
-        let mut v = vec![0u8, 0u8, (code / 100) as u8, (code % 100) as u8];
+        // on the wire).  The class occupies the low 3 bits of byte 2 —
+        // mask it so encode and decode are exactly symmetric.
+        let mut v = vec![0u8, 0u8, (code / 100) as u8 & 0x07, (code % 100) as u8];
         v.extend_from_slice(reason.as_bytes());
         self.add(ERROR_CODE, v);
     }
@@ -706,6 +707,148 @@ mod tests {
         let mut h = md5::Md5::new();
         h.update(b"user:realm:pass");
         assert_eq!(k, h.finalize().to_vec());
+    }
+
+    /// Known vectors for the long-term credential key MD5 over
+    /// "user:realm:pass" (RFC 5389 §15.4), generated independently of this
+    /// crate.
+    #[test]
+    fn long_term_key_known_vectors() {
+        assert_eq!(
+            hex::encode(long_term_key("matrix", "matrix.org", "theMatrix")),
+            "7e3dd18f0a15a1b6e49c5517520a9c35"
+        );
+        assert_eq!(
+            hex::encode(long_term_key("user", "realm", "pass")),
+            "8493fbc53ba582fb4c044c456bdc40eb"
+        );
+    }
+
+    /// MESSAGE-INTEGRITY verified against an independently generated vector
+    /// for an authenticated Allocate (RFC 5389 §15.4 / RFC 5766 §6.2):
+    /// key = MD5("matrix:matrix.org:theMatrix"), HMAC-SHA1 over the message
+    /// with the header length field covering the MESSAGE-INTEGRITY attr.
+    #[test]
+    fn message_integrity_long_term_allocate_vector() {
+        let buf = hex::decode(concat!(
+            "000300402112a4420102030405060708090a0b0c",
+            "000600066d61747269780000",         // USERNAME "matrix"
+            "0014000a6d61747269782e6f72670000", // REALM "matrix.org"
+            "001500083031323361626364",         // NONCE "0123abcd"
+            "00080014ae50b903ae6bd933c8bf7cdaab2bf8320f330f1a"
+        ))
+        .unwrap();
+        let msg = Message::parse(&buf).unwrap();
+        assert_eq!(msg.msg_type, ALLOCATE_REQUEST);
+        assert_eq!(msg.username().as_deref(), Some("matrix"));
+        assert_eq!(msg.get(REALM), Some(b"matrix.org".as_slice()));
+        let key = long_term_key("matrix", "matrix.org", "theMatrix");
+        assert!(msg.verify_integrity(&key).unwrap());
+        assert!(!msg
+            .verify_integrity(&long_term_key("matrix", "matrix.org", "wrong"))
+            .unwrap());
+    }
+
+    /// Our encoder produces the exact same wire bytes as the independent
+    /// vector above (length field patched per RFC 5389 §15.4).
+    #[test]
+    fn message_integrity_encode_matches_vector() {
+        let mut m =
+            Message::new_with_txid(ALLOCATE_REQUEST, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        m.add_username("matrix");
+        m.add(REALM, b"matrix.org".to_vec());
+        m.add(NONCE, b"0123abcd".to_vec());
+        m.add_message_integrity(&long_term_key("matrix", "matrix.org", "theMatrix"));
+        assert_eq!(
+            hex::encode(m.encode()),
+            "000300402112a4420102030405060708090a0b0c\
+             000600066d61747269780000\
+             0014000a6d61747269782e6f72670000\
+             001500083031323361626364\
+             00080014ae50b903ae6bd933c8bf7cdaab2bf8320f330f1a"
+        );
+    }
+
+    /// Attribute-type constants on the wire: USERNAME is 0x0006 and
+    /// CHANNEL-NUMBER is 0x000C (RFC 5389 §18.2 / RFC 5766 §18.2) — the two
+    /// must never collide.
+    #[test]
+    fn username_vs_channel_number_attribute_types() {
+        assert_eq!(USERNAME, 0x0006);
+        assert_eq!(MESSAGE_INTEGRITY, 0x0008);
+        assert_eq!(ERROR_CODE, 0x0009);
+        assert_eq!(CHANNEL_NUMBER, 0x000C);
+    }
+
+    /// Hand-built ChannelBind request: CHANNEL-NUMBER 0x4000 travels as
+    /// attribute type 0x000C on the wire and decodes via channel_number()
+    /// only; USERNAME (0x0006) via username() only.
+    #[test]
+    fn channel_number_wire_type_is_000c() {
+        // XOR-PEER-ADDRESS 127.0.0.1:5000 with cookie mask, tx id all zero.
+        let buf = hex::decode(concat!(
+            "000900142112a442000000000000000000000000",
+            "000c000440000000",
+            "001200080001329a5e12a443"
+        ))
+        .unwrap();
+        let msg = Message::parse(&buf).unwrap();
+        assert_eq!(msg.msg_type, CHANNEL_BIND_REQUEST);
+        assert_eq!(msg.channel_number(), Some(0x4000));
+        assert_eq!(msg.username(), None);
+        let peer = msg.xor_address(XOR_PEER_ADDRESS).unwrap().unwrap();
+        assert_eq!(peer.to_string(), "127.0.0.1:5000");
+
+        // Our encoder emits type 0x000C (not 0x0006) for CHANNEL-NUMBER.
+        let mut m = Message::new_with_txid(CHANNEL_BIND_REQUEST, [0u8; 12]);
+        m.add_channel_number(0x4000);
+        let enc = m.encode();
+        assert!(enc.windows(2).any(|w| w == [0x00, 0x0C]));
+        assert!(!enc.windows(2).any(|w| w == [0x00, 0x06]));
+
+        // Conversely a USERNAME attribute never leaks into channel_number().
+        let mut u = Message::new_with_txid(BINDING_REQUEST, [0u8; 12]);
+        u.add_username("evtj:h6vY");
+        let parsed = Message::parse(&u.encode()).unwrap();
+        assert_eq!(parsed.username().as_deref(), Some("evtj:h6vY"));
+        assert_eq!(parsed.channel_number(), None);
+    }
+
+    /// RFC 5389 §15.6 ERROR-CODE round trips: 2 reserved zero bytes, class
+    /// (hundreds digit, low 3 bits of byte 2), number (byte 3), then the
+    /// reason phrase.
+    #[test]
+    fn error_code_roundtrip_matrix() {
+        for (code, reason) in [
+            (400u16, "Bad Request"),
+            (401, "Unauthorized"),
+            (420, "Unknown Attribute"),
+            (438, "Stale Nonce"),
+            (487, "Role Conflict"),
+            (500, "Server Error"),
+        ] {
+            let mut m = Message::new(BINDING_ERROR_RESPONSE);
+            m.add_error_code(code, reason);
+            let raw = m.get(ERROR_CODE).unwrap();
+            assert_eq!(&raw[..2], &[0, 0], "reserved bytes for {code}");
+            assert_eq!(raw[2], (code / 100) as u8);
+            assert_eq!(raw[3], (code % 100) as u8);
+            let parsed = Message::parse(&m.encode()).unwrap();
+            assert_eq!(parsed.error_code(), Some((code, reason.to_string())));
+        }
+        // 487 on the wire is exactly [0, 0, 4, 87].
+        let mut m = Message::new(BINDING_ERROR_RESPONSE);
+        m.add_error_code(487, "Role Conflict");
+        assert_eq!(&m.get(ERROR_CODE).unwrap()[..4], &[0, 0, 4, 87]);
+    }
+
+    /// Decode masks the class byte to its low 3 bits (RFC 5389 §15.6), so
+    /// stray high bits do not corrupt the code.
+    #[test]
+    fn error_code_decode_masks_class_bits() {
+        let mut m = Message::new(BINDING_ERROR_RESPONSE);
+        m.add(ERROR_CODE, vec![0, 0, 0x84, 87]);
+        assert_eq!(m.error_code(), Some((487, String::new())));
     }
 
     #[test]

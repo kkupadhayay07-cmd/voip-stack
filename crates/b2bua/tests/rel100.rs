@@ -189,9 +189,11 @@ async fn run_rel100_uas(sock: UdpSocket, rtp_port: u16, log: Log) {
                 Method::Prack => {
                     pracks_seen += 1;
                     log.push(format!(
-                        "PRACK{} rack={}",
+                        "PRACK{} rack={} cseq={} branch={}",
                         pracks_seen,
-                        req.headers.get("RAck").unwrap_or("-")
+                        req.headers.get("RAck").unwrap_or("-"),
+                        req.headers.cseq().map(|c| c.seq).unwrap_or(0),
+                        via_branch_text(&req),
                     ));
                     let ok = sip_core::builder::respond_to(&req, 200, "OK", Vec::new(), None);
                     let _ = sock
@@ -243,8 +245,9 @@ async fn run_rel100_uas(sock: UdpSocket, rtp_port: u16, log: Log) {
 }
 
 /// Leg B fake UAS that rejects the first INVITE with 421 Extension Required
-/// (RFC 3262 §3) and answers the second normally.
-async fn run_421_uas(sock: UdpSocket, rtp_port: u16, log: Log) {
+/// (RFC 3262 §3) carrying `Require: {require}` and answers the second
+/// normally.
+async fn run_421_uas(sock: UdpSocket, rtp_port: u16, require: &str, log: Log) {
     let mut buf = vec![0u8; 65_535];
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut first = true;
@@ -275,7 +278,7 @@ async fn run_421_uas(sock: UdpSocket, rtp_port: u16, log: Log) {
                         Vec::new(),
                         None,
                     );
-                    resp.headers.add("Require", "100rel");
+                    resp.headers.add("Require", require);
                     let _ = sock
                         .send_to(&serialize(&SipMessage::Response(resp)), src)
                         .await;
@@ -335,6 +338,215 @@ fn to_tag_of(resp: &Response) -> String {
 
 fn rseq_of(resp: &Response) -> Option<u32> {
     resp.headers.rseq()
+}
+
+/// Branch parameter of a request's top Via (string-level, test-side).
+fn via_branch_text(req: &sip_core::message::Request) -> String {
+    req.headers
+        .get("Via")
+        .and_then(|v| v.split(";branch=").nth(1))
+        .map(|b| b.split(';').next().unwrap_or("").to_string())
+        .unwrap_or_default()
+}
+
+/// Extracts `key=value` whitespace-delimited fields from a log entry.
+fn field_of(entry: &str, key: &str) -> String {
+    entry
+        .split_whitespace()
+        .find_map(|t| t.strip_prefix(key))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Leg B fake UAS that rings forever (100 + 180, never answers): CANCEL is
+/// answered 200 and additionally 487s the INVITE, logging the Via branch +
+/// CSeq of both so the test can check the §9.1 CANCEL matching.
+async fn run_ringing_uas(sock: UdpSocket, log: Log) {
+    let mut buf = vec![0u8; 65_535];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut invite: Option<sip_core::message::Request> = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let recv = tokio::time::timeout(remaining, sock.recv_from(&mut buf)).await;
+        let Ok(Ok((n, src))) = recv else { break };
+        let Ok(msg) = parse_message(&buf[..n]) else {
+            continue;
+        };
+        let SipMessage::Request(req) = msg else {
+            continue;
+        };
+        match req.method {
+            Method::Invite => {
+                log.push(format!(
+                    "INVITE branch={} cseq={}",
+                    via_branch_text(&req),
+                    req.headers.cseq().map(|c| c.seq).unwrap_or(0)
+                ));
+                let trying = sip_core::builder::respond_to(&req, 100, "Trying", Vec::new(), None);
+                let _ = sock
+                    .send_to(&serialize(&SipMessage::Response(trying)), src)
+                    .await;
+                let ring = sip_core::builder::respond_to(&req, 180, "Ringing", Vec::new(), None);
+                let _ = sock
+                    .send_to(&serialize(&SipMessage::Response(ring)), src)
+                    .await;
+                invite = Some(req);
+            }
+            Method::Cancel => {
+                log.push(format!(
+                    "CANCEL branch={} cseq={}",
+                    via_branch_text(&req),
+                    req.headers.cseq().map(|c| c.seq).unwrap_or(0)
+                ));
+                let ok = sip_core::builder::respond_to(&req, 200, "OK", Vec::new(), None);
+                let _ = sock
+                    .send_to(&serialize(&SipMessage::Response(ok)), src)
+                    .await;
+                // A real UAS also terminates the INVITE transaction.
+                if let Some(inv) = &invite {
+                    let term = sip_core::builder::respond_to(
+                        inv,
+                        487,
+                        "Request Terminated",
+                        Vec::new(),
+                        Some("tagB"),
+                    );
+                    let _ = sock
+                        .send_to(&serialize(&SipMessage::Response(term)), src)
+                        .await;
+                }
+                break;
+            }
+            Method::Bye => {
+                log.push("BYE");
+                let ok = sip_core::builder::respond_to(&req, 200, "OK", Vec::new(), None);
+                let _ = sock
+                    .send_to(&serialize(&SipMessage::Response(ok)), src)
+                    .await;
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Leg B fake UAS that probes the RFC 3262 §4 PRACK gate: a 100 carrying
+/// `Require: 100rel` + `RSeq` (100 is never PRACKable) and a 183 WITHOUT
+/// `Require` (unreliable) must not draw any PRACK; a 183 with both markers
+/// is PRACKed; then the call completes.
+async fn run_gate_uas(sock: UdpSocket, rtp_port: u16, log: Log) {
+    let mut buf = vec![0u8; 65_535];
+    let start = tokio::time::Instant::now();
+    let mut invite: Option<sip_core::message::Request> = None;
+    let mut peer: Option<SocketAddr> = None;
+    let mut unrel_sent = false;
+    let mut rel_sent = false;
+    loop {
+        // Staged probes fire by wall clock, independent of traffic: the
+        // point is that NO PRACK arrives for either of them.
+        if let Some(dst) = peer {
+            if start.elapsed() >= Duration::from_millis(2200) && !rel_sent {
+                rel_sent = true;
+                // The REAL reliable 183 — PRACKed.
+                if let Some(inv) = &invite {
+                    let mut resp = sip_core::builder::respond_to(
+                        inv,
+                        183,
+                        "Session Progress",
+                        Vec::new(),
+                        Some("tagB"),
+                    );
+                    resp.headers.add("Require", "100rel");
+                    resp.headers.add("RSeq", "57");
+                    let _ = sock
+                        .send_to(&serialize(&SipMessage::Response(resp)), dst)
+                        .await;
+                }
+            } else if start.elapsed() >= Duration::from_millis(1100) && !unrel_sent {
+                unrel_sent = true;
+                // A 183 with RSeq but WITHOUT Require — unreliable.
+                if let Some(inv) = &invite {
+                    let mut resp = sip_core::builder::respond_to(
+                        inv,
+                        183,
+                        "Session Progress",
+                        Vec::new(),
+                        Some("tagB"),
+                    );
+                    resp.headers.add("RSeq", "56");
+                    let _ = sock
+                        .send_to(&serialize(&SipMessage::Response(resp)), dst)
+                        .await;
+                }
+            }
+        }
+        let recv = tokio::time::timeout(Duration::from_millis(50), sock.recv_from(&mut buf)).await;
+        let Ok(Ok((n, src))) = recv else {
+            if start.elapsed() > Duration::from_secs(12) {
+                break;
+            }
+            continue;
+        };
+        peer = Some(src);
+        let Ok(msg) = parse_message(&buf[..n]) else {
+            continue;
+        };
+        match msg {
+            SipMessage::Request(req) => match req.method {
+                Method::Invite => {
+                    log.push("INVITE");
+                    let trying =
+                        sip_core::builder::respond_to(&req, 100, "Trying", Vec::new(), None);
+                    let _ = sock
+                        .send_to(&serialize(&SipMessage::Response(trying)), src)
+                        .await;
+                    // A 100 that LOOKS reliable (broken peer): must never
+                    // be PRACKed (RFC 3262 §4).
+                    let mut probe =
+                        sip_core::builder::respond_to(&req, 100, "Trying", Vec::new(), None);
+                    probe.headers.add("Require", "100rel");
+                    probe.headers.add("RSeq", "55");
+                    let _ = sock
+                        .send_to(&serialize(&SipMessage::Response(probe)), src)
+                        .await;
+                    invite = Some(req);
+                }
+                Method::Prack => {
+                    log.push(format!(
+                        "PRACK rack={}",
+                        req.headers.get("RAck").unwrap_or("-")
+                    ));
+                    let ok = sip_core::builder::respond_to(&req, 200, "OK", Vec::new(), None);
+                    let _ = sock
+                        .send_to(&serialize(&SipMessage::Response(ok)), src)
+                        .await;
+                    // PRACK received: answer the INVITE.
+                    if let Some(inv) = &invite {
+                        let mut ok = sip_core::builder::respond_to(
+                            inv,
+                            200,
+                            "OK",
+                            answer_sdp(rtp_port).into_bytes(),
+                            Some("tagB"),
+                        );
+                        ok.headers.add("Contact", "<sip:uas@127.0.0.1>");
+                        let _ = sock
+                            .send_to(&serialize(&SipMessage::Response(ok)), src)
+                            .await;
+                    }
+                }
+                Method::Ack => {
+                    log.push("ACK");
+                    break;
+                }
+                _ => {}
+            },
+            SipMessage::Response(_) => {}
+        }
+    }
 }
 
 /// Caller INVITE with or without `Supported: 100rel`.
@@ -412,6 +624,52 @@ async fn send_ack(
     .cseq(cseq)
     .build();
     a.send_to(&serialize(&SipMessage::Request(ack)), engine)
+        .await
+        .unwrap();
+}
+
+/// CANCEL for the still-unanswered INVITE (To without tag, same CSeq).
+async fn send_cancel(
+    a: &UdpSocket,
+    a_addr: SocketAddr,
+    engine: SocketAddr,
+    call_id: &str,
+    cseq: u32,
+) {
+    let cancel = RequestBuilder::new(
+        Method::Cancel,
+        SipUri::parse(&format!("sip:1000@{engine}")).unwrap(),
+    )
+    .via(TransportKind::Udp, &a_addr.to_string(), Some("z9hG4bKc1"))
+    .from("<sip:caller@dev>;tag=tagA")
+    .to("<sip:1000@dev>")
+    .call_id(Some(call_id))
+    .cseq(cseq)
+    .build();
+    a.send_to(&serialize(&SipMessage::Request(cancel)), engine)
+        .await
+        .unwrap();
+}
+
+async fn send_bye(
+    a: &UdpSocket,
+    a_addr: SocketAddr,
+    engine: SocketAddr,
+    call_id: &str,
+    to_tag: &str,
+    cseq: u32,
+) {
+    let bye = RequestBuilder::new(
+        Method::Bye,
+        SipUri::parse(&format!("sip:1000@{engine}")).unwrap(),
+    )
+    .via(TransportKind::Udp, &a_addr.to_string(), Some("z9hG4bKb1"))
+    .from("<sip:caller@dev>;tag=tagA")
+    .to(&format!("<sip:1000@dev>;tag={to_tag}"))
+    .call_id(Some(call_id))
+    .cseq(cseq)
+    .build();
+    a.send_to(&serialize(&SipMessage::Request(bye)), engine)
         .await
         .unwrap();
 }
@@ -840,11 +1098,13 @@ async fn pracks_leg_b_reliable_180_including_retransmission() {
     let _ = timeout(Duration::from_secs(10), uas_task).await;
 
     // The engine PRACKed the fake UAS twice (original + retransmitted 180),
-    // both with RAck "77 1 INVITE".
+    // both with RAck "77 1 INVITE" — and both times the SAME PRACK request:
+    // identical CSeq number and identical Via branch (RFC 3261 §17.1.2).
     let events = log.snapshot();
-    let prack_count = events.iter().filter(|e| e.contains("PRACK")).count();
+    let pracks: Vec<&String> = events.iter().filter(|e| e.contains("PRACK")).collect();
     assert_eq!(
-        prack_count, 2,
+        pracks.len(),
+        2,
         "engine must PRACK the reliable 180 and its retransmission: {events:?}"
     );
     assert!(
@@ -852,6 +1112,16 @@ async fn pracks_leg_b_reliable_180_including_retransmission() {
             .iter()
             .all(|e| !e.contains("PRACK") || e.contains("rack=77 1 INVITE")),
         "every PRACK must carry RAck for RSeq 77 / INVITE CSeq 1: {events:?}"
+    );
+    let cseqs: Vec<String> = pracks.iter().map(|e| field_of(e, "cseq=")).collect();
+    let branches: Vec<String> = pracks.iter().map(|e| field_of(e, "branch=")).collect();
+    assert!(
+        cseqs.iter().all(|c| !c.is_empty()) && cseqs[0] == cseqs[1],
+        "the retransmitted 1xx must be answered with the SAME PRACK CSeq: {pracks:?}"
+    );
+    assert!(
+        branches.iter().all(|b| !b.is_empty()) && branches[0] == branches[1],
+        "the retransmitted 1xx must be answered with the SAME PRACK branch: {pracks:?}"
     );
     assert!(log.contains("ACK"), "leg B must be confirmed: {events:?}");
 }
@@ -865,7 +1135,7 @@ async fn retries_leg_b_after_421() {
     let uas_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let uas = uas_sock.local_addr().unwrap();
     let engine = spawn_engine(uas).await;
-    let uas_task = tokio::spawn(run_421_uas(uas_sock, 49230, log.clone()));
+    let uas_task = tokio::spawn(run_421_uas(uas_sock, 49230, "100rel", log.clone()));
 
     let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let a_addr = a.local_addr().unwrap();
@@ -888,4 +1158,198 @@ async fn retries_leg_b_after_421() {
         "retry must carry Supported: 100rel: {events:?}"
     );
     assert!(log.contains("ACK"), "retry must be confirmed: {events:?}");
+}
+
+/// RFC 3262 §4 gate: a 100 that (illegally) carries `Require: 100rel` +
+/// `RSeq` draws NO PRACK, and a 183 without `Require: 100rel` draws none
+/// either; only a real 101–199 with both markers is PRACKed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prack_gate_rejects_100_and_unrequired_1xx() {
+    let log = Log::default();
+    let uas_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let uas = uas_sock.local_addr().unwrap();
+    let engine = spawn_engine(uas).await;
+    let uas_task = tokio::spawn(run_gate_uas(uas_sock, 49232, log.clone()));
+
+    let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = a.local_addr().unwrap();
+
+    send_invite(&a, a_addr, engine, false, "rl-7").await;
+    let _ = timeout(Duration::from_secs(12), uas_task).await;
+
+    let events = log.snapshot();
+    let pracks: Vec<&String> = events.iter().filter(|e| e.contains("PRACK")).collect();
+    assert_eq!(
+        pracks.len(),
+        1,
+        "exactly one PRACK: for the reliable 183 only (no PRACK for the 100 or the Require-less 183): {events:?}"
+    );
+    assert!(
+        pracks[0].contains("rack=57 1 INVITE"),
+        "the single PRACK must RAck the reliable 183 (RSeq 57): {pracks:?}"
+    );
+    assert!(
+        log.contains("ACK"),
+        "call must complete after the PRACK: {events:?}"
+    );
+}
+
+/// A 421 whose `Require` lists more than `100rel` must have ALL of its
+/// tokens merged into the retry INVITE's `Supported` header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retries_leg_b_after_421_merging_require_tokens() {
+    let log = Log::default();
+    let uas_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let uas = uas_sock.local_addr().unwrap();
+    let engine = spawn_engine(uas).await;
+    let uas_task = tokio::spawn(run_421_uas(uas_sock, 49234, "100rel, timer", log.clone()));
+
+    let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = a.local_addr().unwrap();
+    let mut buf = vec![0u8; 65_535];
+
+    send_invite(&a, a_addr, engine, false, "rl-8").await;
+    let invite_200 = await_invite_200(&a, &mut buf).await;
+    send_ack(&a, a_addr, engine, "rl-8", &to_tag_of(&invite_200), 1).await;
+    let _ = timeout(Duration::from_secs(10), uas_task).await;
+
+    let events = log.snapshot();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.contains("INVITE cseq=2") && e.contains("supported=100rel, timer")),
+        "retry must merge the 421's Require tokens into Supported: {events:?}"
+    );
+    assert!(log.contains("ACK"), "retry must be confirmed: {events:?}");
+}
+
+/// CANCEL while the call is unanswered: 200 for the CANCEL, 487 for the
+/// INVITE, and leg B (still ringing) receives a §9.1 CANCEL that matches
+/// the dial INVITE's transaction (same branch + CSeq).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_while_ringing_propagates_to_leg_b() {
+    let log = Log::default();
+    let uas_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let uas = uas_sock.local_addr().unwrap();
+    let engine = spawn_engine(uas).await;
+    let uas_task = tokio::spawn(run_ringing_uas(uas_sock, log.clone()));
+
+    let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = a.local_addr().unwrap();
+    let mut buf = vec![0u8; 65_535];
+
+    send_invite(&a, a_addr, engine, false, "rl-9").await;
+    // The engine dialing leg B: wait for its 180 (ringing) before hanging up.
+    let mut leg_b_dialed = false;
+    for _ in 0..8 {
+        let Some(msg) = recv_on(&a, &mut buf, 3).await else {
+            break;
+        };
+        if let Some(r) = as_response(&msg) {
+            if r.code == 180 {
+                leg_b_dialed = true;
+                break;
+            }
+        }
+    }
+    assert!(leg_b_dialed, "leg B must be ringing before the CANCEL");
+    // Give the dial INVITE a moment to reach the fake UAS.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    send_cancel(&a, a_addr, engine, "rl-9", 1).await;
+
+    // 200 for the CANCEL, then 487 for the INVITE.
+    let mut got_200_cancel = false;
+    let mut got_487_invite = false;
+    for _ in 0..8 {
+        let Some(msg) = recv_on(&a, &mut buf, 3).await else {
+            break;
+        };
+        let Some(r) = as_response(&msg) else { continue };
+        match (r.code, r.headers.cseq().map(|c| c.method)) {
+            (200, Some(Method::Cancel)) => got_200_cancel = true,
+            (487, Some(Method::Invite)) => got_487_invite = true,
+            _ => {}
+        }
+        if got_200_cancel && got_487_invite {
+            break;
+        }
+    }
+    assert!(got_200_cancel, "CANCEL must be answered 200");
+    assert!(got_487_invite, "the cancelled INVITE must get 487");
+
+    let _ = timeout(Duration::from_secs(10), uas_task).await;
+    let events = log.snapshot();
+    let invite = events
+        .iter()
+        .find(|e| e.contains("INVITE"))
+        .expect("leg B INVITE");
+    let cancel = events
+        .iter()
+        .find(|e| e.contains("CANCEL"))
+        .expect("leg B must have received a CANCEL");
+    assert_eq!(
+        field_of(invite, "branch="),
+        field_of(cancel, "branch="),
+        "the leg-B CANCEL must reuse the dial INVITE's top Via branch (§9.1): {events:?}"
+    );
+    assert_eq!(
+        field_of(invite, "cseq="),
+        field_of(cancel, "cseq="),
+        "the leg-B CANCEL must carry the dial INVITE's CSeq (§9.1): {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e.contains("BYE")),
+        "leg B was never answered: CANCEL, not BYE: {events:?}"
+    );
+}
+
+/// CANCEL for an already-answered call is out of transaction: the call
+/// survives it (481), and the caller must BYE to end it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_after_answer_does_not_teardown() {
+    let log = Log::default();
+    let uas_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let uas = uas_sock.local_addr().unwrap();
+    let engine = spawn_engine(uas).await;
+    let uas_task = tokio::spawn(run_plain_uas(uas_sock, 49236, log.clone()));
+
+    let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = a.local_addr().unwrap();
+    let mut buf = vec![0u8; 65_535];
+
+    send_invite(&a, a_addr, engine, false, "rl-10").await;
+    let invite_200 = await_invite_200(&a, &mut buf).await;
+    send_ack(&a, a_addr, engine, "rl-10", &to_tag_of(&invite_200), 1).await;
+
+    // Late CANCEL for the answered call: 481, call stays up.
+    send_cancel(&a, a_addr, engine, "rl-10", 1).await;
+    let mut got_481 = false;
+    for _ in 0..6 {
+        let Some(msg) = recv_on(&a, &mut buf, 3).await else {
+            break;
+        };
+        let Some(r) = as_response(&msg) else { continue };
+        if r.code == 481 && r.headers.cseq().map(|c| c.method) == Some(Method::Cancel) {
+            got_481 = true;
+            break;
+        }
+    }
+    assert!(
+        got_481,
+        "a CANCEL for a answered call has no transaction: 481 (§9.2)"
+    );
+
+    // The call is still fully up: BYE ends it and leg B sees the BYE.
+    send_bye(&a, a_addr, engine, "rl-10", &to_tag_of(&invite_200), 2).await;
+    let _ = timeout(Duration::from_secs(10), uas_task).await;
+    let events = log.snapshot();
+    assert!(
+        events.contains(&"BYE".to_string()),
+        "leg B must have been BYEed after the caller's BYE: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e.contains("CANCEL")),
+        "no CANCEL may be relayed for an answered call: {events:?}"
+    );
 }

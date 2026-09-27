@@ -99,6 +99,10 @@ pub struct LiveStats {
     pub agents_busy: usize,
     /// Outbound calls currently ringing (no agent attached yet).
     pub lines_ringing: usize,
+    /// Outbound calls with an INVITE in flight (dialed, no response yet).
+    pub lines_dialing: usize,
+    /// Outbound calls currently connected (agent on the call).
+    pub lines_active: usize,
     /// Rolling answered / dialed counts.
     pub dialed_recent: u64,
     pub answered_recent: u64,
@@ -211,8 +215,15 @@ pub fn pace_predictive(stats: &LiveStats, abandon_rate: f64) -> PacingDecision {
     }
     // Never overdial more than 3x idle agents (drop protection).
     lines = lines.min(agents_idle * 3);
+    // The model targets TOTAL lines in flight, so every outstanding call
+    // (INVITE in flight + ringing + active) counts against capacity; only
+    // the deficit may be placed now, never a fresh batch on top of it.
+    let outstanding = stats
+        .lines_dialing
+        .saturating_add(stats.lines_ringing)
+        .saturating_add(stats.lines_active);
     PacingDecision {
-        lines_to_dial: lines,
+        lines_to_dial: lines.saturating_sub(outstanding),
         reason: "predictive",
     }
 }
@@ -316,9 +327,15 @@ impl Dialer {
         let c = self.campaigns.get(campaign).ok_or(DialerError::NoLead)?;
         let queue = self.leads.get_mut(campaign).ok_or(DialerError::NoLead)?;
         let now = Instant::now();
-        // Rotate the queue looking for a dialable lead.
+        let dnc = &self.dnc;
+        // Rotate the queue looking for a dialable lead. DNC is re-checked
+        // HERE — the single dial-candidacy point — so a number added to the
+        // list after queueing can never be dialed, first attempt or retry.
         for _ in 0..queue.len() {
-            let lead = queue.remove(0);
+            let mut lead = queue.remove(0);
+            if !lead.done && dnc.contains(&normalize(&lead.phone)) {
+                lead.done = true;
+            }
             let retryable = lead
                 .last_attempt
                 .map(|t| now.duration_since(t) >= c.retry_cooldown)
@@ -365,24 +382,21 @@ impl Dialer {
         } else if answered {
             self.abandonment.record_connected(campaign);
         }
-        if let Some(AmdResult::Machine) = amd {
-            // Machine-detected calls park the lead (message drop policy).
-            if let Some(queue) = self.leads.get_mut(campaign) {
-                if let Some(lead) = queue.iter_mut().find(|l| l.id == lead_id) {
-                    lead.done = true;
-                }
-            }
-        }
-        // Exhausted leads park.
+        // Lead disposition: a lead that was answered is complete and must
+        // never be eligible for redial; machine-detected calls park the
+        // lead (message drop policy); exhausted leads park.
         if let Some(queue) = self.leads.get_mut(campaign) {
             if let Some(lead) = queue.iter_mut().find(|l| l.id == lead_id) {
-                if lead.attempts
-                    >= self
-                        .campaigns
-                        .get(campaign)
-                        .map(|c| c.max_attempts)
-                        .unwrap_or(3)
-                {
+                if answered || matches!(amd, Some(AmdResult::Machine)) {
+                    lead.done = true;
+                }
+                // Exhausted leads park.
+                let max_attempts = self
+                    .campaigns
+                    .get(campaign)
+                    .map(|c| c.max_attempts)
+                    .unwrap_or(3);
+                if lead.attempts >= max_attempts {
                     lead.done = true;
                 }
             }
@@ -618,5 +632,107 @@ mod tests {
         };
         let d = dialer.pace("missing", &stats, 12);
         assert_eq!(d.lines_to_dial, 0);
+    }
+
+    // Regression 2.14(i): ALL outstanding calls (dialing + ringing + active)
+    // count against the predictive in-flight target — no overdialing.
+    #[test]
+    fn predictive_counts_all_outstanding_calls() {
+        let mut stats = LiveStats {
+            agents_ready: 6,
+            dialed_recent: 100,
+            answered_recent: 90, // p = 0.9
+            avg_talk_secs: 60.0,
+            avg_ring_secs: 15.0,
+            ..Default::default()
+        };
+        // Target in flight: ceil(6 * (15 + 60) / (60 * 0.9)) = 9.
+        assert_eq!(pace_predictive(&stats, 0.0).lines_to_dial, 9);
+        // 15 calls already outstanding across every stage: booked capacity
+        // saturates the target, so nothing more may be dialed.
+        stats.lines_dialing = 4;
+        stats.lines_ringing = 5;
+        stats.lines_active = 6;
+        assert_eq!(
+            pace_predictive(&stats, 0.0).lines_to_dial,
+            0,
+            "booked capacity must not be dialed on top of"
+        );
+        // Partially booked capacity: only the deficit is dialed (9 - 3).
+        stats.lines_dialing = 2;
+        stats.lines_ringing = 1;
+        stats.lines_active = 0;
+        assert_eq!(pace_predictive(&stats, 0.0).lines_to_dial, 6);
+    }
+
+    // Regression 2.14(ii): a lead that got answered is complete and must
+    // never be eligible for redial.
+    #[tokio::test]
+    async fn answered_lead_is_never_redialed() {
+        let mut dialer = Dialer::new(cdr::CdrStore::new(10));
+        dialer.add_campaign(Campaign {
+            max_attempts: 3,
+            retry_cooldown: Duration::from_secs(0),
+            ..Campaign::new("c-ans", PacingMode::Predictive, vec!["5550001".into()])
+        });
+        dialer
+            .add_lead(Lead {
+                id: "l-a".into(),
+                phone: "2125550100".into(),
+                campaign: "c-ans".into(),
+                attempts: 0,
+                last_attempt: None,
+                done: false,
+            })
+            .unwrap();
+        let lead = dialer.next_lead("c-ans", 12).unwrap();
+        dialer.mark_attempt(&lead.id);
+        dialer.record_outcome(
+            "c-ans",
+            "l-a",
+            true,
+            false,
+            Some(AmdResult::Human),
+            200,
+            30,
+            "5550001",
+        );
+        assert_eq!(dialer.pending_leads("c-ans"), 0, "answered lead is done");
+        assert!(
+            dialer.next_lead("c-ans", 12).is_err(),
+            "answered lead must not be redialed"
+        );
+    }
+
+    // Regression 2.14(iii): DNC is enforced on every dial candidacy — a
+    // number DNC-listed after queueing is blocked on the retry path too.
+    #[tokio::test]
+    async fn dnc_gate_blocks_retry_path() {
+        let mut dialer = Dialer::new(cdr::CdrStore::new(10));
+        dialer.add_campaign(Campaign {
+            max_attempts: 3,
+            retry_cooldown: Duration::from_secs(0),
+            ..Campaign::new("c-dnc", PacingMode::Progressive, vec!["5550001".into()])
+        });
+        dialer
+            .add_lead(Lead {
+                id: "l-r".into(),
+                phone: "2125550199".into(),
+                campaign: "c-dnc".into(),
+                attempts: 0,
+                last_attempt: None,
+                done: false,
+            })
+            .unwrap();
+        let lead = dialer.next_lead("c-dnc", 12).unwrap();
+        dialer.mark_attempt(&lead.id);
+        dialer.record_outcome("c-dnc", "l-r", false, false, None, 486, 0, "5550001");
+        // DNC-listed between attempts: the retry must be blocked.
+        dialer.add_dnc("212-555-0199");
+        assert!(
+            dialer.next_lead("c-dnc", 12).is_err(),
+            "retry of DNC number must be blocked"
+        );
+        assert_eq!(dialer.pending_leads("c-dnc"), 0, "DNC lead parked");
     }
 }

@@ -171,9 +171,12 @@ pub struct Sbc {
     pub config: SbcConfig,
     buckets: HashMap<IpAddr, Bucket>,
     latches: LatchTable,
-    /// Call-ID rewrite map: real (internal) id → hidden (external) id.
+    /// Call-ID rewrite map: peer (external) id → hidden (core-facing) id.
+    /// Populated on the external→internal request path.
     call_map: HashMap<String, String>,
-    /// Reverse map: hidden id → real id (upstream lookups).
+    /// Reverse map: hidden id → peer id. Responses from the core carry the
+    /// hidden id, so this is the map that resolves on the internal→external
+    /// response path.
     call_map_rev: HashMap<String, String>,
 }
 
@@ -318,13 +321,19 @@ impl Sbc {
     }
 
     /// Screen a response from the internal core before it leaves to the peer.
+    ///
+    /// The core answers the request we relayed inward, so its responses carry
+    /// the *hidden* Call-ID; restore the peer's original (external) id here so
+    /// the peer can match the call it initiated. Responses that already carry
+    /// an external id (e.g. locally generated refusals built from the peer's
+    /// own request) have no reverse entry and pass through untouched.
     pub fn process_response(&mut self, resp: &Response) -> Response {
         let mut resp = resp.clone();
         if self.config.topology_hiding {
             if let Some(cid) = resp.headers.call_id().map(|s| s.to_string()) {
-                if let Some(hidden) = self.call_map.get(&cid) {
+                if let Some(real) = self.call_map_rev.get(&cid) {
                     resp.headers.remove_all("Call-ID");
-                    resp.headers.add("Call-ID", hidden.clone());
+                    resp.headers.add("Call-ID", real.clone());
                 }
             }
         }

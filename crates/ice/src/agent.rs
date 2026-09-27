@@ -216,27 +216,37 @@ impl IceAgent {
         user: &str,
         pass: &str,
     ) -> Result<Candidate, IceError> {
-        // 1. Binding request to learn realm/nonce (438 error).
+        // 1. Initial Allocate: an authenticating server answers 401 with
+        //    REALM + NONCE (RFC 5389 §10.2.2); a server without
+        //    authentication answers with the allocation itself.
         let mut probe = stun::Message::new(stun::ALLOCATE_REQUEST);
         probe.add_requested_transport(17); // UDP
         self.socket
             .send_to(&probe.encode(), turn_server)
             .await
             .map_err(|e| IceError::Io(e.to_string()))?;
-        let (realm, nonce) = self
+        let probe_resp = self
             .await_message(turn_server, Duration::from_secs(3), |m| {
-                m.msg_type == stun::ALLOCATE_ERROR_RESPONSE
+                m.msg_type == stun::ALLOCATE_RESPONSE || m.msg_type == stun::ALLOCATE_ERROR_RESPONSE
             })
-            .await?
-            .map(|m| {
+            .await?;
+
+        let (realm, nonce) = match probe_resp {
+            Some(m) if m.msg_type == stun::ALLOCATE_RESPONSE => {
+                // Server runs without authentication and the allocation
+                // already exists — finish right here (no 401 round trip).
+                return self.relayed_candidate(&m);
+            }
+            Some(m) => {
                 let realm = m
                     .get(stun::REALM)
                     .map(|v| String::from_utf8_lossy(v).into_owned())
                     .unwrap_or_default();
                 let nonce = m.get(stun::NONCE).map(|v| v.to_vec()).unwrap_or_default();
                 (realm, nonce)
-            })
-            .unwrap_or((String::new(), Vec::new()));
+            }
+            None => (String::new(), Vec::new()),
+        };
 
         if realm.is_empty() {
             // Server runs without authentication.
@@ -253,22 +263,12 @@ impl IceAgent {
             if resp.msg_type != stun::ALLOCATE_RESPONSE {
                 return Err(IceError::Io("allocate refused".into()));
             }
-            let relayed = resp
-                .xor_address(stun::XOR_RELAYED_ADDRESS)
-                .transpose()?
-                .ok_or(IceError::Io("no relayed address".into()))?;
-            let base = self.local_addr()?;
-            let c = Candidate::relayed(
-                relayed,
-                base,
-                1,
-                &self.next_foundation(CandidateType::Relay),
-            );
-            self.local.push(c.clone());
-            return Ok(c);
+            return self.relayed_candidate(&resp);
         }
 
-        // 2. Authenticated allocate with long-term key.
+        // 2. Authenticated Allocate retry (RFC 5389 §10.2 / RFC 5766 §6.2):
+        //    USERNAME + REALM + NONCE + MESSAGE-INTEGRITY with the
+        //    long-term key MD5(username ":" realm ":" password).
         let key = stun::long_term_key(user, &realm, pass);
         let mut alloc = stun::Message::new(stun::ALLOCATE_REQUEST);
         alloc.add_requested_transport(17);
@@ -292,6 +292,12 @@ impl IceAgent {
         if !resp.verify_integrity(&key)? {
             return Err(IceError::Io("allocate integrity failed".into()));
         }
+        self.relayed_candidate(&resp)
+    }
+
+    /// Build the relayed candidate from a successful Allocate response
+    /// (RFC 5766 §6.2) and register it as a local candidate.
+    fn relayed_candidate(&mut self, resp: &stun::Message) -> Result<Candidate, IceError> {
         let relayed = resp
             .xor_address(stun::XOR_RELAYED_ADDRESS)
             .transpose()?

@@ -1788,10 +1788,6 @@ impl Encoder for G729Encoder {
 // Decoder
 // ---------------------------------------------------------------------------
 
-fn out_raw_pf_bypass(v: f64, out_raw: &mut Vec<f64>) {
-    out_raw.push(v);
-}
-
 /// Deterministic G.729 random generator (§4.4.4): `v = 31821·v + 13849`.
 fn g729_prng(v: u16) -> u16 {
     31821u32.wrapping_mul(v as u32).wrapping_add(13849) as u16
@@ -2018,11 +2014,17 @@ impl G729Decoder {
                 self.syn[LP_ORDER - 1] = acc;
                 synth[i] = acc.clamp(-32768.0, 32767.0);
             }
-            out_raw.extend_from_slice(&synth);
+            // The output buffer receives the plain synthesis or the
+            // postfiltered signal depending on `self.postfilter` (see below);
+            // `debug_synth` always holds the plain synthesis (pre-postfilter).
+            self.debug_synth.extend_from_slice(&synth);
 
             // ---- Postfilter: long-term + formant + AGC (§4.2) ----
             if !self.postfilter {
                 self.syn_pf_hist.extend_from_slice(&synth);
+                while self.syn_pf_hist.len() > EXC_BASE_LEN {
+                    self.syn_pf_hist.remove(0);
+                }
                 self.prev_gp = gp;
                 self.prev_gc = gc;
                 if erasure {
@@ -2030,9 +2032,7 @@ impl G729Decoder {
                 } else {
                     self.prev_t = t_int as i32;
                 }
-                for &v in synth.iter() {
-                    out_raw_pf_bypass(v, &mut out_raw);
-                }
+                out_raw.extend_from_slice(&synth);
                 continue;
             }
             let energy_before: f64 = synth.iter().map(|v| v * v).sum();
@@ -2082,6 +2082,8 @@ impl G729Decoder {
             while self.syn_pf_hist.len() > EXC_BASE_LEN {
                 self.syn_pf_hist.remove(0);
             }
+            // The postfilter + AGC output IS the decoder output.
+            out_raw.extend_from_slice(&st);
 
             // State updates.
             self.prev_gp = gp;
@@ -2094,7 +2096,6 @@ impl G729Decoder {
         }
 
         self.prev_cos = cur_cos;
-        self.debug_synth = out_raw.clone();
         self.exc.copy_within(2 * SUBFRAME..EXC_BASE_LEN, 0);
         self.was_periodic = self.last_gt >= 0.35;
         let filtered = self.hpf.run(&out_raw);
@@ -2301,11 +2302,12 @@ mod tests {
             back.extend_from_slice(&d.decode_frame(&frame).unwrap());
         }
         let (snr, _) = aligned_snr_db(&pcm, &back, 30);
-        // CELP does not preserve waveforms of synthetic fixtures: even the
-        // bcg729 reference reaches ≈0 dB sample-SNR on the oracle signal.
-        // Wire conformance is gated by the oracle cross-decode test; this
-        // check only guards against gross encoder regressions.
-        assert!(snr > 1.0, "round-trip SNR {snr:.1} dB too low");
+        // CELP does not preserve waveforms of synthetic fixtures: the decode
+        // includes the postfilter, and even the bcg729 reference reaches only
+        // ≈0 dB sample-SNR on the oracle signal. Wire conformance is gated by
+        // the oracle cross-decode test; this check only guards against gross
+        // encoder regressions (which land far below 0 dB).
+        assert!(snr > 0.0, "round-trip SNR {snr:.1} dB too low");
     }
 
     #[test]
@@ -2472,6 +2474,60 @@ mod tests {
         d.reset();
         let b = d.decode_frame(&f1).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn postfilter_output_paths() {
+        // Fixed, deterministic bitstream: encode a speech-like fixture once.
+        let pcm = speechish(800); // 10 frames
+        let mut e = G729Encoder::new();
+        let mut bit = Vec::new();
+        for chunk in pcm.chunks(80) {
+            bit.extend_from_slice(&e.encode_frame(chunk).unwrap());
+        }
+
+        // (a) Exactly 80 samples per 10 ms frame, postfilter on AND off.
+        let mut on = G729Decoder::new();
+        on.postfilter = true;
+        let mut off = G729Decoder::new();
+        off.postfilter = false;
+        let mut out_on = Vec::new();
+        let mut out_off = Vec::new();
+        for fr in bit.chunks(10) {
+            let a = on.decode_frame(fr).unwrap();
+            let b = off.decode_frame(fr).unwrap();
+            assert_eq!(a.len(), FRAME_SAMPLES, "postfilter=on frame length");
+            assert_eq!(b.len(), FRAME_SAMPLES, "postfilter=off frame length");
+            out_on.extend_from_slice(&a);
+            out_off.extend_from_slice(&b);
+        }
+        assert_eq!(out_on.len(), 800);
+        assert_eq!(out_off.len(), 800);
+        // Not duplicated: the buggy decoder emitted every sample twice
+        // (postfilter off), making both halves of the stream identical.
+        assert_ne!(&out_off[..400], &out_off[400..], "output must not repeat");
+
+        // (b) The postfiltered signal differs from the plain synthesis but
+        // tracks its level (AGC) and is not zero.
+        let differing = out_on.iter().zip(&out_off).filter(|(a, b)| a != b).count();
+        assert!(
+            differing > 40,
+            "postfilter must alter the signal (differing samples = {differing})"
+        );
+        let sum_on: f64 = out_on[160..]
+            .iter()
+            .map(|v| (*v as f64) * (*v as f64))
+            .sum();
+        let sum_off: f64 = out_off[160..]
+            .iter()
+            .map(|v| (*v as f64) * (*v as f64))
+            .sum();
+        assert!(sum_on > 0.0 && sum_off > 0.0, "neither output may be zero");
+        let dev_db = 10.0 * (sum_on / sum_off).log10();
+        assert!(
+            dev_db.abs() < 6.0,
+            "AGC must keep the postfiltered level near plain synthesis ({dev_db:+.1} dB)"
+        );
     }
 
     #[test]

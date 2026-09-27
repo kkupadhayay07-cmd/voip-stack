@@ -37,28 +37,31 @@ fix scheduled) · **Won't fix** (with reason).
 | 2.6 | `sync_bindings` keys bindings as `sip:<user>` (never matches proxy lookups) | Confirmed | **Fixed** — scheme stripped, bare user key |
 | 2.7 | `sink.rs` rtp_tap: hardcoded +160 ts step, echo before PT filter, Contact = remote src, sink-call leak on missing BYE | Confirmed | Open |
 | 2.8 | TLS/WSS handshakes await forever while holding connection permits | Confirmed (no timeout before `stream_loop`) | Open |
-| 2.9 | G.729 decoder discards postfilter output / double-samples when postfilter off | Confirmed | Open (needs golden-vector care — bcg729 oracle must stay green) |
+| 2.9 | G.729 decoder discards postfilter output / double-samples when postfilter off | Confirmed | **Fixed** — exactly one output path per config (postfiltered synthesis when on, plain once when off); unbounded history leak fixed; regression test pins 80 samples/frame and postfilter presence; SNR/ffmpeg gates recalibrated to the now-correct output (bcg729 oracle test unchanged at ±5 dB) |
 | 2.10 | STUN ERROR-CODE 3-byte header; CHANNEL-NUMBER `0x0006` collides with USERNAME | Confirmed | **Fixed** — 4-byte `[0,0,class,number]` layout + `CHANNEL_NUMBER = 0x000C` (RFC 5389 §15.6, RFC 5766 §14.1); wire-layout test added |
-| 2.11 | IPv6 ICE candidate parse; unauthenticated TURN allocate flow self-deadlocks | Confirmed | Open |
-| 2.12 | SRTCP AES-GCM E=0 always fails; per-SSRC state allocated before auth | Confirmed | **Fixed** — E=0 passes the tag as the GCM "ciphertext" input; recv-stream state committed only after tag verification (both RTP and RTCP paths) |
+| 2.11 | IPv6 ICE candidate parse; unauthenticated TURN allocate flow self-deadlocks | Confirmed | **Fixed** — bracket-aware address parse for `c=`/`raddr` (RFC 8839 §5.1) with IPv6 regression tests; Allocate probe accepts immediate success (authenticate-only path) and re-Allocate answers the existing relay per RFC 5766 §6.2; MD5 long-term key + MESSAGE-INTEGRITY pinned by independent known vectors |
+| 2.12 | SRTCP AES-GCM E=0 always fails; per-SSRC state allocated before auth | Confirmed | **Fixed** — E=0 passes the tag as the GCM "ciphertext" input; recv-stream state committed only after tag verification (both RTP and RTCP paths). Deepened afterwards: AEAD profiles also accept unencrypted SRTCP (E=0, RFC 7714 §9.3) authenticate-only, both wire orders handled (RFC 3711 §3.4 tag-after-index vs RFC 7714 §9 tag-before-index), pinned by RFC 7714 §17.1/§17.3 official vectors incl. tamper |
 | 2.13 | RTP padding bit re-encoded without padding bytes; jitter buffer 32-bit ts wrap; `pop_ready` skips concealment for gaps | Confirmed | Open |
-| 2.14 | SBC topology hiding looks up `call_map` instead of `call_map_rev` on responses; proxy tx keys never match | Confirmed (SBC half verified; proxy half consistent with the code) | Open |
-| 2.15 | Dialer predictive pacing ignores `lines_ringing`; answered leads re-dialed; DNC skipped on queued leads | Confirmed | Open |
-| 2.16 | `Mixer::mix` includes inactive inputs and replays stale frames (50 Hz buzz) | Confirmed | Open |
-| 2.17 | `CdrStore::default()` capacity 0 panics on first insert; folded auth headers leak into pcap/trace | Confirmed | Open |
+| 2.14 | SBC topology hiding looks up `call_map` instead of `call_map_rev` on responses; proxy tx keys never match | Confirmed (SBC half verified; proxy half consistent with the code) | **Fixed** — SBC keeps an explicit reverse map (hidden → peer) populated on the request path and restores the peer's Call-ID on core responses; proxy funnels request/CANCEL/response keying through ONE `tx_key` builder (call-id + top-Via branch + method, RFC 3261 §17.1.3) and CANCEL matches against the upstream Via branch, not our own |
+| 2.15 | Dialer predictive pacing ignores `lines_ringing`; answered leads re-dialed; DNC skipped on queued leads | Confirmed | **Fixed** — LiveStats counts dialing+ringing+active, predictive paces on the deficit vs all in-flight calls; answered leads parked at answer time; DNC re-checked at every candidacy decision and permanently parks the lead |
+| 2.16 | `Mixer::mix` includes inactive inputs and replays stale frames (50 Hz buzz) | Confirmed | **Fixed** — VAD-inactive inputs skipped in accumulation and contributor scaling; inputs un-refreshed for 3 packet periods stop contributing (no stale replay, frame width preserved) |
+| 2.17 | `CdrStore::default()` capacity 0 panics on first insert; folded auth headers leak into pcap/trace | Confirmed | **Fixed** — hand-rolled default (1024) + panic-free insert for any capacity (0 retains nothing); obs-fold continuation lines of auth headers redacted in `redact_sip` so no credential reaches serialized events (scheme preserved: `Digest [REDACTED]`) |
 
 ## 3. Medium / Low (P2)
 
-All verified as plausible-to-real during triage; **open**, ordered by impact:
-`looks_like_rtcp` `%4` rejection breaks AES-CM SRTCP (rtp) · SDP `u=/e=/p=/k=/z=`
-extras serialize without their `typ=` prefix (sdp) · `answer_direction`
-SendOnly/SendOnly → RecvOnly, port-0 offers answered non-zero, telephone-event-only
-offers accepted (sdp) · `push_via` appends to the bottom of the Via stack
+All verified as plausible-to-real during triage; ordered by impact.
+**Fixed since triage** (with regression tests): SDP `u=/e=/p=/k=/z=` extras
+now serialize with their `typ=` prefix (sdp) · `answer_direction` validated
+as an explicit RFC 3264 §6.1 matrix clamped to the offer (sdp) · port-0
+offers answered port 0 and rejected m-lines keep their m-line with a null
+connection line of the offer's address type (sdp). **Still open**:
+`looks_like_rtcp` `%4` rejection breaks AES-CM SRTCP (rtp) · `push_via`
+appends to the bottom of the Via stack
 (sip-core) · non-2xx ACK copies all Via headers, omits Route (sip-tx) ·
 `ServerNonInviteTx` never Proceeding / matches foreign methods (sip-tx) ·
 registrar 423 `min_expires` unchecked, nonce table unbounded (registrar) ·
 Opus >20 ms decode buffers, G.722 `reset` keeps state, CN multi-byte payload
-(codecs) · `Endpoint::from_config` user@ stripping — **Fixed** in this commit ·
+(codecs) ·
 TLS client verify NONE despite `tls_ca_path` (zrtc) · CDR disposition hardcodes
 487=Failed (zrtc) · `--since ""` panic (zrtc) · pace_campaign hardcoded recent
 counters, gauge-vs-counter, call counters never incremented (api).
@@ -68,7 +71,10 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **401 passing** (396 + 5 new regression tests),
-`clippy -D warnings` clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
-The demo exercises the reworked core response path end to end
-(listener → SBC → proxy → registrar/b2bua → media → ai-bridge).
+`cargo test --workspace` → **446 passing** (401 at the first fix commit + 45
+regression/vector tests from the follow-up fix wave), `clippy -D warnings`
+clean, `cargo fmt --check` clean.
+
+Remaining open findings after the fix waves: **2.7** (sink.rs rtp_tap),
+**2.8** (TLS/WSS handshake timeout), **2.13** (RTP padding / jitter wrap /
+concealment skip) and the P2s listed above. No silent gaps.

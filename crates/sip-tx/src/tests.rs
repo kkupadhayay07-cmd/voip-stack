@@ -526,3 +526,122 @@ fn timer_config_derivations() {
     assert!(tx.on_event(TxEvent::Delivered, c.at(100)).is_empty());
     assert_eq!(tx.next_deadline(), Some(c.at(32_000)));
 }
+
+// 15. Audit 2.4 regression: Timer B is armed and fires on reliable
+//     transports too (§17.1.1.1/§17.1.1.2 apply B to every transport; only
+//     retransmissions are unreliable-transport-only). A live TCP/TLS/WS/WSS
+//     connection that never yields a response must time out at exactly
+//     64·T1 with the same terminal outcome as the UDP path.
+#[test]
+fn timer_b_fires_on_reliable_transport() {
+    let c = Clock::new();
+    for transport in [
+        Transport::Tcp,
+        Transport::Tls,
+        Transport::Ws,
+        Transport::Wss,
+    ] {
+        // UDP control: same send instant; the reliable outcome at Timer B
+        // must be identical to what the UDP path produces (test 12).
+        let mut udp_ctrl = ClientInviteTx::new(base_req(Method::Invite), Transport::Udp);
+        assert_send_request(&udp_ctrl.on_event(TxEvent::Send, c.at(0)), 1);
+
+        let mut tx = ClientInviteTx::new(base_req(Method::Invite), transport);
+        assert_send_request(&tx.on_event(TxEvent::Send, c.at(0)), 1);
+
+        // No retransmissions and no premature timeout before Timer B:
+        // Timer A must not exist on reliable transports.
+        for probe in [500u64, 1_000, 4_000, 16_000, 31_999] {
+            assert!(
+                tx.on_event(TxEvent::Timeout, c.at(probe)).is_empty(),
+                "{transport:?}: nothing may be due at {probe} ms"
+            );
+        }
+        assert_eq!(
+            tx.next_deadline(),
+            Some(c.at(32_000)),
+            "{transport:?}: Timer B due at exactly 64·T1"
+        );
+
+        let actions = tx.on_event(TxEvent::Timeout, c.at(32_000));
+        assert_eq!(
+            actions,
+            udp_ctrl.on_event(TxEvent::Timeout, c.at(32_000)),
+            "{transport:?}: same timeout outcome as the UDP path"
+        );
+        assert_eq!(actions, vec![TxAction::DeleteTransaction]);
+        assert_eq!(tx.state(), TxState::Terminated);
+        assert_eq!(udp_ctrl.state(), TxState::Terminated);
+        assert_eq!(tx.next_deadline(), None);
+    }
+
+    // Transport-level delivery confirmation must not disarm Timer B either.
+    let c2 = Clock::new();
+    let mut tx = ClientInviteTx::new(base_req(Method::Invite), Transport::Wss);
+    tx.on_event(TxEvent::Send, c2.at(0));
+    assert!(tx.on_event(TxEvent::Delivered, c2.at(50)).is_empty());
+    assert_eq!(tx.next_deadline(), Some(c2.at(32_000)));
+    assert_eq!(
+        tx.on_event(TxEvent::Timeout, c2.at(32_000)),
+        vec![TxAction::DeleteTransaction]
+    );
+    assert_eq!(tx.state(), TxState::Terminated);
+}
+
+// 16. Audit 2.4 regression: Timer F is armed and fires on reliable
+//     transports too (§17.1.2 applies F to every transport); only Timer E
+//     is unreliable-transport-only. Same terminal outcome as the UDP path
+//     at exactly 64·T1.
+#[test]
+fn timer_f_fires_on_reliable_transport() {
+    let c = Clock::new();
+    for transport in [
+        Transport::Tcp,
+        Transport::Tls,
+        Transport::Ws,
+        Transport::Wss,
+    ] {
+        let mut udp_ctrl = ClientNonInviteTx::new(base_req(Method::Options), Transport::Udp);
+        assert_send_request(&udp_ctrl.on_event(TxEvent::Send, c.at(0)), 1);
+
+        let mut tx = ClientNonInviteTx::new(base_req(Method::Options), transport);
+        assert_send_request(&tx.on_event(TxEvent::Send, c.at(0)), 1);
+
+        // No retransmissions and no premature timeout before Timer F.
+        for probe in [500u64, 1_000, 4_000, 16_000, 31_999] {
+            assert!(
+                tx.on_event(TxEvent::Timeout, c.at(probe)).is_empty(),
+                "{transport:?}: nothing may be due at {probe} ms"
+            );
+        }
+        assert_eq!(
+            tx.next_deadline(),
+            Some(c.at(32_000)),
+            "{transport:?}: Timer F due at exactly 64·T1"
+        );
+
+        let actions = tx.on_event(TxEvent::Timeout, c.at(32_000));
+        assert_eq!(
+            actions,
+            udp_ctrl.on_event(TxEvent::Timeout, c.at(32_000)),
+            "{transport:?}: same timeout outcome as the UDP path"
+        );
+        assert_eq!(actions, vec![TxAction::DeleteTransaction]);
+        assert_eq!(tx.state(), TxState::Terminated);
+        assert_eq!(udp_ctrl.state(), TxState::Terminated);
+        assert_eq!(tx.next_deadline(), None);
+    }
+
+    // Delivered stops Timer E (none armed on reliable anyway) but keeps
+    // Timer F: a confirmed TCP send still times out at 64·T1.
+    let c2 = Clock::new();
+    let mut tx = ClientNonInviteTx::new(base_req(Method::Options), Transport::Tcp);
+    tx.on_event(TxEvent::Send, c2.at(0));
+    assert!(tx.on_event(TxEvent::Delivered, c2.at(50)).is_empty());
+    assert_eq!(tx.next_deadline(), Some(c2.at(32_000)));
+    assert_eq!(
+        tx.on_event(TxEvent::Timeout, c2.at(32_000)),
+        vec![TxAction::DeleteTransaction]
+    );
+    assert_eq!(tx.state(), TxState::Terminated);
+}

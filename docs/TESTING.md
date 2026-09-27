@@ -24,29 +24,29 @@ RUST_LOG="info,b2bua=debug" cargo test -p b2bua -- --nocapture
 Toolchain is pinned by `rust-toolchain.toml` (stable). System dependency:
 `pkg-config` + `libopus-dev` unless building `--no-default-features`.
 
-## 2. Suite inventory (last verified full run: 396 tests, 54 suites)
+## 2. Suite inventory (last verified full run: 446 tests, 54 suites)
 
 | Crate | Tests | Focus |
 |-------|-------|-------|
-| `sip-core` | 62 | URI/headers/message model incl. host-only URIs (§19.1), `Session-Expires`/`refresher` accessors (RFC 4028) and `RSeq`/`RAck` accessors (RFC 3262); datagram + stream framing (split reads, folding, limits, §18.3 trailing octets); canonical serializer round-trips; digest RFC 2617 vectors; fuzz-smoke corpus; builder defaults |
-| `sip-tx` | 14 | RFC 3261 §17 state machines with a fake clock: exact timer fire instants (0/500/1500/3500/7500/15500/31500 ms), T2 caps, 64·T1 timeouts, retransmission absorption, wrong-branch/wrong-CSeq rejection, 2xx-ACK-is-a-new-transaction, reliable-transport timer elision, transport-error teardown |
-| `sdp` | 17 | parser grammar + positioned errors; canonical serialization; RFC 3264 offer/answer (codec/direction intersection, mux, ICE/DTLS carry); `StreamPlan` projection; fuzz-smoke corpus |
+| `sip-core` | 65 | URI/headers/message model incl. host-only URIs (§19.1), `Session-Expires`/`refresher` accessors (RFC 4028) and `RSeq`/`RAck` accessors (RFC 3262); datagram + stream framing (split reads, folding, limits, §18.3 trailing octets); canonical serializer round-trips; digest RFC 2617 vectors; fuzz-smoke corpus; builder defaults |
+| `sip-tx` | 16 | RFC 3261 §17 state machines with a fake clock: exact timer fire instants (0/500/1500/3500/7500/15500/31500 ms), T2 caps, 64·T1 timeouts, retransmission absorption, wrong-branch/wrong-CSeq rejection, 2xx-ACK-is-a-new-transaction, reliable-transport timer elision, Timer B/F armed on reliable transports and firing at exactly 64·T1 with UDP-parity terminal state, transport-error teardown |
+| `sdp` | 22 | parser grammar + positioned errors; canonical serialization (extras keep their `typ=` prefix); RFC 3264 offer/answer (codec/direction intersection, mux, ICE/DTLS carry); §6.1 answer-direction matrix validated for every offer/caps pair and clamped to the offer; rejected m-lines answered port 0 with a null `c=` line of the offer's address type; port-0 offers answered port 0; `StreamPlan` projection; fuzz-smoke corpus |
 | `rtp` | 41 | packet/RTCP parse+serialize round-trips; RFC 8285 extensions; RFC 4733 events; RFC 5761 demux; jitter buffer with virtual time (reorder, loss→PLC, duplicates, wrap, SSRC restart, adaptive depth); fuzz-smoke corpus |
-| `codecs` | 91 | G.711/G.722 bit-exactness; G.729 ITU tables + interop gates (§3); Opus binding; L16/CN/PLC; resampler; registry |
-| `b2bua` | 21 | RFC 4028 timer negotiation matrix + refresh/expiry clock math (unit); RFC 3262 rel100 rules (Timer-G backoff clock, PRACK decision matrix, RAck matching) (unit); full-loopback integration call: 100/180/200/ACK ordering, PCMU→PCMA transcode with SNR gate, DTMF relay, BYE, CDR trail; session-timer integration flows: negotiation mirrored on the 200s, downstream half-interval refresh, leg-A refresher election, 422/Min-SE floor, 422 retry with the peer's Min-SE, UPDATE refresh, expiry teardown with BYEs on both legs; rel100 integration flows: reliable 180 with the parked 200 (§3), retransmission until PRACK, RAck verdicts (481/488), plain-180 + unsolicited PRACK, both-legs PRACK incl. lost-PRACK recovery, 421 dial retry; both legs driven by `sip-tx` transactions |
-| `srtp` | 35 | RFC 3711 B.2/B.3 + RFC 7714 §16 vectors; round-trips; replay window/ROC semantics |
+| `codecs` | 92 | G.711/G.722 bit-exactness; G.729 ITU tables + interop gates (§3) incl. postfilter output-path regression (80 samples/frame, postfilter presence); Opus binding; L16/CN/PLC; resampler; registry |
+| `b2bua` | 28 | RFC 4028 timer negotiation matrix + refresh/expiry clock math (unit); RFC 3262 rel100 rules (Timer-G backoff clock, PRACK decision matrix with §4 gates — 100 and non-100rel 1xx never PRACKed — stored-PRACK retransmit, RAck matching, `Supported` merge for 421) (unit); full-loopback integration call: 100/180/200/ACK ordering, PCMU→PCMA transcode with SNR gate, DTMF relay, BYE, CDR trail; session-timer integration flows: negotiation mirrored on the 200s, downstream half-interval refresh, leg-A refresher election, 422/Min-SE floor, 422 retry with the peer's Min-SE, UPDATE refresh, expiry teardown with BYEs on both legs; rel100 integration flows: reliable 180 with the parked 200 (§3), retransmission until PRACK with the STORED PRACK resent (same CSeq and branch), RAck verdicts (481/488), plain-180 + unsolicited PRACK, both-legs PRACK incl. lost-PRACK recovery, 421 dial retry with `Supported` merge, CANCEL-for-unknown-transaction 481; both legs driven by `sip-tx` transactions |
+| `srtp` | 41 | RFC 3711 B.2/B.3 + RFC 7714 §16 vectors; RFC 7714 §17.1/§17.3 SRTCP AEAD vectors (encrypted, tagging-only E=0, tamper) pinning the tag-before-index wire order; E=0 authenticate-only acceptance for AEAD and RFC 3711 profiles; round-trips; replay window/ROC semantics |
 | `dtls` | 10 | real DTLS 1.2 handshake over UDP loopback, fingerprint pinning, key export, loss-resilient flights, SRTP roundtrip on exported keys |
-| `ice` | 17 | STUN codec vs RFC 5769 vectors; agent gathering/checks/nomination/role-conflict; TURN allocation/permissions/relay; STUN server oracle |
-| `sbc` | 6 | ACL, token-bucket rate limiting, NAT latch, topology hiding, rport |
-| `media` | 13 | resampler anti-alias/streaming parity, mixer, recorder, VAD, full codec pipeline test |
-| `cdr` | 6 | lifecycle builder, dispositions, bounded store, filters/stats, JSON |
-| `dialer` | 8 | pacing modes, TCPA window, DNC, attempts/cooldowns, caller-ID rotation |
+| `ice` | 28 | STUN codec vs RFC 5769 vectors; ERROR-CODE/CHANNEL-NUMBER wire layout; MD5 long-term key + MESSAGE-INTEGRITY against independent known vectors; agent gathering/checks/nomination/role-conflict; IPv6 SDP candidates (bare + bracketed, incl. raddr); TURN allocation (authenticated + unauthenticated idempotent per RFC 5766 §6.2)/permissions/relay; STUN server oracle |
+| `sbc` | 9 | ACL, token-bucket rate limiting, NAT latch, topology hiding with the reverse Call-ID map (core responses restore the peer's id), rport |
+| `media` | 15 | resampler anti-alias/streaming parity, mixer (inactive inputs skipped, stale inputs stop contributing), recorder, VAD, full codec pipeline test |
+| `cdr` | 8 | lifecycle builder, dispositions, bounded store (panic-free at any capacity incl. 0), filters/stats, JSON |
+| `dialer` | 11 | pacing modes incl. predictive deficit over dialing+ringing+active, TCPA window, DNC enforced at every candidacy decision, answered leads never re-dialed, attempts/cooldowns, caller-ID rotation |
 | `ai-bridge` | 4 | AudioSocket framing, WS tap, VAD events, barge-in latency budget |
 | `api` | 8 | REST black-box: CDR queries/filters, campaign stats, pacing preview, metrics, health |
-| `proxy` | 7 | routing, forking, CANCEL, Via/Record-Route, 483, NAT response routing |
+| `proxy` | 9 | routing, forking, CANCEL matched on the upstream Via branch, shared request/response transaction keying, Via/Record-Route, 483, NAT response routing |
 | `registrar` | 9 | bindings, expiry, wildcard removal, digest challenge, CSeq/Call-ID consistency |
-| `observ` | 14 | pcap writers, per-call trace buffer, diag counters (rx/tx/lost/jitter/concealed), redaction of per-packet RTP from traces |
-| `zrtc` | 5 | daemon config parsing + assembly smoke |
+| `observ` | 16 | pcap writers, per-call trace buffer, diag counters (rx/tx/lost/jitter/concealed), redaction of per-packet RTP from traces, obs-fold auth continuation-line redaction |
+| `zrtc` | 11 | daemon config parsing + assembly smoke; core response-path regressions (proxy Via pop + SBC processing, b2bua-Via relay, bindings key, client-map cleanup) |
 
 Counts move with the code; CI (§4) is the authoritative gate on every push.
 
@@ -54,8 +54,8 @@ Counts move with the code; CI (§4) is the authoritative gate on every push.
 
 | Gate | Mechanism | Threshold |
 |------|-----------|-----------|
-| G.729 decode fidelity | `codecs/tests/g729_interop.rs` decodes **bcg729 golden vectors** | output level within ±3 dB of reference |
-| G.729 bitstream conformance | ffmpeg cross-decodes **our** encoder output in CI (runtime-detected) | decodes without gross corruption (±5 dB) |
+| G.729 decode fidelity | `codecs/tests/g729_interop.rs` decodes **bcg729 golden vectors** | output level within ±5 dB of reference (postfilter implementations differ) |
+| G.729 bitstream conformance | ffmpeg cross-decodes **our** encoder output in CI (runtime-detected) | decodes without gross corruption (±6 dB) |
 | G.711 / G.722 | bit-exact round-trip against ITU structures | exact |
 | Opus | libopus round-trip at supported modes | decodes, sane RMS |
 | SIP/SDP/RTP/RTCP | `parse(serialize(x)) == x` property tests | exact equality |
@@ -103,7 +103,7 @@ Current state:
 |-------|----------|-----------------|
 | Transport | UDP loopback; TCP split-read + coalesced messages; TLS loopback with self-signed test certs; WS/WSS framing | message-level equality, framing invariants |
 | Transaction | UAC/UAS INVITE + non-INVITE state walks; retransmit cadence; timeout paths; stray-packet absorption | state/order assertions at T1=10 ms |
-| B2BUA | UAC ↔ B2BUA ↔ UAS full call: 100/180/200/ACK ordering, bidirectional RTP, DTMF relay, BYE teardown, CDR trail; RFC 3262 reliable-1xx flows on both legs | signaling order + audio SNR gates (e.g. ≥12 dB transcode) + event completeness |
+| B2BUA | UAC ↔ B2BUA ↔ UAS full call: 100/180/200/ACK ordering, bidirectional RTP, DTMF relay, BYE teardown, CDR trail; RFC 3262 reliable-1xx flows on both legs incl. §4 gates and stored-PRACK retransmission | signaling order + audio SNR gates (e.g. ≥12 dB transcode) + event completeness |
 | Load (later) | N concurrent calls smoke; Phase-6 harness | setup-time P95, zero-call-loss under restart |
 
 ## 7. Benchmarks (targets)

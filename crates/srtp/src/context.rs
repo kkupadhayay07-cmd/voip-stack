@@ -720,8 +720,13 @@ impl SrtpSession {
     // -- RTCP ---------------------------------------------------------------
 
     /// Protect an RTCP compound packet in place (RFC 3711 §3.4 /
-    /// RFC 7714 §9): everything after the first 8-byte header is encrypted,
-    /// the E|index word and tag are appended.
+    /// RFC 7714 §9): everything after the first 8-byte header is encrypted.
+    ///
+    /// Wire forms: AES-CM appends the `E|index` word and then the HMAC tag
+    /// (RFC 3711 §3.4); AEAD appends `ciphertext || tag || E|index` with the
+    /// GCM tag immediately before the index word (RFC 7714 §9.2).  The E flag
+    /// is always sent as 1; [`SrtpSession::unprotect_rtcp`] also accepts E=0
+    /// packets from peers.
     ///
     /// Returns the SRTCP index used.
     pub fn protect_rtcp(&mut self, packet: &mut Vec<u8>) -> Result<u32, SrtpError> {
@@ -764,17 +769,24 @@ impl SrtpSession {
                 aad.extend_from_slice(&header);
                 aad.extend_from_slice(&flag);
                 let body = packet[8..].to_vec();
+                // `seal` returns ciphertext || tag; RFC 7714 §9.2 places the
+                // tag immediately before the E-flag|index word.
                 let ct = gcm.seal(&iv, &aad, &body)?;
                 packet.truncate(8);
-                packet.extend_from_slice(&ct[..body.len()]);
+                packet.extend_from_slice(&ct);
                 packet.extend_from_slice(&flag);
-                packet.extend_from_slice(&ct[body.len()..]);
             }
         }
         Ok(index)
     }
 
     /// Unprotect a received SRTCP compound packet in place.
+    ///
+    /// Accepts both profile wire orders: AES-CM keeps the RFC 3711 §3.4
+    /// layout (`E|index` word then HMAC tag); AEAD profiles use the
+    /// RFC 7714 §9 layout (GCM tag immediately before the `E|index` word) and
+    /// also accept unencrypted packets (E=0, RFC 7714 §9.3), which are
+    /// verified authenticate-only and returned without the tag/index trailer.
     ///
     /// Returns the SRTCP index.
     pub fn unprotect_rtcp(&mut self, packet: &mut Vec<u8>) -> Result<u32, SrtpError> {
@@ -784,8 +796,13 @@ impl SrtpSession {
         }
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
 
-        let tag_off = packet.len() - tag_len;
-        let flag_off = tag_off - 4;
+        // The E-flag|index word sits at a profile-dependent offset: the HMAC
+        // tag follows it (RFC 3711 §3.4), the GCM tag precedes it
+        // (RFC 7714 §9).
+        let flag_off = match self.profile {
+            Profile::AesCm128Sha1_80 | Profile::AesCm128Sha1_32 => packet.len() - tag_len - 4,
+            _ => packet.len() - 4,
+        };
         let flag = u32::from_be_bytes([
             packet[flag_off],
             packet[flag_off + 1],
@@ -807,6 +824,8 @@ impl SrtpSession {
 
         match self.profile {
             Profile::AesCm128Sha1_80 | Profile::AesCm128Sha1_32 => {
+                let tag_off = packet.len() - tag_len;
+                let flag_off = tag_off - 4;
                 let expected = hmac_sha1(&self.rtcp.auth, &[&packet[..tag_off]]);
                 if !ct_eq(&packet[tag_off..], &expected[..tag_len]) {
                     return Err(SrtpError::AuthFailed);
@@ -825,22 +844,29 @@ impl SrtpSession {
                     .as_ref()
                     .ok_or_else(|| SrtpError::Crypto("no GCM context".into()))?;
                 let iv = gcm_rtcp_iv(&self.rtcp.salt, ssrc, index);
+                let flag_off = packet.len() - 4;
+                let tag_start = flag_off - tag_len;
                 let mut aad = Vec::with_capacity(12);
                 aad.extend_from_slice(&packet[..8]);
-                aad.extend_from_slice(&flag.to_be_bytes());
                 if encrypted {
-                    // ciphertext and tag are separated by the E|index word
-                    let mut ct_tag = packet[8..flag_off].to_vec();
-                    ct_tag.extend_from_slice(&packet[tag_off..]);
+                    // RFC 7714 §9.2: AAD = header || E-flag|index; the
+                    // ciphertext and GCM tag are contiguous before it.
+                    aad.extend_from_slice(&packet[flag_off..]);
+                    let ct_tag = packet[8..flag_off].to_vec();
                     let pt = gcm.open(&iv, &aad, &ct_tag)?;
                     packet.truncate(8);
                     packet.extend_from_slice(&pt);
                 } else {
-                    // E=0: the whole packet is authenticated as AAD and the
-                    // GCM tag sits alone at the end (RFC 7714 §9.3) — pass
-                    // it as the tag-only "ciphertext" so open() verifies it.
-                    aad.extend_from_slice(&packet[8..flag_off]);
-                    gcm.open(&iv, &aad, &packet[tag_off..])?;
+                    // RFC 7714 §9.3 (E=0): authenticate-only.  The plaintext
+                    // is empty; the whole packet (header || body ||
+                    // E-flag|index) is AAD and only the GCM tag is checked.
+                    aad.extend_from_slice(&packet[8..tag_start]);
+                    aad.extend_from_slice(&packet[flag_off..]);
+                    let tag = packet[tag_start..flag_off].to_vec();
+                    gcm.open(&iv, &aad, &tag)?;
+                    // Strip the tag and the index word, leaving the plain
+                    // RTCP compound packet.
+                    packet.truncate(tag_start);
                 }
             }
         }
@@ -919,5 +945,146 @@ mod tests {
         let salt = hex::decode("517569642070726f2071756f").unwrap();
         let iv = gcm_rtp_iv(&salt, 0x5501a0b2, 0, 0xf17b);
         assert_eq!(hex::encode(iv), "51753c6580c2726f20718414");
+    }
+
+    /// Minimal RTCP compound packet (first 8 bytes carry version + SSRC).
+    fn rtcp_packet(ssrc: u32) -> Vec<u8> {
+        let mut p = vec![0x80, 200, 0, 1];
+        p.extend_from_slice(&ssrc.to_be_bytes());
+        p.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        p
+    }
+
+    /// Bug 2.11(i): unencrypted SRTCP (E=0) must be accepted under AEAD
+    /// profiles: authenticate-only verification per RFC 7714 §9.3, and the
+    /// unprotected buffer must come back as the plain RTCP packet.
+    #[test]
+    fn srtcp_gcm_e0_auth_only_roundtrip() {
+        for profile in [Profile::AeadAes128Gcm, Profile::AeadAes128Gcm12] {
+            let mut s = SrtpSession::new(
+                profile,
+                &vec![0x11u8; profile.key_len()],
+                &vec![0x22u8; profile.salt_len()],
+            )
+            .unwrap();
+            let original = rtcp_packet(0x1234_5678);
+            let index = 7u32;
+
+            // Hand-build the E=0 wire form (RFC 7714 §9.3): header || body ||
+            // GCM tag || 0|index, with the whole packet as AAD.
+            let mut wire = original.clone();
+            let mut aad = original.clone();
+            aad.extend_from_slice(&index.to_be_bytes());
+            let tag = s
+                .rtcp
+                .gcm
+                .as_ref()
+                .unwrap()
+                .seal(&gcm_rtcp_iv(&s.rtcp.salt, 0x1234_5678, index), &aad, &[])
+                .unwrap();
+            wire.extend_from_slice(&tag);
+            wire.extend_from_slice(&index.to_be_bytes());
+
+            assert_eq!(s.unprotect_rtcp(&mut wire).unwrap(), index);
+            assert_eq!(
+                wire, original,
+                "{profile:?}: E=0 packet must come back as the plain RTCP packet"
+            );
+
+            // Tampering with any authenticated byte must be rejected (fresh
+            // index so the replay window does not reject it first).
+            let mut wire = original.clone();
+            wire[9] ^= 0x40;
+            let tampered_index = 8u32;
+            let mut aad = wire.clone();
+            aad.extend_from_slice(&tampered_index.to_be_bytes());
+            let tag = s
+                .rtcp
+                .gcm
+                .as_ref()
+                .unwrap()
+                .seal(
+                    &gcm_rtcp_iv(&s.rtcp.salt, 0x1234_5678, tampered_index),
+                    &aad,
+                    &[],
+                )
+                .unwrap();
+            wire.extend_from_slice(&tag);
+            wire.extend_from_slice(&tampered_index.to_be_bytes());
+            wire[9] ^= 0x40; // corrupt a body byte after tagging
+            assert_eq!(s.unprotect_rtcp(&mut wire), Err(SrtpError::AuthFailed));
+        }
+    }
+
+    /// E=0 is also legal for the RFC 3711 profiles (§3.4) and was already
+    /// supported — pin the authenticate-only path.
+    #[test]
+    fn srtcp_aes_cm_e0_auth_only_roundtrip() {
+        let mut s =
+            SrtpSession::new(Profile::AesCm128Sha1_80, &[0x33u8; 16], &[0x44u8; 14]).unwrap();
+        let original = rtcp_packet(0xAAAABBBB);
+        let index = 3u32;
+
+        // RFC 3711 §3.4 E=0 wire form: header || body || 0|index || tag.
+        let mut wire = original.clone();
+        wire.extend_from_slice(&index.to_be_bytes());
+        let tag = hmac_sha1(&s.rtcp.auth, &[&wire]);
+        wire.extend_from_slice(&tag[..Profile::AesCm128Sha1_80.tag_len()]);
+
+        assert_eq!(s.unprotect_rtcp(&mut wire).unwrap(), index);
+        assert_eq!(wire, original);
+    }
+
+    /// Bug 2.11(ii): receive state (replay window) must only be allocated
+    /// for SSRCs whose packets authenticate — forged packets with unseen
+    /// SSRCs must not grow the receive maps, and forgeries against an
+    /// established SSRC must not poison its replay window.
+    #[test]
+    fn forged_packets_do_not_allocate_recv_state() {
+        for profile in [Profile::AesCm128Sha1_80, Profile::AeadAes128Gcm] {
+            let key = vec![0x55u8; profile.key_len()];
+            let salt = vec![0x66u8; profile.salt_len()];
+            let mut tx = SrtpSession::new(profile, &key, &salt).unwrap();
+            let mut rx = SrtpSession::new(profile, &key, &salt).unwrap();
+
+            // SRTP: forged packet with an unseen SSRC and a garbage tag.
+            let mut p = rtp_packet(1, 0x9999_0001, b"x");
+            p.extend_from_slice(&[0u8; 16]);
+            assert_eq!(rx.unprotect(&mut p), Err(SrtpError::AuthFailed));
+            assert!(
+                rx.recv.is_empty(),
+                "{profile:?}: forged SRTP allocated receive state"
+            );
+
+            // SRTCP: forged packet with an unseen SSRC and a garbage tag.
+            let mut c = rtcp_packet(0x9999_0002);
+            c.extend_from_slice(&0x8000_0001u32.to_be_bytes());
+            c.extend_from_slice(&[0u8; 16]);
+            assert_eq!(rx.unprotect_rtcp(&mut c), Err(SrtpError::AuthFailed));
+            assert!(
+                rx.recv_rtcp.is_empty(),
+                "{profile:?}: forged SRTCP allocated receive state"
+            );
+
+            // Authenticated packets DO allocate per-SSRC state.
+            let mut good = rtp_packet(1, 0x9999_0003, b"x");
+            tx.protect(&mut good).unwrap();
+            rx.unprotect(&mut good).unwrap();
+            assert!(rx.recv.contains_key(&0x9999_0003));
+
+            let mut good_c = rtcp_packet(0x9999_0003);
+            tx.protect_rtcp(&mut good_c).unwrap();
+            rx.unprotect_rtcp(&mut good_c).unwrap();
+            assert!(rx.recv_rtcp.contains_key(&0x9999_0003));
+
+            // A forgery on an ESTABLISHED SSRC must not consume the packet
+            // index it claimed: the real packet still verifies afterwards.
+            let mut forged = rtp_packet(2, 0x9999_0003, b"x");
+            forged.extend_from_slice(&[0u8; 16]);
+            assert_eq!(rx.unprotect(&mut forged), Err(SrtpError::AuthFailed));
+            let mut real = rtp_packet(2, 0x9999_0003, b"x");
+            tx.protect(&mut real).unwrap();
+            rx.unprotect(&mut real).unwrap();
+        }
     }
 }
