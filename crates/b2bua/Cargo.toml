@@ -3,7 +3,7 @@ name = "b2bua"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "B2BUA call engine: dual-leg SIP calls with transcoding media bridge"
+description = "B2BUA call engine: dual-leg SIP calls driven by RFC 3261 section 17 transactions (sip-tx), transcoding media bridge, DTMF relay"
 
 [[bin]]
 name = "b2bua-demo"

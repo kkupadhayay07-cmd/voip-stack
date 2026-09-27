@@ -3,7 +3,7 @@ name = "cdr"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Call Detail Records: lifecycle events, durable store with query API, retention policy, RFC-compliant fields"
+description = "Call Detail Records: lifecycle events, bounded store with filtered query API, JSON export, pump-consistent quality metrics (packets_lost, concealed_events)"
 
 [dependencies]
 observ = { workspace = true }

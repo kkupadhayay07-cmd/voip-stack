@@ -1,13 +1,14 @@
 //! # b2bua — back-to-back user agent
 //!
-//! Dual-leg call engine on top of `sip-core` (message layer), `sdp`
-//! (offer/answer), `rtp` (adaptive jitter buffer, RTCP demux, RFC 4733) and
-//! `codecs` (full codec suite). Every call gets two independent legs with
-//! their own SDP negotiation; media flows through a linear-PCM bridge
-//! (16 kHz mono intermediate) with per-leg decode → resample → encode, so
-//! **any codec pair** from the registry can be bridged (e.g. WebRTC-style
-//! Opus ↔ PSTN G.711/G.729). RFC 4733 DTMF events are relayed payload-level
-//! without transcoding.
+//! Dual-leg call engine on top of `sip-core` (message layer), `sip-tx`
+//! (RFC 3261 §17 transaction state machines), `sdp` (offer/answer), `rtp`
+//! (adaptive jitter buffer, RTCP demux, RFC 4733) and `codecs` (full codec
+//! suite). Every call gets two independent legs with their own SDP
+//! negotiation; media flows through a linear-PCM bridge (16 kHz mono
+//! intermediate) with per-leg decode → resample → encode, so **any codec
+//! pair** from the registry can be bridged (e.g. WebRTC-style Opus ↔ PSTN
+//! G.711/G.729). RFC 4733 DTMF events are relayed payload-level without
+//! transcoding.
 //!
 //! Architecture (no shared locks; single-owner engine loop):
 //!
@@ -21,9 +22,13 @@
 //!       (JB → decode → 16k → encode) (JB → decode → 16k → encode)
 //! ```
 //!
-//! * UAS leg: INVITE → 100/180/200(answer) with SDP answer built by
-//!   `sdp::negotiate::answer_session`; 200 retransmission on INVITE retry.
-//! * UAC leg: INVITE with generated offer, Timer A/B retransmission, ACK on 2xx.
+//! * UAS leg (A): a `sip-tx` `ServerInviteTx` drives INVITE →
+//!   100/180/200(answer) with SDP answer built by
+//!   `sdp::negotiate::answer_session`; retransmitted INVITEs after the 200
+//!   get the cached response (§17.2.1 Completed state).
+//! * UAC leg (B): a `sip-tx` `ClientInviteTx` sends the generated offer at
+//!   t=0 (no dial delay); the state machine owns Timer A/B retransmission
+//!   and 2xx/non-2xx ACK rules (§17.1.1).
 //! * Media: one pump task per leg owning its jitter buffer, decoder and
 //!   encoder; paced TX by encoder frame duration; latches the remote media
 //!   address from the first valid RTP datagram if SDP routing fails (NAT).
