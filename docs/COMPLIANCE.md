@@ -4,7 +4,8 @@ Status of the ZRTC VoIP stack against the RFCs and ITU codecs it targets.
 **Honest by design** — no row is marked Done without implementation and tests
 behind it. Last reviewed: 2026-09 (all six phases implemented plus the
 hardening series: `sip-tx` transaction layer, in-process observability,
-trunk auth, `zrtc` daemon transports; 359 tests green across 52 suites).
+trunk auth, `zrtc` daemon transports, the TCP/TLS/WSS framing audit, RFC 4028
+session timers on both B2BUA legs; 385 tests green across 53 suites).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
@@ -24,6 +25,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC 3326 | Reason header | **Partial** | Header type modelled; no protocol semantics applied yet. |
 | RFC 3515 | REFER | **Planned** | `Refer-To` header type modelled; call flows not implemented. |
 | RFC 3581 | rport / Symmetric RTP | **Done** | SBC marks `rport` on requests and routes responses via received/rport; NAT latch table maps contact → source. |
+| RFC 4028 | Session timers | **Done** | B2BUA, both legs: `Min-SE`/422 floor on inbound INVITEs, `Session-Expires`+`refresher` negotiation mirrored end-to-end on the 200s, half-interval refresh re-INVITEs (no-change offer), in-dialog UPDATE refresh, expiry teardown with BYEs on both legs, 422-retry with the peer's `Min-SE`, tag-checked in-dialog re-INVITE/UPDATE routing (481/491/488). |
 | RFC 4566 | SDP | **Done** | `sdp` crate: strict positioned-error parser + canonical serializer. |
 | RFC 8866 | SDP v2 | **Partial** | Parser/model cover `rtpmap`/`fmtp`, `ice-*`, `fingerprint`, `bundle`, `extmap`; full 8866 grammar validation not complete. |
 | RFC 2617/7616 | Digest auth | **Done** (server side) | `sip-core` helpers + registrar nonce store; `respond_to_challenge` used in tests/clients. |
@@ -86,12 +88,12 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 * **Failover (RFC 3263)**: DNS-based next-server selection on timeout/
   transport failure is not implemented; the transaction layer (sip-tx)
   reports timeouts so callers can fail over.
-* **Standalone dialog layer (§12)**: the B2BUA tracks per-leg dialog state;
-  a reusable dialog package has not been extracted yet.
-* **TCP/TLS/WSS framing audit**: listeners are wired and demo-probed; a
-  systematic adverse-input framing audit (split/coalesced/flooded streams)
-  against the service binary is the current hardening item.
-* **Session timers (RFC 4028)**: not implemented.
+* **Standalone dialog layer (§12)**: the B2BUA tracks per-leg dialog state
+  (tags/Call-ID/CSeq, in-dialog re-INVITE/UPDATE with tag checks); a
+  reusable dialog package has not been extracted yet.
+* **In-dialog SDP renegotiation**: re-INVITEs that would change the session
+  (hold, codec change) are answered 488 instead of renegotiating; only
+  no-change refreshes are accepted.
 * **Postgres CDR persistence**: CDRs are in-memory (bounded) + JSON; sqlx
   storage backend planned.
 * **Load verification**: the 8-core/1000-call target is an architecture goal;
@@ -102,10 +104,12 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **359 passing across 52 suites**.
+  `cargo test --workspace` → **385 passing across 53 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16),
   STUN (RFC 5769 §2.1/§2.2), G.729 (bcg729 oracle), cross-decode by ffmpeg.
-* End-to-end in-repo: B2BUA loopback call, DTLS-SRTP handshake → SRTP media,
-  ICE agent pair checks, TURN relay round-trip, REST API black-box tests.
+* End-to-end in-repo: B2BUA loopback call, RFC 4028 session-timer flows
+  (negotiation, refresh, 422 floor/retry, UPDATE, expiry BYEs), DTLS-SRTP
+  handshake → SRTP media, ICE agent pair checks, TURN relay round-trip, REST
+  API black-box tests.
 * `cargo audit`: 0 vulnerabilities (1 allowed unmaintained notice on the
   whitelisted libopus FFI wrapper).

@@ -185,19 +185,16 @@ configured bounds. Guidance:
 
 ## 9. Roadmap
 
-1. **Transport hardening** — systematic TCP/TLS/WSS framing audit under
-   adverse input (split/coalesced/flooded streams) against the daemon.
-2. **Session timers** (RFC 4028) on both B2BUA legs.
-3. **Dialog layer extraction** (§12) from the B2BUA's per-leg state;
+1. **Dialog layer extraction** (§12) from the B2BUA's per-leg state;
    `sip-tx` adoption in the proxy.
-4. **Load harness** — 1000-concurrent-call soak with per-leg SRTP +
+2. **Load harness** — 1000-concurrent-call soak with per-leg SRTP +
    transcoding on 8-core hardware; publish numbers here.
-5. **Postgres CDR backend** (sqlx) + retention/archival policies.
-6. **WebRTC hardening** — RTX/NACK resend path, TWCC-driven bandwidth
+3. **Postgres CDR backend** (sqlx) + retention/archival policies.
+4. **WebRTC hardening** — RTX/NACK resend path, TWCC-driven bandwidth
    estimation, data channels (SCTP).
-7. **Container entrypoint** — wire `zrtc` as the image entrypoint with a
+5. **Container entrypoint** — wire `zrtc` as the image entrypoint with a
    mounted config + real healthcheck.
-8. **PRACK/100rel, GRUU/Outbound, NAPTR/SRV** for carrier-grade signaling.
+6. **PRACK/100rel, GRUU/Outbound, NAPTR/SRV** for carrier-grade signaling.
 
 See `docs/DESIGN.md` for the full architecture contract and
 `docs/COMPLIANCE.md` for the per-RFC status matrix.

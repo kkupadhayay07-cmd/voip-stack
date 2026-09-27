@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 359 tests passing across 52 suites in 19 crates;
+**Current state: 385 tests passing across 53 suites in 19 crates;
 `clippy -D warnings` clean; `cargo audit` clean.**
 
 ## Workspace layout
@@ -46,7 +46,7 @@ observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 359 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 385 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -94,18 +94,17 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
 * **Phase 6** — REST/WS control plane + Prometheus metrics + `zrtc` daemon. ✅
 * **Hardening** — RFC 3261 §17 transaction layer (`sip-tx`), in-process
   observability (pcap/traces/diag/CDR), trunk auth (IP/Digest/Bearer/mTLS),
-  UDP/TCP/TLS/WSS listeners. ✅
+  UDP/TCP/TLS/WSS listeners, TCP/TLS/WSS framing audit under adverse input,
+  RFC 4028 session timers on both B2BUA legs. ✅
 
 ## Roadmap (next)
 
-1. TCP/TLS/WSS framing audit under adverse input (Batch A hardening).
-2. Session timers (RFC 4028) on both B2BUA legs.
-3. Dialog layer extraction (§12) from the B2BUA's per-leg state.
-4. Load harness — 1000-concurrent-call soak on 8-core hardware.
-5. Postgres CDR persistence (sqlx) + retention policies.
-6. WebRTC hardening — RTX/NACK resend path, TWCC-driven bandwidth estimation,
+1. Dialog layer extraction (§12) from the B2BUA's per-leg state.
+2. Load harness — 1000-concurrent-call soak on 8-core hardware.
+3. Postgres CDR persistence (sqlx) + retention policies.
+4. WebRTC hardening — RTX/NACK resend path, TWCC-driven bandwidth estimation,
    data channels (SCTP).
-7. PRACK/100rel, GRUU/Outbound, NAPTR/SRV for carrier-grade signaling.
+5. PRACK/100rel, GRUU/Outbound, NAPTR/SRV for carrier-grade signaling.
 
 ## Documentation
 

@@ -143,9 +143,14 @@ addendum records what landed since, so the document stays honest.
 | `9d4e4a8` | CDR consistency — `plc_events`→`concealed_events`, filled from the same pump totals the diag reports (diag and CDR now always agree) |
 | `c0f310a` | clippy 1.98 `-D warnings` hygiene across observ/zrtc |
 | `3d87fb8` | `sip-tx` crate — RFC 3261 §17 client/server INVITE + non-INVITE state machines (Timers A/B/D, E/F/K, G/H/I, J, §17.1.3/§17.2.3 matching), pure + fake-clock tested; B2BUA legs now driven by real transactions (leg-B INVITE on the wire at t=0, retransmissions absorbed, non-2xx finals ACKed) |
+| `abfe43d` | TCP/TLS/WSS framing audit (Batch A Task 2) — §7.5 leading-CRLF keepalives, byte-exact header/body boundary under UTF-8 splits, Content-Length caps, framing-error connection close (§18.3), idle timeouts, bounded connections/backlogs, WSS frame peeling; 16 new parser + socket tests |
+| `4534503` | `docs/VISION.md` — the platform vision reference (north star for every task) |
+| `v0.4.0-sip-tx` | Tag closing the sip-tx + framing arc |
+| SipUri host-only | `sip:atlanta.com` (no userinfo) parsed correctly — the split-on-`@` bug rejected RFC 3261 §19.1-valid URIs (found during the framing audit, blocked real-world REGISTERs); last-`@` boundary for unescaped user parts |
+| RFC 4028 | Session timers on both B2BUA legs — `Min-SE`/422 floor, `Session-Expires`+`refresher` negotiation mirrored end-to-end, half-interval no-change refresh re-INVITEs, UPDATE refresh, expiry teardown with BYEs on both legs, 422-retry with the peer's `Min-SE`; in-dialog re-INVITE/UPDATE routing with tag checks (481/491/488) — previously a post-2xx re-INVITE was silently ignored |
 
-**Current baseline (supersedes the header numbers):** 19 crates, **359 tests
-across 52 suites**, `clippy -D warnings` clean, `cargo audit` clean.
+**Current baseline (supersedes the header numbers):** 19 crates, **385 tests
+across 53 suites**, `clippy -D warnings` clean, `cargo audit` clean.
 
 **§6 next-steps status:** item 1 (transaction layer) ✅ done as `sip-tx`;
 item 2 (service assembly binary) ✅ done as `zrtc`. Remaining: load harness,
