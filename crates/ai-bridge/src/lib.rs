@@ -166,19 +166,34 @@ impl AiSession {
             self.was_speaking = true;
             let _ = self.event_tx.send(AiEvent::SpeechStart);
             // ai hook: VAD speech start
-            observ::session::emit_for(&self.uuid, observ::EventKind::Vad { state: "speech_start".into() });
+            observ::session::emit_for(
+                &self.uuid,
+                observ::EventKind::Vad {
+                    state: "speech_start".into(),
+                },
+            );
             // Barge-in: caller speaks while agent audio plays.
             if *self.playing.lock().await {
                 let _ = self.event_tx.send(AiEvent::BargeIn);
                 // ai hook: barge-in
-                observ::session::emit_for(&self.uuid, observ::EventKind::Vad { state: "barge_in".into() });
+                observ::session::emit_for(
+                    &self.uuid,
+                    observ::EventKind::Vad {
+                        state: "barge_in".into(),
+                    },
+                );
                 *self.playing.lock().await = false;
             }
         } else if !active && self.was_speaking {
             self.was_speaking = false;
             let _ = self.event_tx.send(AiEvent::SpeechEnd);
             // ai hook: VAD speech end
-            observ::session::emit_for(&self.uuid, observ::EventKind::Vad { state: "speech_end".into() });
+            observ::session::emit_for(
+                &self.uuid,
+                observ::EventKind::Vad {
+                    state: "speech_end".into(),
+                },
+            );
         }
         let _ = self.event_tx.send(AiEvent::CallerAudio {
             samples: samples.to_vec(),
@@ -190,7 +205,13 @@ impl AiSession {
     pub async fn agent_audio(&mut self, samples: &[i16]) {
         if !*self.playing.lock().await {
             // ai hook: TTS playback start
-            observ::session::emit_for(&self.uuid, observ::EventKind::Tts { state: "start".into(), bytes: samples.len() * 2 });
+            observ::session::emit_for(
+                &self.uuid,
+                observ::EventKind::Tts {
+                    state: "start".into(),
+                    bytes: samples.len() * 2,
+                },
+            );
         }
         *self.playing.lock().await = true;
         let _ = samples;

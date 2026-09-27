@@ -188,7 +188,10 @@ mod tests {
     #[test]
     fn negotiate_uas_matrix() {
         // No session timer requested → off.
-        assert_eq!(negotiate_uas(&invite(None, None), 90, 1800), UasNegotiation::Off);
+        assert_eq!(
+            negotiate_uas(&invite(None, None), 90, 1800),
+            UasNegotiation::Off
+        );
         // Plain engage, default refresher (UAC) → we (UAS) are the refreshee.
         assert_eq!(
             negotiate_uas(&invite(Some("600"), None), 90, 1800),

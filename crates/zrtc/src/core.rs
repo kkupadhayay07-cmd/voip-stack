@@ -252,7 +252,12 @@ impl Core {
                 match via.transport {
                     sip_core::uri::TransportKind::Udp => {}
                     _ => {
-                        let tx = self.registry.lock().expect("registry lock").get(&dst).cloned();
+                        let tx = self
+                            .registry
+                            .lock()
+                            .expect("registry lock")
+                            .get(&dst)
+                            .cloned();
                         match tx {
                             Some(tx) => {
                                 if let Err(e) = tx.try_send(bytes) {

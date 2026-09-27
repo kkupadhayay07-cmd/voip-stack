@@ -121,9 +121,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
 fn load_config(rest: &[String]) -> Result<Config, String> {
     let path = flag_value(rest, "--config")
         .or_else(|| std::env::var("ZRTC_CONFIG").ok())
-        .ok_or_else(|| {
-            "no config: pass --config <path> or set $ZRTC_CONFIG".to_string()
-        })?;
+        .ok_or_else(|| "no config: pass --config <path> or set $ZRTC_CONFIG".to_string())?;
     Config::load(std::path::Path::new(&path)).map_err(|e| format!("{e} (from {path})"))
 }
 
@@ -136,12 +134,11 @@ fn init_tracing(level: &str, observ_level: Option<&str>) {
     let obs = observ_level.unwrap_or("info");
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| {
-                    tracing_subscriber::EnvFilter::new(format!(
-                        "{level},observ={obs},hyper=warn,h2=warn,rustls=warn"
-                    ))
-                }),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(format!(
+                    "{level},observ={obs},hyper=warn,h2=warn,rustls=warn"
+                ))
+            }),
         )
         .try_init();
 }
@@ -174,9 +171,13 @@ fn parse_uac(args: &[String]) -> Result<UacOpts, String> {
     if let Some(id) = flag_value(args, "--call-id") {
         opts.call_id = id;
     }
-    opts.rtp_ms = flag_or(args, "--rtp-ms", "1000").parse().map_err(|_| "bad --rtp-ms")?;
+    opts.rtp_ms = flag_or(args, "--rtp-ms", "1000")
+        .parse()
+        .map_err(|_| "bad --rtp-ms")?;
     opts.probe = has_flag(args, "--probe");
-    let secs: u64 = flag_or(args, "--timeout-secs", "15").parse().map_err(|_| "bad --timeout-secs")?;
+    let secs: u64 = flag_or(args, "--timeout-secs", "15")
+        .parse()
+        .map_err(|_| "bad --timeout-secs")?;
     opts.timeout = Duration::from_secs(secs);
     Ok(opts)
 }

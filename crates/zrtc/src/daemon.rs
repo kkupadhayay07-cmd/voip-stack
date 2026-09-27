@@ -139,7 +139,14 @@ pub async fn run(mut cfg: Config) -> Result<(), String> {
     let sbc = build_sbc(&cfg, udp_bind);
     let proxy = build_proxy(&cfg);
     let registrar = build_registrar(&cfg);
-    let core = Core::new(sbc, proxy, registrar, udp.clone(), registry.clone(), b2bua_bind);
+    let core = Core::new(
+        sbc,
+        proxy,
+        registrar,
+        udp.clone(),
+        registry.clone(),
+        b2bua_bind,
+    );
     tokio::spawn(async move {
         core.pump(core_rx).await;
     });
@@ -157,8 +164,7 @@ pub async fn run(mut cfg: Config) -> Result<(), String> {
     {
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            while let Err(e) =
-                transport::run_tls(tls_bind, tls_acceptor.clone(), ctx.clone()).await
+            while let Err(e) = transport::run_tls(tls_bind, tls_acceptor.clone(), ctx.clone()).await
             {
                 tracing::error!("sip/tls listener failed: {e}; restarting in 1s");
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -168,8 +174,7 @@ pub async fn run(mut cfg: Config) -> Result<(), String> {
     {
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            while let Err(e) =
-                transport::run_wss(wss_bind, wss_acceptor.clone(), ctx.clone()).await
+            while let Err(e) = transport::run_wss(wss_bind, wss_acceptor.clone(), ctx.clone()).await
             {
                 tracing::error!("sip/wss listener failed: {e}; restarting in 1s");
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -344,10 +349,7 @@ pub async fn run(mut cfg: Config) -> Result<(), String> {
     Ok(())
 }
 
-async fn udp_listener(
-    udp: Arc<UdpSocket>,
-    ctx: ListenerCtx,
-) -> Result<(), String> {
+async fn udp_listener(udp: Arc<UdpSocket>, ctx: ListenerCtx) -> Result<(), String> {
     use sip_core::parse::parse_message;
     let local = udp.local_addr().map_err(|e| e.to_string())?;
     tracing::debug!("udp listener active on {local}");

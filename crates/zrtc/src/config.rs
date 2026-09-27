@@ -94,9 +94,9 @@ fn default_wss_port() -> u16 {
 
 impl Sip {
     pub fn bind_addr(&self, port: u16) -> SocketAddr {
-        format!("{}:{}", self.host, port).parse().unwrap_or_else(|_| {
-            format!("127.0.0.1:{port}").parse().expect("fallback bind")
-        })
+        format!("{}:{}", self.host, port)
+            .parse()
+            .unwrap_or_else(|_| format!("127.0.0.1:{port}").parse().expect("fallback bind"))
     }
 }
 

@@ -75,7 +75,11 @@ pub fn build(cfg: &Trunk) -> Result<Box<dyn TrunkAuth>, String> {
                 .auth_pass
                 .clone()
                 .ok_or("trunk auth=digest requires auth_pass (or ZRTC_TRUNK_PASS)")?;
-            Ok(Box::new(DigestAuth::new(user, pass, cfg.auth_realm.clone())))
+            Ok(Box::new(DigestAuth::new(
+                user,
+                pass,
+                cfg.auth_realm.clone(),
+            )))
         }
         "bearer" => {
             let token = cfg

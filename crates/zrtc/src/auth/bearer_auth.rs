@@ -54,6 +54,7 @@ impl TrunkAuth for BearerAuth {
     }
 
     fn on_keepalive(&mut self, ctx: &mut KeepaliveCtx) {
-        ctx.headers.push(("Authorization".to_string(), self.value()));
+        ctx.headers
+            .push(("Authorization".to_string(), self.value()));
     }
 }

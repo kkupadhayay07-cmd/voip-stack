@@ -265,7 +265,14 @@ impl Registrar {
         let entry = self.aors.entry(aor.clone()).or_default();
         let mut updates: Vec<(String, u32)> = Vec::new();
         // AoR lookup tap (after lookup, before response)
-        observ::session::emit_for(&call_id, observ::EventKind::RegistrarLookup { aor: aor.clone(), found: existed, bindings: contacts.addresses.len() });
+        observ::session::emit_for(
+            &call_id,
+            observ::EventKind::RegistrarLookup {
+                aor: aor.clone(),
+                found: existed,
+                bindings: contacts.addresses.len(),
+            },
+        );
 
         for c in &contacts.addresses {
             let contact_str = c.addr.to_string();

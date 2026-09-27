@@ -94,14 +94,9 @@ impl TraceSink {
     }
 
     /// Consumes events forever; rotates files at UTC midnight.
-    pub async fn run(
-        mut self,
-        mut rx: broadcast::Receiver<Event>,
-        flush_interval_ms: u64,
-    ) {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
-            flush_interval_ms.max(10),
-        ));
+    pub async fn run(mut self, mut rx: broadcast::Receiver<Event>, flush_interval_ms: u64) {
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_millis(flush_interval_ms.max(10)));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
@@ -148,7 +143,10 @@ impl TraceSink {
         let buf = self
             .calls
             .entry(ev.call_id.clone())
-            .or_insert_with(|| CallBuf { events: Vec::new(), truncated: false });
+            .or_insert_with(|| CallBuf {
+                events: Vec::new(),
+                truncated: false,
+            });
         if buf.events.len() < MAX_EVENTS_PER_CALL {
             buf.events.push(ev.clone());
         } else {
@@ -163,11 +161,7 @@ impl TraceSink {
         }
         // Bound memory: drop the oldest unfinished calls.
         if self.calls.len() > MAX_CALLS {
-            let oldest = self
-                .calls
-                .keys()
-                .next()
-                .cloned();
+            let oldest = self.calls.keys().next().cloned();
             if let Some(k) = oldest {
                 self.calls.remove(&k);
             }
@@ -182,14 +176,18 @@ impl TraceSink {
         self.log_file = self.dir.join(format!("trace-{today}.log"));
         self.jsonl_file = self.dir.join(format!("trace-{today}.jsonl"));
         self.day = today;
-        self.log = Some(io::BufWriter::new(std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_file)?));
-        self.jsonl = Some(io::BufWriter::new(std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.jsonl_file)?));
+        self.log = Some(io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.log_file)?,
+        ));
+        self.jsonl = Some(io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.jsonl_file)?,
+        ));
         Ok(())
     }
 
@@ -215,14 +213,21 @@ impl TraceSink {
 /// One human-readable line per event.
 pub fn fmt_event(ev: &Event, include_sdp: bool, include_sip_bodies: bool) -> String {
     let ts = ts_iso(ev.ts_ms);
-    let cid = if ev.call_id.is_empty() { "-" } else { &ev.call_id };
+    let cid = if ev.call_id.is_empty() {
+        "-"
+    } else {
+        &ev.call_id
+    };
     let head = format!("{ts} cid={cid} leg={} {}", ev.leg.as_str(), ev.kind_name());
     match &ev.kind {
         EventKind::SipRx { peer, bytes, .. } | EventKind::SipTx { peer, bytes, .. } => {
-            let first_line = String::from_utf8_lossy(
-                bytes.split(|&b| b == b'\r').next().unwrap_or(bytes),
+            let first_line =
+                String::from_utf8_lossy(bytes.split(|&b| b == b'\r').next().unwrap_or(bytes));
+            let mut s = format!(
+                "{head} peer={} bytes={} {first_line}",
+                peer.addr,
+                bytes.len()
             );
-            let mut s = format!("{head} peer={} bytes={} {first_line}", peer.addr, bytes.len());
             if include_sip_bodies {
                 if let Some(sdp_len) = body_summary(bytes, b"v=0") {
                     if include_sdp {
@@ -232,20 +237,45 @@ pub fn fmt_event(ev: &Event, include_sdp: bool, include_sip_bodies: bool) -> Str
             }
             s
         }
-        EventKind::RtpRx { src, dst, bytes, ssrc, seq, pt, .. }
-        | EventKind::RtpTx { src, dst, bytes, ssrc, seq, pt, .. } => {
+        EventKind::RtpRx {
+            src,
+            dst,
+            bytes,
+            ssrc,
+            seq,
+            pt,
+            ..
+        }
+        | EventKind::RtpTx {
+            src,
+            dst,
+            bytes,
+            ssrc,
+            seq,
+            pt,
+            ..
+        } => {
             format!(
                 "{head} {src}->{dst} ssrc={ssrc:#x} seq={seq} pt={pt} bytes={}",
                 bytes.len()
             )
         }
-        EventKind::SbcDecision { verdict, reason, method, source } => {
+        EventKind::SbcDecision {
+            verdict,
+            reason,
+            method,
+            source,
+        } => {
             format!("{head} verdict={verdict} reason={reason} method={method} source={source}")
         }
         EventKind::ProxyFork { method, targets } => {
             format!("{head} method={method} targets={targets:?}")
         }
-        EventKind::RegistrarLookup { aor, found, bindings } => {
+        EventKind::RegistrarLookup {
+            aor,
+            found,
+            bindings,
+        } => {
             format!("{head} aor={aor} found={found} bindings={bindings}")
         }
         EventKind::B2buaLegUp { side, peer, codec } => {
@@ -254,16 +284,42 @@ pub fn fmt_event(ev: &Event, include_sdp: bool, include_sip_bodies: bool) -> Str
         EventKind::B2buaLegDown { side, reason } => {
             format!("{head} side={side} reason={reason}")
         }
-        EventKind::MediaStart { pump_leg, local, rx_codec, tx_codec } => {
-            format!("{head} local={local} rx_codec={rx_codec} tx_codec={tx_codec} pump_leg={}", pump_leg.as_str())
+        EventKind::MediaStart {
+            pump_leg,
+            local,
+            rx_codec,
+            tx_codec,
+        } => {
+            format!(
+                "{head} local={local} rx_codec={rx_codec} tx_codec={tx_codec} pump_leg={}",
+                pump_leg.as_str()
+            )
         }
-        EventKind::MediaStats { pump_leg, rx, tx, lost, jitter_ms, concealed }
-        | EventKind::MediaEnd { pump_leg, rx, tx, lost, jitter_ms, concealed, .. } => {
+        EventKind::MediaStats {
+            pump_leg,
+            rx,
+            tx,
+            lost,
+            jitter_ms,
+            concealed,
+        }
+        | EventKind::MediaEnd {
+            pump_leg,
+            rx,
+            tx,
+            lost,
+            jitter_ms,
+            concealed,
+            ..
+        } => {
             let mut s = format!(
                 "{head} pump_leg={} rx={rx} tx={tx} lost={lost} jitter_ms={jitter_ms:.1} concealed={concealed}",
                 pump_leg.as_str()
             );
-            if let EventKind::MediaEnd { talk_ms, remote, .. } = &ev.kind {
+            if let EventKind::MediaEnd {
+                talk_ms, remote, ..
+            } = &ev.kind
+            {
                 s.push_str(&format!(" talk_ms={talk_ms}"));
                 if let Some(r) = remote {
                     s.push_str(&format!(" remote={r}"));
@@ -277,7 +333,10 @@ pub fn fmt_event(ev: &Event, include_sdp: bool, include_sip_bodies: bool) -> Str
         EventKind::Tts { state, bytes } => format!("{head} state={state} bytes={bytes}"),
         EventKind::CdrWritten { record } => {
             let id = record.get("id").and_then(|v| v.as_str()).unwrap_or("-");
-            let disp = record.get("disposition").and_then(|v| v.as_str()).unwrap_or("-");
+            let disp = record
+                .get("disposition")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
             format!("{head} cdr_id={id} disposition={disp}")
         }
     }
@@ -302,15 +361,30 @@ fn dump_block(
         writeln!(f, "  {} {}", ts_iso(ev.ts_ms), compact(ev))?;
     }
     if buf.truncated {
-        writeln!(f, "  ... (buffer truncated at {MAX_EVENTS_PER_CALL} events)")?;
+        writeln!(
+            f,
+            "  ... (buffer truncated at {MAX_EVENTS_PER_CALL} events)"
+        )?;
     }
     if let EventKind::CdrWritten { record } = &cdr.kind {
         let media = record.get("media");
-        writeln!(f, "  cdr: id={} disposition={} talk_secs={} media={}",
+        writeln!(
+            f,
+            "  cdr: id={} disposition={} talk_secs={} media={}",
             record.get("id").and_then(|v| v.as_str()).unwrap_or("-"),
-            serde_json::to_string(record.get("disposition").unwrap_or(&serde_json::Value::Null)).unwrap_or_default(),
-            record.get("talk_secs").and_then(|v| v.as_u64()).unwrap_or(0),
-            media.map(|m| m.to_string()).unwrap_or_else(|| "null".into()),
+            serde_json::to_string(
+                record
+                    .get("disposition")
+                    .unwrap_or(&serde_json::Value::Null)
+            )
+            .unwrap_or_default(),
+            record
+                .get("talk_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            media
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "null".into()),
         )?;
     }
     writeln!(f, "──── end {call_id} ────")
@@ -320,7 +394,8 @@ fn dump_block(
 fn compact(ev: &Event) -> String {
     match &ev.kind {
         EventKind::SipRx { bytes, .. } | EventKind::SipTx { bytes, .. } => {
-            let first = String::from_utf8_lossy(bytes.split(|&b| b == b'\r').next().unwrap_or(bytes));
+            let first =
+                String::from_utf8_lossy(bytes.split(|&b| b == b'\r').next().unwrap_or(bytes));
             first.trim_end().to_string()
         }
         EventKind::RtpRx { ssrc, seq, pt, .. } | EventKind::RtpTx { ssrc, seq, pt, .. } => {
@@ -339,10 +414,23 @@ fn compact(ev: &Event) -> String {
 /// only for the sink's own tests).
 pub fn last_stats(events: &[Event], leg: Leg) -> Option<(u64, u64, u64, f64, u64)> {
     events.iter().rev().find_map(|ev| match &ev.kind {
-        EventKind::MediaStats { pump_leg: l, rx, tx, lost, jitter_ms, concealed }
-        | EventKind::MediaEnd { pump_leg: l, rx, tx, lost, jitter_ms, concealed, .. } if *l == leg => {
-            Some((*rx, *tx, *lost, *jitter_ms, *concealed))
+        EventKind::MediaStats {
+            pump_leg: l,
+            rx,
+            tx,
+            lost,
+            jitter_ms,
+            concealed,
         }
+        | EventKind::MediaEnd {
+            pump_leg: l,
+            rx,
+            tx,
+            lost,
+            jitter_ms,
+            concealed,
+            ..
+        } if *l == leg => Some((*rx, *tx, *lost, *jitter_ms, *concealed)),
         _ => None,
     })
 }
@@ -353,19 +441,38 @@ mod tests {
     use crate::event::{Direction, Peer, Transport};
 
     fn ev(call: &str, kind: EventKind) -> Event {
-        Event { ts_ms: 1_700_000_000_000, call_id: call.into(), trunk: None, direction: Some(Direction::Inbound), leg: Leg::Core, kind }
+        Event {
+            ts_ms: 1_700_000_000_000,
+            call_id: call.into(),
+            trunk: None,
+            direction: Some(Direction::Inbound),
+            leg: Leg::Core,
+            kind,
+        }
     }
 
     #[test]
     fn human_line_shape() {
-        let e = ev("c9", EventKind::SipRx {
-            peer: Peer { addr: "127.0.0.1:5060".parse().unwrap(), transport: Transport::Udp },
-            bytes: b"INVITE sip:1000@zrtc.local SIP/2.0\r\nCall-ID: c9\r\n\r\n".to_vec(),
-            plaintext: true,
-        });
+        let e = ev(
+            "c9",
+            EventKind::SipRx {
+                peer: Peer {
+                    addr: "127.0.0.1:5060".parse().unwrap(),
+                    transport: Transport::Udp,
+                },
+                bytes: b"INVITE sip:1000@zrtc.local SIP/2.0\r\nCall-ID: c9\r\n\r\n".to_vec(),
+                plaintext: true,
+            },
+        );
         let line = fmt_event(&e, true, true);
-        assert!(line.starts_with("2023-11-14T22:13:20.000Z cid=c9 leg=core sip-rx"), "{line}");
-        assert!(line.contains("INVITE sip:1000@zrtc.local SIP/2.0"), "{line}");
+        assert!(
+            line.starts_with("2023-11-14T22:13:20.000Z cid=c9 leg=core sip-rx"),
+            "{line}"
+        );
+        assert!(
+            line.contains("INVITE sip:1000@zrtc.local SIP/2.0"),
+            "{line}"
+        );
         assert!(!line.contains("sdp_bytes="), "no SDP in this message");
     }
 
@@ -376,13 +483,33 @@ mod tests {
         let status = Arc::new(StatusShared::default());
         let mut sink = TraceSink::new(dir.clone(), true, true, status.clone());
 
-        sink.on_event(ev("cA", EventKind::B2buaLegUp { side: "A".into(), peer: "127.0.0.1:5060".parse().unwrap(), codec: "PCMU".into() }));
-        sink.on_event(ev("cA", EventKind::MediaStart { pump_leg: Leg::A, local: "127.0.0.1:40000".parse().unwrap(), rx_codec: "PCMU".into(), tx_codec: "PCMU".into() }));
+        sink.on_event(ev(
+            "cA",
+            EventKind::B2buaLegUp {
+                side: "A".into(),
+                peer: "127.0.0.1:5060".parse().unwrap(),
+                codec: "PCMU".into(),
+            },
+        ));
+        sink.on_event(ev(
+            "cA",
+            EventKind::MediaStart {
+                pump_leg: Leg::A,
+                local: "127.0.0.1:40000".parse().unwrap(),
+                rx_codec: "PCMU".into(),
+                tx_codec: "PCMU".into(),
+            },
+        ));
         sink.on_event(ev("cA", EventKind::CdrWritten { record: serde_json::json!({"id": "r1", "disposition": "answered", "talk_secs": 2, "media": {"packets_rx": 74}}) }));
         // Call must be gone from memory after CDR.
         assert!(!sink.calls.contains_key("cA"));
         // A call without a CDR stays buffered (active).
-        sink.on_event(ev("cB", EventKind::Vad { state: "speech_start".into() }));
+        sink.on_event(ev(
+            "cB",
+            EventKind::Vad {
+                state: "speech_start".into(),
+            },
+        ));
         assert!(sink.calls.contains_key("cB"));
         sink.flush_files();
         let log = std::fs::read_to_string(sink.log_file).unwrap();
@@ -396,9 +523,24 @@ mod tests {
 
     #[test]
     fn last_stats_picks_latest_per_leg() {
-        let mk = |rx: u64| ev("c", EventKind::MediaStats { pump_leg: Leg::A, rx, tx: 1, lost: 0, jitter_ms: 1.0, concealed: 0 });
+        let mk = |rx: u64| {
+            ev(
+                "c",
+                EventKind::MediaStats {
+                    pump_leg: Leg::A,
+                    rx,
+                    tx: 1,
+                    lost: 0,
+                    jitter_ms: 1.0,
+                    concealed: 0,
+                },
+            )
+        };
         let events = vec![mk(10), mk(20)];
-        assert_eq!(last_stats(&events, Leg::A).map(|(rx, _, _, _, _)| rx), Some(20));
+        assert_eq!(
+            last_stats(&events, Leg::A).map(|(rx, _, _, _, _)| rx),
+            Some(20)
+        );
         assert_eq!(last_stats(&events, Leg::B), None);
     }
 
@@ -410,34 +552,43 @@ mod tests {
         let status = Arc::new(StatusShared::default());
         let mut sink = TraceSink::new(dir.clone(), true, true, status.clone());
 
-        sink.on_event(ev("cR", EventKind::RtpRx {
-            src: "127.0.0.1:40000".parse().unwrap(),
-            dst: "127.0.0.1:40002".parse().unwrap(),
-            pump_leg: Leg::A,
-            bytes: vec![0x80, 0, 0, 1, 0, 0, 0, 1, 1, 2, 3, 4, 0xaa],
-            ssrc: 0x01020304,
-            seq: 1,
-            pt: 0,
-        }));
-        sink.on_event(ev("cR", EventKind::RtpTx {
-            src: "127.0.0.1:40002".parse().unwrap(),
-            dst: "127.0.0.1:40000".parse().unwrap(),
-            pump_leg: Leg::A,
-            bytes: vec![0x80, 0, 0, 2, 0, 0, 0, 161, 1, 2, 3, 4, 0xbb],
-            ssrc: 0x01020304,
-            seq: 2,
-            pt: 0,
-        }));
-        sink.on_event(ev("cR", EventKind::MediaEnd {
-            pump_leg: Leg::A,
-            rx: 1,
-            tx: 1,
-            lost: 0,
-            jitter_ms: 0.4,
-            concealed: 0,
-            talk_ms: 40,
-            remote: Some("127.0.0.1:40000".parse().unwrap()),
-        }));
+        sink.on_event(ev(
+            "cR",
+            EventKind::RtpRx {
+                src: "127.0.0.1:40000".parse().unwrap(),
+                dst: "127.0.0.1:40002".parse().unwrap(),
+                pump_leg: Leg::A,
+                bytes: vec![0x80, 0, 0, 1, 0, 0, 0, 1, 1, 2, 3, 4, 0xaa],
+                ssrc: 0x01020304,
+                seq: 1,
+                pt: 0,
+            },
+        ));
+        sink.on_event(ev(
+            "cR",
+            EventKind::RtpTx {
+                src: "127.0.0.1:40002".parse().unwrap(),
+                dst: "127.0.0.1:40000".parse().unwrap(),
+                pump_leg: Leg::A,
+                bytes: vec![0x80, 0, 0, 2, 0, 0, 0, 161, 1, 2, 3, 4, 0xbb],
+                ssrc: 0x01020304,
+                seq: 2,
+                pt: 0,
+            },
+        ));
+        sink.on_event(ev(
+            "cR",
+            EventKind::MediaEnd {
+                pump_leg: Leg::A,
+                rx: 1,
+                tx: 1,
+                lost: 0,
+                jitter_ms: 0.4,
+                concealed: 0,
+                talk_ms: 40,
+                remote: Some("127.0.0.1:40000".parse().unwrap()),
+            },
+        ));
         sink.flush_files();
 
         let log = std::fs::read_to_string(sink.log_file).unwrap();
@@ -445,7 +596,11 @@ mod tests {
         assert!(log.contains("media-end"), "{log}");
         assert!(log.contains("remote=127.0.0.1:40000"), "{log}");
         let jsonl = std::fs::read_to_string(sink.jsonl_file).unwrap();
-        assert_eq!(jsonl.lines().count(), 1, "only the media-end event: {jsonl}");
+        assert_eq!(
+            jsonl.lines().count(),
+            1,
+            "only the media-end event: {jsonl}"
+        );
         assert!(sink.calls.get("cR").map(|b| b.events.len()) == Some(1));
         std::fs::remove_dir_all(&dir).ok();
     }

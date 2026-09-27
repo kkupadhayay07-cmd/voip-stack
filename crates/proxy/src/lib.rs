@@ -245,7 +245,13 @@ impl Proxy {
             actions.push(Action::Send(SipMessage::Request(req.clone()), target));
         }
         // fork tap (after forking)
-        observ::session::emit_for(req.headers.call_id().unwrap_or(""), observ::EventKind::ProxyFork { method: req.method.to_string(), targets: targets.clone() });
+        observ::session::emit_for(
+            req.headers.call_id().unwrap_or(""),
+            observ::EventKind::ProxyFork {
+                method: req.method.to_string(),
+                targets: targets.clone(),
+            },
+        );
 
         if req.method == Method::Invite {
             let call_id = req.headers.call_id().unwrap_or("").to_string();

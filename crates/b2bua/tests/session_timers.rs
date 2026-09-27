@@ -84,25 +84,23 @@ async fn spawn_engine(min_se: u64, uas: SocketAddr) -> SocketAddr {
 /// RFC 4028 UAS must), ACKs are recorded, BYE ends the task. When
 /// `first_reject` is set, the FIRST INVITE is answered with that code plus a
 /// `Min-SE` header (422 path) instead.
-async fn run_uas(
-    sock: UdpSocket,
-    rtp_port: u16,
-    first_reject: Option<(u16, u64)>,
-    log: Log,
-) {
+async fn run_uas(sock: UdpSocket, rtp_port: u16, first_reject: Option<(u16, u64)>, log: Log) {
     let mut buf = vec![0u8; 65_535];
     let mut first = true;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
     loop {
-        let remaining =
-            deadline.saturating_duration_since(tokio::time::Instant::now());
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             break;
         }
         let recv = tokio::time::timeout(remaining, sock.recv_from(&mut buf)).await;
         let Ok(Ok((n, src))) = recv else { break };
-        let Ok(msg) = parse_message(&buf[..n]) else { continue };
-        let SipMessage::Request(req) = msg else { continue };
+        let Ok(msg) = parse_message(&buf[..n]) else {
+            continue;
+        };
+        let SipMessage::Request(req) = msg else {
+            continue;
+        };
         match req.method {
             Method::Invite => {
                 let se = req
@@ -130,13 +128,7 @@ async fn run_uas(
                         continue;
                     }
                 }
-                let trying = sip_core::builder::respond_to(
-                    &req,
-                    100,
-                    "Trying",
-                    Vec::new(),
-                    None,
-                );
+                let trying = sip_core::builder::respond_to(&req, 100, "Trying", Vec::new(), None);
                 let _ = sock
                     .send_to(&serialize(&SipMessage::Response(trying)), src)
                     .await;
@@ -159,8 +151,7 @@ async fn run_uas(
             Method::Ack => log.push("ACK"),
             Method::Bye => {
                 log.push("BYE");
-                let ok =
-                    sip_core::builder::respond_to(&req, 200, "OK", Vec::new(), None);
+                let ok = sip_core::builder::respond_to(&req, 200, "OK", Vec::new(), None);
                 let _ = sock
                     .send_to(&serialize(&SipMessage::Response(ok)), src)
                     .await;
@@ -295,15 +286,7 @@ async fn engages_refreshes_downstream_and_expires() {
         .get("Supported")
         .unwrap_or_default()
         .contains("timer"));
-    send_ack(
-        &a,
-        a_addr,
-        engine,
-        "st-1",
-        &to_tag_of(&ok200),
-        1,
-    )
-    .await;
+    send_ack(&a, a_addr, engine, "st-1", &to_tag_of(&ok200), 1).await;
 
     // We never refresh leg A. At anchor+2s the engine must BYE us.
     let mut got_bye = false;
@@ -314,13 +297,7 @@ async fn engages_refreshes_downstream_and_expires() {
         match msg {
             SipMessage::Request(r) if r.method == Method::Bye => {
                 got_bye = true;
-                let ok = sip_core::builder::respond_to(
-                    &r,
-                    200,
-                    "OK",
-                    Vec::new(),
-                    None,
-                );
+                let ok = sip_core::builder::respond_to(&r, 200, "OK", Vec::new(), None);
                 a.send_to(&serialize(&SipMessage::Response(ok)), engine)
                     .await
                     .unwrap();
@@ -357,7 +334,10 @@ async fn engages_refreshes_downstream_and_expires() {
         events.iter().any(|e| e.contains("INVITE cseq=2")),
         "engine must refresh leg B at half-interval: {events:?}"
     );
-    assert!(log.contains("BYE"), "engine must BYE leg B at expiry: {events:?}");
+    assert!(
+        log.contains("BYE"),
+        "engine must BYE leg B at expiry: {events:?}"
+    );
 }
 
 /// `SE=4;refresher=uas`: the B2BUA is the leg-A refresher and must send a
@@ -454,10 +434,7 @@ async fn rejects_interval_below_min_se() {
     assert_eq!(resp.code, 422, "too-small interval must get 422");
     assert_eq!(resp.headers.get("Min-SE"), Some("90"));
     assert!(
-        resp.headers
-            .get("To")
-            .unwrap_or_default()
-            .contains("tag="),
+        resp.headers.get("To").unwrap_or_default().contains("tag="),
         "422 for an INVITE still carries a To tag"
     );
 
@@ -495,9 +472,7 @@ async fn retries_leg_b_after_422() {
 
     let events = log.snapshot();
     assert!(
-        events
-            .iter()
-            .any(|e| e.contains("INVITE cseq=1")),
+        events.iter().any(|e| e.contains("INVITE cseq=1")),
         "first dial attempt must be recorded: {events:?}"
     );
     assert!(
@@ -586,6 +561,9 @@ async fn update_refreshes_the_session() {
             }
         }
     }
-    assert!(got_bye, "session must still expire without further refreshes");
+    assert!(
+        got_bye,
+        "session must still expire without further refreshes"
+    );
     let _ = timeout(Duration::from_secs(6), uas_task).await;
 }

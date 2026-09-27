@@ -86,9 +86,7 @@ pub mod bytes_hex {
         }
         let mut out = Vec::with_capacity(s.len() / 2);
         for i in (0..s.len()).step_by(2) {
-            out.push(
-                u8::from_str_radix(&s[i..i + 2], 16).map_err(serde::de::Error::custom)?,
-            );
+            out.push(u8::from_str_radix(&s[i..i + 2], 16).map_err(serde::de::Error::custom)?);
         }
         Ok(out)
     }
@@ -146,15 +144,31 @@ pub enum EventKind {
         source: SocketAddr,
     },
     /// Proxy forked a request to one or more targets.
-    ProxyFork { method: String, targets: Vec<String> },
+    ProxyFork {
+        method: String,
+        targets: Vec<String>,
+    },
     /// Registrar finished an AoR lookup for a REGISTER.
-    RegistrarLookup { aor: String, found: bool, bindings: usize },
+    RegistrarLookup {
+        aor: String,
+        found: bool,
+        bindings: usize,
+    },
     /// A b2bua leg answered (came up).
-    B2buaLegUp { side: String, peer: SocketAddr, codec: String },
+    B2buaLegUp {
+        side: String,
+        peer: SocketAddr,
+        codec: String,
+    },
     /// A b2bua leg went down.
     B2buaLegDown { side: String, reason: String },
     /// Media pump started for one leg (`pump_leg`: the pump's leg).
-    MediaStart { pump_leg: Leg, local: SocketAddr, rx_codec: String, tx_codec: String },
+    MediaStart {
+        pump_leg: Leg,
+        local: SocketAddr,
+        rx_codec: String,
+        tx_codec: String,
+    },
     /// Rolling media counters (every 5 s per pump). `lost` counts packets
     /// the sender demonstrably sent but never arrived (sequence-proven
     /// gaps); `concealed` counts playout slots the PLC path filled because
@@ -358,9 +372,18 @@ mod tests {
         );
         let line = serde_json::to_string(&ev).unwrap();
         assert!(line.contains("\"kind\":\"sip_rx\""), "{line}");
-        assert!(line.contains("\"bytes\":\"52454749535445520d0a0d0a\""), "{line}");
+        assert!(
+            line.contains("\"bytes\":\"52454749535445520d0a0d0a\""),
+            "{line}"
+        );
         let back: Event = serde_json::from_str(&line).unwrap();
         assert_eq!(back.call_id, "c-1");
-        assert!(matches!(back.kind, EventKind::SipRx { plaintext: true, .. }));
+        assert!(matches!(
+            back.kind,
+            EventKind::SipRx {
+                plaintext: true,
+                ..
+            }
+        ));
     }
 }

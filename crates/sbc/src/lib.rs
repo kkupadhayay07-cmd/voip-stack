@@ -209,13 +209,29 @@ impl Sbc {
         // 1. ACL.
         if !self.config.acl.admits(source.ip()) {
             // decision tap (refuse: acl)
-            observ::session::emit_for(req.headers.call_id().unwrap_or(""), EventKind::SbcDecision { verdict: "refuse".into(), reason: "acl".into(), method: req.method.to_string(), source });
+            observ::session::emit_for(
+                req.headers.call_id().unwrap_or(""),
+                EventKind::SbcDecision {
+                    verdict: "refuse".into(),
+                    reason: "acl".into(),
+                    method: req.method.to_string(),
+                    source,
+                },
+            );
             return SbcAction::Refuse(respond_to(req, 403, "Forbidden", Vec::new(), None));
         }
         // 2. Rate limit.
         if !self.check_rate(source) {
             // decision tap (refuse: rate)
-            observ::session::emit_for(req.headers.call_id().unwrap_or(""), EventKind::SbcDecision { verdict: "refuse".into(), reason: "rate".into(), method: req.method.to_string(), source });
+            observ::session::emit_for(
+                req.headers.call_id().unwrap_or(""),
+                EventKind::SbcDecision {
+                    verdict: "refuse".into(),
+                    reason: "rate".into(),
+                    method: req.method.to_string(),
+                    source,
+                },
+            );
             return SbcAction::Refuse(respond_to(
                 req,
                 503,
@@ -283,7 +299,15 @@ impl Sbc {
         }
 
         // decision tap (relay: passed acl + rate)
-        observ::session::emit_for(req.headers.call_id().unwrap_or(""), EventKind::SbcDecision { verdict: "relay".into(), reason: "ok".into(), method: req.method.to_string(), source });
+        observ::session::emit_for(
+            req.headers.call_id().unwrap_or(""),
+            EventKind::SbcDecision {
+                verdict: "relay".into(),
+                reason: "ok".into(),
+                method: req.method.to_string(),
+                source,
+            },
+        );
         SbcAction::Relay(req)
     }
 

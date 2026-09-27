@@ -128,14 +128,16 @@ where
                             // socket-boundary tap (SipRx over TCP/TLS)
                             observ::session::sip_tap(&acc[..used], peer, transport, true);
                             acc.drain(..used);
-                            let _ = ctx.core.send(Incoming {
-                                msg,
-                                resp: Responder {
-                                    src: peer,
-                                    conn: Some(tx.clone()),
-                                },
-                            })
-                            .await;
+                            let _ = ctx
+                                .core
+                                .send(Incoming {
+                                    msg,
+                                    resp: Responder {
+                                        src: peer,
+                                        conn: Some(tx.clone()),
+                                    },
+                                })
+                                .await;
                         }
                         Err(ParseError::Truncated { .. }) => break,
                         Err(e) => {
@@ -301,8 +303,9 @@ pub async fn run_wss_on(
             // session is closed after ctx.idle; Pong for peer pings is sent
             // by tungstenite on the next outbound write (SIP keepalives are
             // CRLF-level per RFC 7118 §4.3, not WS pings).
-            while let Some(item) =
-                tokio::time::timeout(ctx.idle, stream.next()).await.unwrap_or(None)
+            while let Some(item) = tokio::time::timeout(ctx.idle, stream.next())
+                .await
+                .unwrap_or(None)
             {
                 let payload: Vec<u8> = match item {
                     Ok(Message::Binary(bin)) => bin,
@@ -611,4 +614,3 @@ Content-Length: 999999999\r\n\r\nshort";
         assert_register(&msg, "text-framed message");
     }
 }
-

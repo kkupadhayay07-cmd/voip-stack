@@ -113,7 +113,13 @@ pub fn start_with_socket(
     bridge_out: mpsc::Sender<Vec<i16>>,
     bridge_in: mpsc::Receiver<Vec<i16>>,
 ) -> Result<PumpHandle, codecs::CodecError> {
-    start_with_socket_session(cfg, rtp, bridge_out, bridge_in, observ::CallSession::detached())
+    start_with_socket_session(
+        cfg,
+        rtp,
+        bridge_out,
+        bridge_in,
+        observ::CallSession::detached(),
+    )
 }
 
 /// Same as [`start_with_socket`] but with a call context so the pump emits
@@ -174,10 +180,7 @@ async fn run_pump(
         .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
     // A wildcard bind must not leak 0.0.0.0 into capture addresses.
     let local = if local.ip().is_unspecified() {
-        std::net::SocketAddr::new(
-            std::net::IpAddr::from([127, 0, 0, 1]),
-            local.port(),
-        )
+        std::net::SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), local.port())
     } else {
         local
     };

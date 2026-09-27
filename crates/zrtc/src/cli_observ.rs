@@ -105,8 +105,7 @@ fn load_events(log_dir: &Path) -> Result<Vec<Event>, String> {
     }
     let mut events = Vec::new();
     for f in &files {
-        let text = std::fs::read_to_string(f)
-            .map_err(|e| format!("read {}: {e}", f.display()))?;
+        let text = std::fs::read_to_string(f).map_err(|e| format!("read {}: {e}", f.display()))?;
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
             match serde_json::from_str::<Event>(line) {
                 Ok(ev) => events.push(ev),
@@ -250,9 +249,7 @@ fn index_calls(events: Vec<Event>) -> Vec<(String, CallIndex)> {
 fn calls_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
     // `zrtc calls show CALL_ID`
     if let Some(i) = args.iter().position(|a| a == "show") {
-        let id = args
-            .get(i + 1)
-            .ok_or("usage: zrtc calls show CALL_ID")?;
+        let id = args.get(i + 1).ok_or("usage: zrtc calls show CALL_ID")?;
         return calls_show(id, log_dir);
     }
     let recent: Option<usize> = args
@@ -293,13 +290,25 @@ fn calls_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
             ("—".to_string(), "active".to_string(), "—".to_string()),
             |r| {
                 (
-                    r.get("direction").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-                    r.get("disposition").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-                    r.get("talk_secs").and_then(|v| v.as_u64()).unwrap_or(0).to_string(),
+                    r.get("direction")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                    r.get("disposition")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                    r.get("talk_secs")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        .to_string(),
                 )
             },
         );
-        println!("{id:<38} {dir:<9} {disp:<12} {secs:<8} {}", ts_hms(c.last_ms));
+        println!(
+            "{id:<38} {dir:<9} {disp:<12} {secs:<8} {}",
+            ts_hms(c.last_ms)
+        );
         shown += 1;
         if (active || recent.is_none()) && shown >= 25 {
             break;
@@ -395,14 +404,24 @@ fn diag_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
     println!("\n── media summary ──");
     let mut printed_leg: Vec<observ::event::Leg> = Vec::new();
     for ev in c.events.iter().rev() {
-        if let EventKind::MediaEnd { pump_leg: leg, rx, tx, lost, jitter_ms, concealed, talk_ms, .. } = &ev.kind {
-                if !printed_leg.contains(leg) {
-                    printed_leg.push(*leg);
-                    println!(
+        if let EventKind::MediaEnd {
+            pump_leg: leg,
+            rx,
+            tx,
+            lost,
+            jitter_ms,
+            concealed,
+            talk_ms,
+            ..
+        } = &ev.kind
+        {
+            if !printed_leg.contains(leg) {
+                printed_leg.push(*leg);
+                println!(
                         "  leg {}: rx={rx} tx={tx} lost={lost} jitter={jitter_ms:.1}ms concealed={concealed} talk_ms={talk_ms}",
                         leg.as_str()
                     );
-                }
+            }
         }
     }
     if let Some(r) = &c.cdr {
@@ -416,13 +435,22 @@ fn diag_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
 
     // 4. Pipeline timing.
     println!("\n── pipeline timing ──");
-    let t_inv = first_ts(&c.events, |e| {
-        matches!(&e.kind, EventKind::SipRx { bytes, .. } if bytes.starts_with(b"INVITE"))
+    let t_inv = first_ts(
+        &c.events,
+        |e| matches!(&e.kind, EventKind::SipRx { bytes, .. } if bytes.starts_with(b"INVITE")),
+    );
+    let t_sbc = first_ts(&c.events, |e| {
+        matches!(&e.kind, EventKind::SbcDecision { .. })
     });
-    let t_sbc = first_ts(&c.events, |e| matches!(&e.kind, EventKind::SbcDecision { .. }));
-    let t_fork = first_ts(&c.events, |e| matches!(&e.kind, EventKind::ProxyFork { .. }));
-    let t_leg = first_ts(&c.events, |e| matches!(&e.kind, EventKind::B2buaLegUp { .. }));
-    let t_media = first_ts(&c.events, |e| matches!(&e.kind, EventKind::MediaStart { .. }));
+    let t_fork = first_ts(&c.events, |e| {
+        matches!(&e.kind, EventKind::ProxyFork { .. })
+    });
+    let t_leg = first_ts(&c.events, |e| {
+        matches!(&e.kind, EventKind::B2buaLegUp { .. })
+    });
+    let t_media = first_ts(&c.events, |e| {
+        matches!(&e.kind, EventKind::MediaStart { .. })
+    });
     let delta = |base: Option<i64>, t: Option<i64>, label: &str| {
         if let (Some(b), Some(t)) = (base, t) {
             println!("  {label:<18} +{}ms", t - b);
@@ -457,7 +485,9 @@ fn diag_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
             EventKind::MediaStart { local, .. } => {
                 rtp_ports.insert(local.port());
             }
-            EventKind::MediaEnd { remote: Some(r), .. } => {
+            EventKind::MediaEnd {
+                remote: Some(r), ..
+            } => {
                 rtp_ports.insert(r.port());
             }
             _ => {}
@@ -489,13 +519,19 @@ fn capture_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
             for f in ["sip.pcap", "rtp.pcap", "status.json"] {
                 let p = log_dir.join(f);
                 let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-                println!("  {f:<12} {:>10} bytes{}", size, if size == 0 { "  (missing)" } else { "" });
+                println!(
+                    "  {f:<12} {:>10} bytes{}",
+                    size,
+                    if size == 0 { "  (missing)" } else { "" }
+                );
             }
             for f in jsonl_files(log_dir) {
                 let size = std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
                 println!(
                     "  {:<12} {:>10} bytes",
-                    f.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                    f.file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
                     size
                 );
             }
@@ -505,7 +541,9 @@ fn capture_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
                         "  bus: published-so-far trace_events={} trace_lagged={} pcap_stopped={}",
                         v.get("trace_events").and_then(|x| x.as_u64()).unwrap_or(0),
                         v.get("trace_lagged").and_then(|x| x.as_u64()).unwrap_or(0),
-                        v.get("pcap_stopped").and_then(|x| x.as_bool()).unwrap_or(false),
+                        v.get("pcap_stopped")
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false),
                     );
                 }
             }
@@ -513,10 +551,11 @@ fn capture_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
         }
         "dump" => {
             if !has_flag(args, "--out") {
-                return Err("usage: zrtc capture dump --call-id ID --out FILE [--type sip|rtp|both]".into());
+                return Err(
+                    "usage: zrtc capture dump --call-id ID --out FILE [--type sip|rtp|both]".into(),
+                );
             }
-            let call_id = flag_value(args, "--call-id")
-                .ok_or("missing --call-id <ID>")?;
+            let call_id = flag_value(args, "--call-id").ok_or("missing --call-id <ID>")?;
             let out = flag_value(args, "--out").unwrap();
             let kind = flag_value(args, "--type").unwrap_or_else(|| "both".into());
             let events = load_events(log_dir)?;
@@ -534,18 +573,17 @@ fn capture_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
                     EventKind::MediaStart { local, .. } => {
                         rtp_ports.insert(local.port());
                     }
-                    EventKind::MediaEnd { remote: Some(r), .. } => {
+                    EventKind::MediaEnd {
+                        remote: Some(r), ..
+                    } => {
                         rtp_ports.insert(r.port());
                     }
                     _ => {}
                 }
             }
 
-            let mut writer = PcapWriter::create(
-                Path::new(&out),
-                512 * 1024 * 1024,
-            )
-            .map_err(|e| format!("create {out}: {e}"))?;
+            let mut writer = PcapWriter::create(Path::new(&out), 512 * 1024 * 1024)
+                .map_err(|e| format!("create {out}: {e}"))?;
             let mut n_sip = 0usize;
             let mut n_rtp = 0usize;
             let needle = call_id.as_bytes();
@@ -577,10 +615,22 @@ fn capture_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
             };
 
             if kind == "sip" || kind == "both" {
-                write_matching(&mut writer, &log_dir.join("sip.pcap"), true, &mut n_sip, &mut n_rtp)?;
+                write_matching(
+                    &mut writer,
+                    &log_dir.join("sip.pcap"),
+                    true,
+                    &mut n_sip,
+                    &mut n_rtp,
+                )?;
             }
             if kind == "rtp" || kind == "both" {
-                write_matching(&mut writer, &log_dir.join("rtp.pcap"), false, &mut n_sip, &mut n_rtp)?;
+                write_matching(
+                    &mut writer,
+                    &log_dir.join("rtp.pcap"),
+                    false,
+                    &mut n_sip,
+                    &mut n_rtp,
+                )?;
             }
             writer.flush();
             let (packets, bytes) = writer.stats();
@@ -592,7 +642,9 @@ fn capture_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
             }
             Ok(())
         }
-        other => Err(format!("unknown capture subcommand '{other}' (status|dump)")),
+        other => Err(format!(
+            "unknown capture subcommand '{other}' (status|dump)"
+        )),
     }
 }
 
@@ -624,7 +676,15 @@ fn metrics_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
             }
         }
         match &ev.kind {
-            EventKind::MediaEnd { pump_leg: _, rx: r, tx: t, lost: l, jitter_ms: j, concealed: co, .. } => {
+            EventKind::MediaEnd {
+                pump_leg: _,
+                rx: r,
+                tx: t,
+                lost: l,
+                jitter_ms: j,
+                concealed: co,
+                ..
+            } => {
                 saw_media = true;
                 calls.insert(ev.call_id.clone());
                 rx += r;
@@ -643,7 +703,10 @@ fn metrics_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
         }
     }
     let scope = call_id.as_deref().unwrap_or("all calls");
-    println!("metrics for {scope}{}:", cutoff.map(|_| " (since window)").unwrap_or(""));
+    println!(
+        "metrics for {scope}{}:",
+        cutoff.map(|_| " (since window)").unwrap_or("")
+    );
     if calls.is_empty() && !saw_media {
         println!("  (no media events found)");
         return Ok(());
@@ -657,7 +720,10 @@ fn metrics_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
     }
     println!("  concealed frames: {concealed}");
     if lost + rx > 0 {
-        println!("  loss rate:   {:.2}%", 100.0 * lost as f64 / (lost + rx) as f64);
+        println!(
+            "  loss rate:   {:.2}%",
+            100.0 * lost as f64 / (lost + rx) as f64
+        );
     }
     Ok(())
 }

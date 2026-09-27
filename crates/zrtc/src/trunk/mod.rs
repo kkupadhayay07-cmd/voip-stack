@@ -67,11 +67,11 @@ impl Endpoint {
             .ok_or_else(|| format!("trunk address '{hostport}': no addresses"))?;
 
         let transport = uac::Transport::parse(&t.transport)?;
-        let user = t
-            .auth_user
+        let user = t.auth_user.clone().unwrap_or_else(|| "trunk".to_string());
+        let aor = t
+            .aor
             .clone()
-            .unwrap_or_else(|| "trunk".to_string());
-        let aor = t.aor.clone().unwrap_or_else(|| format!("sip:{user}@{host}"));
+            .unwrap_or_else(|| format!("sip:{user}@{host}"));
         let contact = format!("sip:{user}@{}", cfg.sip.host);
         Ok(Endpoint {
             target,

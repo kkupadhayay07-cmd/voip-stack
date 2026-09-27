@@ -108,7 +108,10 @@ mod tests {
         let bus = Arc::new(EventBus::new(2));
         let mut rx = bus.subscribe();
         for i in 0..6 {
-            bus.publish(Event::now(format!("c{i}"), EventKind::Vad { state: "s".into() }));
+            bus.publish(Event::now(
+                format!("c{i}"),
+                EventKind::Vad { state: "s".into() },
+            ));
         }
         assert!(matches!(rx.recv().await, Err(broadcast::error::RecvError::Lagged(n)) if n >= 1));
         assert!(rx.recv().await.is_ok(), "channel continues after lag");

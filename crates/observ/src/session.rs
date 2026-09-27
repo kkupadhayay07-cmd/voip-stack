@@ -85,7 +85,9 @@ pub fn call_id_of_bytes(bytes: &[u8]) -> Option<String> {
             .unwrap_or(head.len());
         let line = &head[pos..end];
         if let Some(colon) = line.iter().position(|&b| b == b':') {
-            let name = String::from_utf8_lossy(&line[..colon]).trim().to_ascii_lowercase();
+            let name = String::from_utf8_lossy(&line[..colon])
+                .trim()
+                .to_ascii_lowercase();
             if name == "call-id" {
                 let val = String::from_utf8_lossy(&line[colon + 1..])
                     .trim()
@@ -108,7 +110,10 @@ pub fn sip_tap(bytes: &[u8], peer: SocketAddr, transport: Transport, rx: bool) {
     }
     let redacted = redact_sip(bytes);
     let call_id = call_id_of_bytes(&redacted).unwrap_or_default();
-    let peer = Peer { addr: peer, transport };
+    let peer = Peer {
+        addr: peer,
+        transport,
+    };
     bus::emit(Event {
         ts_ms: crate::event::now_ms(),
         call_id,
@@ -116,23 +121,24 @@ pub fn sip_tap(bytes: &[u8], peer: SocketAddr, transport: Transport, rx: bool) {
         direction: None,
         leg: Leg::Core,
         kind: if rx {
-            EventKind::SipRx { peer, bytes: redacted, plaintext: true }
+            EventKind::SipRx {
+                peer,
+                bytes: redacted,
+                plaintext: true,
+            }
         } else {
-            EventKind::SipTx { peer, bytes: redacted, plaintext: true }
+            EventKind::SipTx {
+                peer,
+                bytes: redacted,
+                plaintext: true,
+            }
         },
     });
 }
 
 /// Media tap: emits RtpRx/RtpTx for one datagram (valid RTP only).
 #[allow(clippy::too_many_arguments)]
-pub fn rtp_tap(
-    call_id: &str,
-    leg: Leg,
-    src: SocketAddr,
-    dst: SocketAddr,
-    bytes: &[u8],
-    rx: bool,
-) {
+pub fn rtp_tap(call_id: &str, leg: Leg, src: SocketAddr, dst: SocketAddr, bytes: &[u8], rx: bool) {
     if bus::global().is_none() {
         return;
     }
@@ -146,9 +152,25 @@ pub fn rtp_tap(
         direction: None,
         leg,
         kind: if rx {
-            EventKind::RtpRx { src, dst, pump_leg: leg, bytes: bytes.to_vec(), ssrc, seq, pt }
+            EventKind::RtpRx {
+                src,
+                dst,
+                pump_leg: leg,
+                bytes: bytes.to_vec(),
+                ssrc,
+                seq,
+                pt,
+            }
         } else {
-            EventKind::RtpTx { src, dst, pump_leg: leg, bytes: bytes.to_vec(), ssrc, seq, pt }
+            EventKind::RtpTx {
+                src,
+                dst,
+                pump_leg: leg,
+                bytes: bytes.to_vec(),
+                ssrc,
+                seq,
+                pt,
+            }
         },
     });
 }
@@ -178,8 +200,20 @@ mod tests {
         // No install_global in this process (tests run in parallel in one
         // process, so the global may exist from another test — either way
         // these must not panic).
-        sip_tap(b"OPTIONS sip:x SIP/2.0\r\n\r\n", "127.0.0.1:1".parse().unwrap(), Transport::Udp, true);
-        rtp_tap("c", Leg::A, "127.0.0.1:1".parse().unwrap(), "127.0.0.1:2".parse().unwrap(), &[0u8; 12], true);
+        sip_tap(
+            b"OPTIONS sip:x SIP/2.0\r\n\r\n",
+            "127.0.0.1:1".parse().unwrap(),
+            Transport::Udp,
+            true,
+        );
+        rtp_tap(
+            "c",
+            Leg::A,
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+            &[0u8; 12],
+            true,
+        );
         emit_for("c", EventKind::Vad { state: "s".into() });
     }
 }

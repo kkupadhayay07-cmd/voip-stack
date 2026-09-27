@@ -125,14 +125,19 @@ fn invite_client_retransmits_at_exact_doubling_instants() {
 
     // Fires at 500, 1500, 3500, 7500, 15500, 31500 (doubled intervals).
     for fire in [500u64, 1500, 3500, 7500, 15500, 31500] {
-        assert_eq!(tx.next_deadline(), Some(c.at(fire)), "deadline before {fire}");
+        assert_eq!(
+            tx.next_deadline(),
+            Some(c.at(fire)),
+            "deadline before {fire}"
+        );
         assert_send_request(&tx.on_event(TxEvent::Timeout, c.at(fire)), 1);
     }
     // Timer B (64·T1 = 32 s) is the next and final deadline.
     assert_eq!(tx.next_deadline(), Some(c.at(32_000)));
-    assert_eq!(tx.on_event(TxEvent::Timeout, c.at(32_000)), vec![
-        TxAction::DeleteTransaction
-    ]);
+    assert_eq!(
+        tx.on_event(TxEvent::Timeout, c.at(32_000)),
+        vec![TxAction::DeleteTransaction]
+    );
     assert_eq!(tx.state(), TxState::Terminated);
     assert_eq!(tx.next_deadline(), None);
 }
@@ -151,7 +156,11 @@ fn invite_client_200_at_10s_terminates_and_schedules_timer_d() {
     );
     assert_pass_to_tu(&actions, 200);
     assert_eq!(tx.state(), TxState::Terminated);
-    assert_eq!(tx.next_deadline(), Some(c.at(42_000)), "10s + Timer D (32s)");
+    assert_eq!(
+        tx.next_deadline(),
+        Some(c.at(42_000)),
+        "10s + Timer D (32s)"
+    );
     // Retransmission timers are gone: a stray Timeout before Timer D is inert.
     assert!(tx.on_event(TxEvent::Timeout, c.at(11_000)).is_empty());
     assert_eq!(
@@ -305,7 +314,9 @@ fn wrong_branch_response_ignored() {
     let mut via = invite.headers.first_via().unwrap();
     via.branch = Some(OTHER_BRANCH.to_string());
     other.headers.add("Via", via.to_string());
-    assert!(stx.on_event(TxEvent::ReceivedRequest(other), c.at(100)).is_empty());
+    assert!(stx
+        .on_event(TxEvent::ReceivedRequest(other), c.at(100))
+        .is_empty());
 }
 
 // 8. A response with the wrong CSeq (method or number) is ignored.
@@ -347,7 +358,9 @@ fn ack_for_2xx_does_not_match_invite_tx() {
         crate::matching::ack_matches_invite(&ack, &invite),
         "branch-level match is true — termination is what stops the machine"
     );
-    assert!(tx.on_event(TxEvent::ReceivedRequest(ack), c.at(100)).is_empty());
+    assert!(tx
+        .on_event(TxEvent::ReceivedRequest(ack), c.at(100))
+        .is_empty());
     assert_eq!(tx.state(), TxState::Terminated);
     assert_eq!(tx.next_deadline(), None);
 }
@@ -400,7 +413,10 @@ fn fake_clock_full_invite_client_timeline_exact_instants() {
 
     // The generated ACK carries the INVITE's branch so the server matches it.
     if let TxAction::SendRequest(ack) = &actions[0] {
-        assert_eq!(ack.headers.first_via().and_then(|v| v.branch).as_deref(), Some(BRANCH));
+        assert_eq!(
+            ack.headers.first_via().and_then(|v| v.branch).as_deref(),
+            Some(BRANCH)
+        );
         assert_eq!(ack.headers.cseq().map(|cs| cs.seq), Some(1));
     }
     // Timer D fires exactly at 37 s → release.
@@ -429,7 +445,10 @@ fn reliable_transport_has_no_retransmit_timers() {
         matches!(&actions[1], TxAction::SendRequest(r) if r.method == Method::Ack),
         "client transaction generates the ACK itself"
     );
-    assert!(actions.contains(&TxAction::DeleteTransaction), "Timer D = 0");
+    assert!(
+        actions.contains(&TxAction::DeleteTransaction),
+        "Timer D = 0"
+    );
     assert_eq!(tx.next_deadline(), None);
 
     // Server INVITE over TCP: no Timer G; the ACK ends the transaction at once.
@@ -437,7 +456,10 @@ fn reliable_transport_has_no_retransmit_timers() {
     let mut stx = ServerInviteTx::new(invite.clone(), Transport::Tls);
     stx.stage(resp_for(&invite, 486, BRANCH, Some("t")));
     stx.on_event(TxEvent::Send, c.at(0));
-    assert!(stx.next_deadline().is_some(), "Timer H still guards Completed");
+    assert!(
+        stx.next_deadline().is_some(),
+        "Timer H still guards Completed"
+    );
     stx.on_event(TxEvent::ReceivedRequest(ack_for(&invite)), c.at(200));
     assert!(stx.is_confirmed());
     assert_eq!(stx.state(), TxState::Terminated, "Timer I = 0 on TCP");

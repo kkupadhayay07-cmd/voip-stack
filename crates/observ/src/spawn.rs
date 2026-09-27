@@ -49,7 +49,8 @@ pub fn spawn_writers(bus: Arc<EventBus>, cfg: WriterConfig) -> Vec<tokio::task::
                     let status = status.clone();
                     let include_payload = cfg.include_payload;
                     handles.push(tokio::spawn(async move {
-                        pcap_task(rx, &mut w, sip_payload_len, include_payload, &status, true).await;
+                        pcap_task(rx, &mut w, sip_payload_len, include_payload, &status, true)
+                            .await;
                     }));
                 }
                 Err(e) => tracing::error!("observ: cannot open {}: {e}", path.display()),
@@ -64,7 +65,8 @@ pub fn spawn_writers(bus: Arc<EventBus>, cfg: WriterConfig) -> Vec<tokio::task::
                     let status = status.clone();
                     let include_payload = cfg.include_payload;
                     handles.push(tokio::spawn(async move {
-                        pcap_task(rx, &mut w, rtp_payload_len, include_payload, &status, false).await;
+                        pcap_task(rx, &mut w, rtp_payload_len, include_payload, &status, false)
+                            .await;
                     }));
                 }
                 Err(e) => tracing::error!("observ: cannot open {}: {e}", path.display()),
@@ -129,10 +131,18 @@ async fn pcap_task(
         match rx.recv().await {
             Ok(ev) => {
                 let (src, dst, bytes, ts_ms) = match &ev.kind {
-                    EventKind::SipRx { peer, bytes, .. } if sip => (peer.addr, peer.addr, bytes, ev.ts_ms),
-                    EventKind::SipTx { peer, bytes, .. } if sip => (peer.addr, peer.addr, bytes, ev.ts_ms),
-                    EventKind::RtpRx { src, dst, bytes, .. } if !sip => (*src, *dst, bytes, ev.ts_ms),
-                    EventKind::RtpTx { src, dst, bytes, .. } if !sip => (*src, *dst, bytes, ev.ts_ms),
+                    EventKind::SipRx { peer, bytes, .. } if sip => {
+                        (peer.addr, peer.addr, bytes, ev.ts_ms)
+                    }
+                    EventKind::SipTx { peer, bytes, .. } if sip => {
+                        (peer.addr, peer.addr, bytes, ev.ts_ms)
+                    }
+                    EventKind::RtpRx {
+                        src, dst, bytes, ..
+                    } if !sip => (*src, *dst, bytes, ev.ts_ms),
+                    EventKind::RtpTx {
+                        src, dst, bytes, ..
+                    } if !sip => (*src, *dst, bytes, ev.ts_ms),
                     _ => continue,
                 };
                 let kept = if include_payload {
@@ -191,20 +201,29 @@ mod tests {
         let hs = spawn_writers(bus.clone(), cfg);
         assert_eq!(hs.len(), 3, "sip pcap + rtp pcap + trace");
 
-        bus.publish(Event::now("cx", EventKind::SipRx {
-            peer: Peer { addr: "127.0.0.1:5060".parse().unwrap(), transport: Transport::Udp },
-            bytes: b"INVITE sip:1000@x SIP/2.0\r\nCall-ID: cx\r\n\r\n".to_vec(),
-            plaintext: true,
-        }));
-        bus.publish(Event::now("cx", EventKind::RtpRx {
-            src: "127.0.0.1:40000".parse().unwrap(),
-            dst: "127.0.0.1:40002".parse().unwrap(),
-            pump_leg: crate::event::Leg::A,
-            bytes: vec![0x80, 0, 0, 1, 0, 0, 0, 1, 1, 2, 3, 4, 0xaa],
-            ssrc: 0x01020304,
-            seq: 1,
-            pt: 0,
-        }));
+        bus.publish(Event::now(
+            "cx",
+            EventKind::SipRx {
+                peer: Peer {
+                    addr: "127.0.0.1:5060".parse().unwrap(),
+                    transport: Transport::Udp,
+                },
+                bytes: b"INVITE sip:1000@x SIP/2.0\r\nCall-ID: cx\r\n\r\n".to_vec(),
+                plaintext: true,
+            },
+        ));
+        bus.publish(Event::now(
+            "cx",
+            EventKind::RtpRx {
+                src: "127.0.0.1:40000".parse().unwrap(),
+                dst: "127.0.0.1:40002".parse().unwrap(),
+                pump_leg: crate::event::Leg::A,
+                bytes: vec![0x80, 0, 0, 1, 0, 0, 0, 1, 1, 2, 3, 4, 0xaa],
+                ssrc: 0x01020304,
+                seq: 1,
+                pt: 0,
+            },
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         let sip = crate::pcap_sink::read_frames(&dir.join("sip.pcap")).unwrap();
@@ -215,18 +234,31 @@ mod tests {
         assert_eq!(rtp[0].payload.len(), 13);
         // trace jsonl only got the SIP event; the RTP packet went to the
         // rtp.pcap writer alone (per-packet media never reaches the trace)
-        let jsonl: String = std::fs::read_dir(&dir).unwrap()
+        let jsonl: String = std::fs::read_dir(&dir)
+            .unwrap()
             .filter_map(|e| e.ok())
-            .find(|e| e.file_name().to_string_lossy().starts_with("trace-")
-                && e.file_name().to_string_lossy().ends_with(".jsonl"))
+            .find(|e| {
+                e.file_name().to_string_lossy().starts_with("trace-")
+                    && e.file_name().to_string_lossy().ends_with(".jsonl")
+            })
             .map(|e| std::fs::read_to_string(e.path()).unwrap())
             .expect("trace jsonl exists");
-        assert_eq!(jsonl.lines().count(), 1, "RTP packets must stay out of the trace: {jsonl}");
+        assert_eq!(
+            jsonl.lines().count(),
+            1,
+            "RTP packets must stay out of the trace: {jsonl}"
+        );
         assert!(jsonl.contains("\"kind\":\"sip_rx\""), "{jsonl}");
-        let files: Vec<_> = std::fs::read_dir(&dir).unwrap()
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
             .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
             .collect();
-        assert!(files.iter().any(|f| f.starts_with("trace-") && f.ends_with(".jsonl")), "{files:?}");
+        assert!(
+            files
+                .iter()
+                .any(|f| f.starts_with("trace-") && f.ends_with(".jsonl")),
+            "{files:?}"
+        );
         assert!(files.iter().any(|f| f == "status.json"), "{files:?}");
     }
 }

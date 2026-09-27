@@ -458,7 +458,11 @@ i: folded\n\tcontinuation\r\nt: <sip:a@b>\r\nl: 0\r\n\r\n";
         wire.extend_from_slice(INVITE);
         let (msg, used) = parse_stream(&wire).unwrap();
         assert_eq!(msg.method(), Some(Method::Invite));
-        assert_eq!(used, wire.len(), "consumed count includes the keepalive CRLFs");
+        assert_eq!(
+            used,
+            wire.len(),
+            "consumed count includes the keepalive CRLFs"
+        );
         // Datagram framing (UDP) tolerates leading CRLFs the same way.
         assert!(parse_message(&wire).is_ok());
     }
@@ -491,8 +495,7 @@ i: folded\n\tcontinuation\r\nt: <sip:a@b>\r\nl: 0\r\n\r\n";
     #[test]
     fn stream_survives_utf8_split_across_segments() {
         // body = "café" (é = 0xC3 0xA9), Content-Length: 5
-        let wire =
-            b"MESSAGE sip:a@b SIP/2.0\r\nVia: SIP/2.0/TCP h;branch=z9hG4bK1\r\n\
+        let wire = b"MESSAGE sip:a@b SIP/2.0\r\nVia: SIP/2.0/TCP h;branch=z9hG4bK1\r\n\
 Call-ID: u8@x\r\nCSeq: 1 MESSAGE\r\nContent-Type: text/plain\r\n\
 Content-Length: 5\r\n\r\ncaf\xC3\xA9";
         let split = wire.len() - 1; // cut between 0xC3 and 0xA9
@@ -542,7 +545,10 @@ Call-ID: big@x\r\nCSeq: 1 MESSAGE\r\nContent-Length: 999999999\r\n\r\nshort";
         assert_eq!(used2, rest.len());
         // A keepalive-only remainder is Truncated (nothing to parse), not
         // an error.
-        assert!(matches!(parse_stream(b"\r\n"), Err(ParseError::Truncated { .. })));
+        assert!(matches!(
+            parse_stream(b"\r\n"),
+            Err(ParseError::Truncated { .. })
+        ));
     }
 
     /// Invalid UTF-8 inside the header section is still a real error (only

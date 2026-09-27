@@ -202,7 +202,8 @@ impl TrunkAuth for DigestAuth {
         if let Some(c) = &mut g.creds {
             c.nc = c.nc.wrapping_add(1);
             let value = Self::render(c, &self.user, &self.pass, "OPTIONS", &ctx.uri);
-            ctx.headers.push(("Authorization".to_string(), value.to_string()));
+            ctx.headers
+                .push(("Authorization".to_string(), value.to_string()));
         }
     }
 }

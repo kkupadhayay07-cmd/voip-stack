@@ -11,11 +11,11 @@ use std::sync::Arc;
 use ai_bridge::{AiEvent, AiSession};
 use codecs::{CodecId, Registry, Resampler};
 use rtp::packet::RtpPacket;
+use sdp::negotiate::stream_plans;
 use sip_core::builder::respond_to;
 use sip_core::ids::new_tag;
 use sip_core::message::{Method, Request, SipMessage};
 use sip_core::serialize;
-use sdp::negotiate::stream_plans;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 
@@ -63,8 +63,16 @@ pub async fn run(bind: SocketAddr, host: String, ai_enabled: bool) -> Result<(),
         let call_id = req.headers.call_id().unwrap_or("").to_string();
         match req.method {
             Method::Invite => {
-                handle_invite(sip.as_ref(), &req, src, call_id, &host, ai_enabled, &mut calls)
-                    .await;
+                handle_invite(
+                    sip.as_ref(),
+                    &req,
+                    src,
+                    call_id,
+                    &host,
+                    ai_enabled,
+                    &mut calls,
+                )
+                .await;
             }
             Method::Ack => {
                 // Media already flowing (the RTP task starts with the 200).
@@ -111,9 +119,14 @@ async fn handle_invite(
     // Retransmission: resend the cached 200.
     if let Some(c) = calls.get(&call_id) {
         if c.remote_sip == src {
-            let mut ok = respond_to(req, 200, "OK", c.answer_sdp.clone().into_bytes(), Some(&c.tag));
-            ok.headers
-                .add("Contact", format!("<sip:sink@{src}>"));
+            let mut ok = respond_to(
+                req,
+                200,
+                "OK",
+                c.answer_sdp.clone().into_bytes(),
+                Some(&c.tag),
+            );
+            ok.headers.add("Contact", format!("<sip:sink@{src}>"));
             let _ = sip
                 .send_to(&serialize(&SipMessage::Response(ok)), src)
                 .await;
@@ -200,24 +213,21 @@ async fn rtp_tap(
     ai_enabled: bool,
     mut stop: watch::Receiver<bool>,
 ) {
-    let mut dec = codec
-        .and_then(|id| {
-            let rate = match id {
-                CodecId::G722 => 16_000,
-                CodecId::Opus => 48_000,
-                _ => 8_000,
-            };
-            Registry::decoder(id, rate, 1).ok().map(|d| (d, rate))
-        });
-    let mut resampler = dec
-        .as_ref()
-        .and_then(|(_, rate)| {
-            if *rate == 16_000 {
-                None
-            } else {
-                Resampler::new(*rate, 16_000, 1).ok()
-            }
-        });
+    let mut dec = codec.and_then(|id| {
+        let rate = match id {
+            CodecId::G722 => 16_000,
+            CodecId::Opus => 48_000,
+            _ => 8_000,
+        };
+        Registry::decoder(id, rate, 1).ok().map(|d| (d, rate))
+    });
+    let mut resampler = dec.as_ref().and_then(|(_, rate)| {
+        if *rate == 16_000 {
+            None
+        } else {
+            Resampler::new(*rate, 16_000, 1).ok()
+        }
+    });
     let mut ai = if ai_enabled {
         let (s, ev) = AiSession::new(&call_id);
         Some((s, ev))

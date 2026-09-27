@@ -11,8 +11,8 @@ use sip_core::builder::RequestBuilder;
 use sip_core::ids::{new_branch, new_call_id, new_tag};
 use sip_core::message::{Method, Response, SipMessage};
 use sip_core::parse::{parse_message, parse_stream};
-use sip_core::{serialize, ParseError};
 use sip_core::uri::{SipUri, TransportKind};
+use sip_core::{serialize, ParseError};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{timeout, Instant};
 
@@ -108,8 +108,14 @@ impl Link {
                 .await
                 .map(|_| ())
                 .map_err(|e| format!("udp send: {e}")),
-            Link::Tcp(s) => s.write_all(bytes).await.map_err(|e| format!("tcp send: {e}")),
-            Link::Tls(s) => s.write_all(bytes).await.map_err(|e| format!("tls send: {e}")),
+            Link::Tcp(s) => s
+                .write_all(bytes)
+                .await
+                .map_err(|e| format!("tcp send: {e}")),
+            Link::Tls(s) => s
+                .write_all(bytes)
+                .await
+                .map_err(|e| format!("tls send: {e}")),
             Link::Ws(s) => s
                 .send(Message::Binary(bytes.to_vec()))
                 .await
@@ -182,12 +188,16 @@ impl Session {
                 (Link::Udp(s), false, None)
             }
             Transport::Tcp => {
-                let s = TcpStream::connect(target).await.map_err(|e| e.to_string())?;
+                let s = TcpStream::connect(target)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let local = s.local_addr().ok();
                 (Link::Tcp(s), true, local)
             }
             Transport::Tls => {
-                let s = TcpStream::connect(target).await.map_err(|e| e.to_string())?;
+                let s = TcpStream::connect(target)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let local = s.local_addr().ok();
                 let connector = match &opts.tls_identity {
                     Some(id) => crate::tls::client_connector_with_identity(id)?,
@@ -197,7 +207,9 @@ impl Session {
                 (Link::Tls(tls), true, local)
             }
             Transport::Wss => {
-                let s = TcpStream::connect(target).await.map_err(|e| e.to_string())?;
+                let s = TcpStream::connect(target)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let local = s.local_addr().ok();
                 let connector = match &opts.tls_identity {
                     Some(id) => crate::tls::client_connector_with_identity(id)?,
@@ -209,10 +221,9 @@ impl Session {
                 let req = format!("wss://{}/sip", target)
                     .into_client_request()
                     .map_err(|e| format!("ws request: {e}"))?;
-                let (ws, _resp) =
-                    tokio_tungstenite::client_async(req, tls)
-                        .await
-                        .map_err(|e| format!("ws handshake: {e}"))?;
+                let (ws, _resp) = tokio_tungstenite::client_async(req, tls)
+                    .await
+                    .map_err(|e| format!("ws handshake: {e}"))?;
                 (Link::Ws(Box::new(ws)), true, local)
             }
         };
@@ -283,14 +294,14 @@ async fn probe(sess: &mut Session, opts: &UacOpts) -> Result<(), String> {
         Method::Options,
         SipUri::parse(&opts.to).map_err(|e| e.to_string())?,
     )
-        .via(opts.transport.kind(), &sess.via(), Some(&new_branch()))
-        .from(&format!("<{}>;tag={}", opts.from, new_tag()))
-        .to(&format!("<{}>", opts.to))
-        .call_id(Some(&new_call_id("zrtc-probe")))
-        .cseq(1)
-        .contact(&format!("<sip:probe@{}>", sess.via()))
-        .header("Max-Forwards", "70")
-        .build();
+    .via(opts.transport.kind(), &sess.via(), Some(&new_branch()))
+    .from(&format!("<{}>;tag={}", opts.from, new_tag()))
+    .to(&format!("<{}>", opts.to))
+    .call_id(Some(&new_call_id("zrtc-probe")))
+    .cseq(1)
+    .contact(&format!("<sip:probe@{}>", sess.via()))
+    .header("Max-Forwards", "70")
+    .build();
     sess.send_msg(&SipMessage::Request(options)).await?;
     loop {
         match sess.recv_msg().await? {
@@ -318,16 +329,16 @@ async fn place_call(sess: &mut Session, opts: &UacOpts) -> Result<(), String> {
         Method::Invite,
         SipUri::parse(&opts.to).map_err(|e| e.to_string())?,
     )
-        .via(opts.transport.kind(), &sess.via(), Some(&new_branch()))
-        .from(&format!("<{}>;tag={}", opts.from, new_tag()))
-        .to(&format!("<{}>", opts.to))
-        .call_id(Some(&opts.call_id))
-        .cseq(1)
-        .contact(&format!("<sip:demo@{}>", sess.via()))
-        .header("Max-Forwards", "70")
-        .header("Allow", "INVITE, ACK, BYE, CANCEL, OPTIONS")
-        .body("application/sdp", offer.serialize().into_bytes())
-        .build();
+    .via(opts.transport.kind(), &sess.via(), Some(&new_branch()))
+    .from(&format!("<{}>;tag={}", opts.from, new_tag()))
+    .to(&format!("<{}>", opts.to))
+    .call_id(Some(&opts.call_id))
+    .cseq(1)
+    .contact(&format!("<sip:demo@{}>", sess.via()))
+    .header("Max-Forwards", "70")
+    .header("Allow", "INVITE, ACK, BYE, CANCEL, OPTIONS")
+    .body("application/sdp", offer.serialize().into_bytes())
+    .build();
     tracing::info!(call_id = %opts.call_id, transport = ?opts.transport, "uac: INVITE -> {}", opts.target);
     sess.send_msg(&SipMessage::Request(invite)).await?;
 
@@ -358,12 +369,12 @@ async fn place_call(sess: &mut Session, opts: &UacOpts) -> Result<(), String> {
         Method::Ack,
         SipUri::parse(&opts.to).map_err(|e| e.to_string())?,
     )
-        .via(opts.transport.kind(), &sess.via(), Some(&new_branch()))
-        .from(&format!("<{}>;tag={}", opts.from, from_tag_of(&ok)))
-        .to(&format!("<{}>;tag={remote_tag}", opts.to))
-        .call_id(Some(&opts.call_id))
-        .cseq(1)
-        .build();
+    .via(opts.transport.kind(), &sess.via(), Some(&new_branch()))
+    .from(&format!("<{}>;tag={}", opts.from, from_tag_of(&ok)))
+    .to(&format!("<{}>;tag={remote_tag}", opts.to))
+    .call_id(Some(&opts.call_id))
+    .cseq(1)
+    .build();
     sess.send_msg(&SipMessage::Request(ack)).await?;
 
     // Paced RTP: 20 ms PCMU frames, 440 Hz tone.
@@ -385,17 +396,12 @@ async fn place_call(sess: &mut Session, opts: &UacOpts) -> Result<(), String> {
         ticker.tick().await;
         let mut wire = Vec::with_capacity(200);
         enc.encode(frame, &mut wire).map_err(|e| e.to_string())?;
-        let pkt = RtpPacket::new(
-            0,
-            seq,
-            ts,
-            ssrc,
-            false,
-            bytes::Bytes::from(wire),
-        );
+        let pkt = RtpPacket::new(0, seq, ts, ssrc, false, bytes::Bytes::from(wire));
         seq = seq.wrapping_add(1);
         ts = ts.wrapping_add(160);
-        rtp.send_to(&pkt.encode(), dst).await.map_err(|e| e.to_string())?;
+        rtp.send_to(&pkt.encode(), dst)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     tracing::info!(call_id = %opts.call_id, "uac: sent {} frames of RTP", samples.div_ceil(160));
 
@@ -407,12 +413,12 @@ async fn place_call(sess: &mut Session, opts: &UacOpts) -> Result<(), String> {
         Method::Bye,
         SipUri::parse(&opts.to).map_err(|e| e.to_string())?,
     )
-        .via(opts.transport.kind(), &sess.via(), Some(&new_branch()))
-        .from(&format!("<{}>;tag={}", opts.from, from_tag_of(&ok)))
-        .to(&format!("<{}>;tag={remote_tag}", opts.to))
-        .call_id(Some(&opts.call_id))
-        .cseq(2)
-        .build();
+    .via(opts.transport.kind(), &sess.via(), Some(&new_branch()))
+    .from(&format!("<{}>;tag={}", opts.from, from_tag_of(&ok)))
+    .to(&format!("<{}>;tag={remote_tag}", opts.to))
+    .call_id(Some(&opts.call_id))
+    .cseq(2)
+    .build();
     sess.send_msg(&SipMessage::Request(bye)).await?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

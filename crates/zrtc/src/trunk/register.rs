@@ -37,10 +37,7 @@ pub async fn run(
     while (resp.code == 401 || resp.code == 407) && rounds < MAX_CHALLENGE_ROUNDS {
         rounds += 1;
         let www = resp.headers.get("WWW-Authenticate").map(str::to_string);
-        let proxy = resp
-            .headers
-            .get("Proxy-Authenticate")
-            .map(str::to_string);
+        let proxy = resp.headers.get("Proxy-Authenticate").map(str::to_string);
         // Log the raw challenge (never a credential).
         let raw = if resp.code == 407 {
             proxy.as_deref().or(www.as_deref())

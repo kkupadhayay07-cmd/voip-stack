@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use b2bua::{CdrEvent, Side};
-use cdr::{CallRecordBuilder, CallRecord, CdrStore, Direction, MediaStats};
+use cdr::{CallRecord, CallRecordBuilder, CdrStore, Direction, MediaStats};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::core::OutboundIds;
@@ -98,7 +98,11 @@ fn build_record(
     concealed: u64,
 ) -> CallRecord {
     let talk_secs = duration_ms / 1000;
-    let (code, canceled) = if st.answered { (200u16, false) } else { (487, false) };
+    let (code, canceled) = if st.answered {
+        (200u16, false)
+    } else {
+        (487, false)
+    };
     let mut rec = CallRecordBuilder::new(direction, &st.from, &st.to)
         .a_call_id(call_id)
         .correlate("frames_a_to_b", &frames_a_to_b.to_string())

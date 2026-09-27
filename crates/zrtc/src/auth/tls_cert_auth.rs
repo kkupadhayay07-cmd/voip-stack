@@ -37,7 +37,8 @@ impl TlsCertAuth {
                 .map_err(|e| format!("trunk {label} \"{path}\" is not readable: {e}"))?;
         }
         if let Some(ca) = cfg.tls_ca_path.as_deref() {
-            std::fs::read(ca).map_err(|e| format!("trunk tls_ca_path \"{ca}\" is not readable: {e}"))?;
+            std::fs::read(ca)
+                .map_err(|e| format!("trunk tls_ca_path \"{ca}\" is not readable: {e}"))?;
         }
         Ok(TlsCertAuth)
     }

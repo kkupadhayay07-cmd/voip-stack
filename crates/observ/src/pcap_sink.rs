@@ -103,7 +103,8 @@ impl PcapWriter {
         // --- UDP (8 B), checksum 0 ("not computed", legal over IPv4) ---
         self.w.write_all(&src_port.to_be_bytes())?;
         self.w.write_all(&dst_port.to_be_bytes())?;
-        self.w.write_all(&(8 + payload.len() as u16).to_be_bytes())?;
+        self.w
+            .write_all(&(8 + payload.len() as u16).to_be_bytes())?;
         self.w.write_all(&0u16.to_be_bytes())?;
 
         self.w.write_all(payload)?;
@@ -125,7 +126,10 @@ impl PcapWriter {
 fn as_v4(a: SocketAddr) -> (Ipv4Addr, u16) {
     match a {
         SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
-        SocketAddr::V6(v6) => (v6.ip().to_ipv4_mapped().unwrap_or(Ipv4Addr::UNSPECIFIED), v6.port()),
+        SocketAddr::V6(v6) => (
+            v6.ip().to_ipv4_mapped().unwrap_or(Ipv4Addr::UNSPECIFIED),
+            v6.port(),
+        ),
     }
 }
 
@@ -148,8 +152,13 @@ pub struct RawFrame {
 pub fn read_frames(path: &Path) -> io::Result<Vec<RawFrame>> {
     let mut data = Vec::new();
     std::fs::File::open(path)?.read_to_end(&mut data)?;
-    if data.len() < GLOBAL_HEADER_LEN || u32::from_be_bytes([data[0], data[1], data[2], data[3]]) != PCAP_MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a classic pcap (wrong magic)"));
+    if data.len() < GLOBAL_HEADER_LEN
+        || u32::from_be_bytes([data[0], data[1], data[2], data[3]]) != PCAP_MAGIC
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a classic pcap (wrong magic)",
+        ));
     }
     let mut out = Vec::new();
     let mut pos = GLOBAL_HEADER_LEN;
@@ -211,8 +220,15 @@ mod tests {
         let payload = b"INVITE sip:1000@x SIP/2.0\r\n\r\n";
         {
             let mut w = PcapWriter::create(&path, 64 * 1024).unwrap();
-            w.write_udp(1_700_000_000_000_123, src, dst, payload).unwrap();
-            w.write_udp(1_700_000_000_100_000, dst, src, b"\x80\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x01payload").unwrap();
+            w.write_udp(1_700_000_000_000_123, src, dst, payload)
+                .unwrap();
+            w.write_udp(
+                1_700_000_000_100_000,
+                dst,
+                src,
+                b"\x80\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x01payload",
+            )
+            .unwrap();
             w.flush();
             assert_eq!(w.stats().0, 2);
             assert!(!w.stopped);
@@ -253,8 +269,20 @@ mod tests {
         let path = dir.join("t.pcap");
         let mut w = PcapWriter::create(&path, 500).unwrap();
         let big = vec![0u8; 400];
-        w.write_udp(1, "127.0.0.1:1".parse().unwrap(), "127.0.0.1:2".parse().unwrap(), &big).unwrap();
-        w.write_udp(2, "127.0.0.1:1".parse().unwrap(), "127.0.0.1:2".parse().unwrap(), &big).unwrap();
+        w.write_udp(
+            1,
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+            &big,
+        )
+        .unwrap();
+        w.write_udp(
+            2,
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+            &big,
+        )
+        .unwrap();
         assert!(w.stopped, "cap reached after exceeding max bytes");
         assert_eq!(w.stats().0, 1, "post-cap packets dropped");
         std::fs::remove_dir_all(&dir).ok();

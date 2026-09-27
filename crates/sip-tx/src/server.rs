@@ -131,10 +131,7 @@ impl ServerInviteTx {
             // The INVITE server transaction ends with the 2xx: the ACK for
             // a 2xx is a separate, dialog-level transaction (§17.2.1).
             self.terminate();
-            return vec![
-                TxAction::SendResponse(resp),
-                TxAction::DeleteTransaction,
-            ];
+            return vec![TxAction::SendResponse(resp), TxAction::DeleteTransaction];
         }
         // Non-2xx final: Completed, Timer G (unreliable) + Timer H.
         self.final_resp = Some(resp.clone());
@@ -334,10 +331,7 @@ impl ServerNonInviteTx {
         self.final_resp = Some(resp.clone());
         self.state = TxState::Completed;
         if self.transport.is_reliable() {
-            return vec![
-                TxAction::SendResponse(resp),
-                TxAction::DeleteTransaction,
-            ];
+            return vec![TxAction::SendResponse(resp), TxAction::DeleteTransaction];
         }
         self.timer_j = Some(add(now, self.cfg.timer_j()));
         vec![TxAction::SendResponse(resp)]

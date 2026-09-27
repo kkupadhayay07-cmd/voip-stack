@@ -36,13 +36,15 @@ pub async fn run(cfg: &Config, e164: &str, rtp_ms: u64) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     let rtp_port = rtp.local_addr().map(|a| a.port()).unwrap_or(0);
-    let offer = sdp_util::build_offer(&ep.host(), rtp_port, &[CodecId::Pcmu], rand::random())
-        .serialize();
+    let offer =
+        sdp_util::build_offer(&ep.host(), rtp_port, &[CodecId::Pcmu], rand::random()).serialize();
 
     // ---- INVITE #1: auth signs (bearer attaches, digest records ctx) ----
     let mut extra: Vec<(String, String)> = Vec::new();
     auth_boxed.sign_request(Method::Invite, &ruri, &mut extra);
-    let invite = invite_request(&ep, &mut sess, &ruri, 1, &call_id, &from_tag, &extra, &offer)?;
+    let invite = invite_request(
+        &ep, &mut sess, &ruri, 1, &call_id, &from_tag, &extra, &offer,
+    )?;
 
     // INVITE first line + key headers (none of these are secrets).
     tracing::info!("trunk INVITE {ruri} SIP/2.0");
@@ -113,10 +115,12 @@ pub async fn run(cfg: &Config, e164: &str, rtp_ms: u64) -> Result<(), String> {
                     }
                 }
             }
-            _c => return Err(format!(
-                "trunk INVITE rejected with {} {}",
-                resp.code, resp.reason
-            )),
+            _c => {
+                return Err(format!(
+                    "trunk INVITE rejected with {} {}",
+                    resp.code, resp.reason
+                ))
+            }
         }
     };
 
@@ -126,26 +130,32 @@ pub async fn run(cfg: &Config, e164: &str, rtp_ms: u64) -> Result<(), String> {
     tracing::info!("trunk INVITE answered 200 (answer audio port {audio_port})");
 
     // ---- ACK ---------------------------------------------------------------
-    let ack = RequestBuilder::new(Method::Ack, SipUri::parse(&ruri).map_err(|e| e.to_string())?)
-        .via(ep.transport.kind(), &sess.via(), Some(&new_branch()))
-        .from(&format!("<{}>;tag={from_tag}", ep.aor))
-        .to(&format!("<{ruri}>;tag={remote_tag}"))
-        .call_id(Some(&call_id))
-        .cseq(cseq)
-        .build();
+    let ack = RequestBuilder::new(
+        Method::Ack,
+        SipUri::parse(&ruri).map_err(|e| e.to_string())?,
+    )
+    .via(ep.transport.kind(), &sess.via(), Some(&new_branch()))
+    .from(&format!("<{}>;tag={from_tag}", ep.aor))
+    .to(&format!("<{ruri}>;tag={remote_tag}"))
+    .call_id(Some(&call_id))
+    .cseq(cseq)
+    .build();
     sess.send_msg(&SipMessage::Request(ack)).await?;
 
     // ---- paced RTP (20 ms PCMU tone), then BYE -----------------------------
     send_rtp(&rtp, rtp_ms, SocketAddr::new(ep.target.ip(), audio_port)).await?;
     tokio::time::sleep(Duration::from_millis(600)).await;
 
-    let bye = RequestBuilder::new(Method::Bye, SipUri::parse(&ruri).map_err(|e| e.to_string())?)
-        .via(ep.transport.kind(), &sess.via(), Some(&new_branch()))
-        .from(&format!("<{}>;tag={from_tag}", ep.aor))
-        .to(&format!("<{ruri}>;tag={remote_tag}"))
-        .call_id(Some(&call_id))
-        .cseq(cseq + 1)
-        .build();
+    let bye = RequestBuilder::new(
+        Method::Bye,
+        SipUri::parse(&ruri).map_err(|e| e.to_string())?,
+    )
+    .via(ep.transport.kind(), &sess.via(), Some(&new_branch()))
+    .from(&format!("<{}>;tag={from_tag}", ep.aor))
+    .to(&format!("<{ruri}>;tag={remote_tag}"))
+    .call_id(Some(&call_id))
+    .cseq(cseq + 1)
+    .build();
     sess.send_msg(&SipMessage::Request(bye)).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -175,16 +185,19 @@ fn invite_request(
     extra: &[(String, String)],
     offer: &str,
 ) -> Result<sip_core::message::Request, String> {
-    let mut b = RequestBuilder::new(Method::Invite, SipUri::parse(ruri).map_err(|e| e.to_string())?)
-        .via(ep.transport.kind(), &sess.via(), Some(&new_branch()))
-        .from(&format!("<{}>;tag={from_tag}", ep.aor))
-        .to(&format!("<{ruri}>"))
-        .call_id(Some(call_id))
-        .cseq(cseq)
-        .contact(&format!("<{}>", ep.contact))
-        .header("Max-Forwards", "70")
-        .header("Allow", "INVITE, ACK, BYE, CANCEL, OPTIONS")
-        .body("application/sdp", offer.as_bytes().to_vec());
+    let mut b = RequestBuilder::new(
+        Method::Invite,
+        SipUri::parse(ruri).map_err(|e| e.to_string())?,
+    )
+    .via(ep.transport.kind(), &sess.via(), Some(&new_branch()))
+    .from(&format!("<{}>;tag={from_tag}", ep.aor))
+    .to(&format!("<{ruri}>"))
+    .call_id(Some(call_id))
+    .cseq(cseq)
+    .contact(&format!("<{}>", ep.contact))
+    .header("Max-Forwards", "70")
+    .header("Allow", "INVITE, ACK, BYE, CANCEL, OPTIONS")
+    .body("application/sdp", offer.as_bytes().to_vec());
     for (name, value) in extra {
         b = b.header(name, value);
     }
