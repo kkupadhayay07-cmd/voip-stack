@@ -5,6 +5,7 @@
 //!   zrtc [--config <path>]     run the daemon (config also via $ZRTC_CONFIG)
 //!   zrtc daemon [--config <path>]
 //!   zrtc uac [options]         in-repo SIP client (demo calls / probes)
+//!   zrtc call <e164> [options] place one call out the configured [trunk]
 //!
 //! UAC options:
 //!   --target HOST:PORT     listener address          (default 127.0.0.1:5060)
@@ -15,7 +16,13 @@
 //!   --rtp-ms N             RTP duration in ms        (default 1000)
 //!   --probe                OPTIONS keepalive instead of a call
 //!   --timeout-secs N       overall timeout           (default 15)
+//!
+//! Call options:
+//!   --config PATH          config with the [trunk] section
+//!   --rtp-ms N             RTP duration in ms        (default 1000)
+//!   --timeout-secs N       overall timeout           (default 15)
 
+mod auth;
 mod cdr_task;
 mod config;
 mod core;
@@ -23,6 +30,7 @@ mod daemon;
 mod sink;
 mod tls;
 mod transport;
+mod trunk;
 mod uac;
 
 use config::Config;
@@ -69,8 +77,37 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .map_err(|e| format!("runtime: {e}"))?;
             rt.block_on(uac::run(opts))
         }
+        "call" => {
+            // zrtc call <e164> [--config path] [--rtp-ms N] [--timeout-secs N]
+            let rest = &args[1..];
+            let e164 = rest
+                .iter()
+                .find(|a| !a.starts_with('-'))
+                .ok_or("usage: zrtc call <e164> [--config path]")?
+                .clone();
+            let cfg = load_config(rest)?;
+            init_tracing(&cfg.daemon.log_level);
+            let mut cfg = cfg;
+            cfg.apply_trunk_env();
+            let rtp_ms: u64 = flag_or(rest, "--rtp-ms", "1000")
+                .parse()
+                .map_err(|_| "bad --rtp-ms")?;
+            let secs: u64 = flag_or(rest, "--timeout-secs", "15")
+                .parse()
+                .map_err(|_| "bad --timeout-secs")?;
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| format!("runtime: {e}"))?;
+            rt.block_on(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(secs),
+                    trunk::call::run(&cfg, &e164, rtp_ms),
+                )
+                .await
+                .map_err(|_| format!("trunk call timed out after {secs}s"))?
+            })
+        }
         other => Err(format!(
-            "unknown subcommand '{other}' (expected daemon or uac)"
+            "unknown subcommand '{other}' (expected daemon, uac or call)"
         )),
     }
 }

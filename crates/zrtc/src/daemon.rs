@@ -32,7 +32,7 @@ use crate::config::Config;
 use crate::core::{Core, Incoming, OutboundIds, Responder};
 use crate::tls::TlsIdentity;
 use crate::transport::{self, ListenerCtx};
-use crate::uac;
+use crate::{auth, trunk, uac};
 
 /// All codecs the platform bridges (full matrix via the media pumps).
 const PLATFORM_CODECS: [CodecId; 5] = [
@@ -43,7 +43,9 @@ const PLATFORM_CODECS: [CodecId; 5] = [
     CodecId::Opus,
 ];
 
-pub async fn run(cfg: Config) -> Result<(), String> {
+pub async fn run(mut cfg: Config) -> Result<(), String> {
+    // Environment overrides win over file values; never logged.
+    cfg.apply_trunk_env();
     let host = cfg.sip.host.clone();
     let udp_bind = cfg.sip.bind_addr(cfg.sip.udp_port);
     let tcp_bind = cfg.sip.bind_addr(cfg.sip.tcp_port);
@@ -227,6 +229,37 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         });
     }
 
+    // ---- vendor trunk ------------------------------------------------------
+    if cfg.trunk.address.as_deref().is_some_and(|a| !a.is_empty()) {
+        let ep = trunk::Endpoint::from_config(&cfg)?;
+        let mut trunk_auth = auth::build(&cfg.trunk)?;
+        tracing::info!(
+            "trunk configured: {} transport={} auth={}",
+            cfg.trunk.address.as_deref().unwrap_or(""),
+            ep.transport.name(),
+            trunk_auth.mode()
+        );
+        if cfg.trunk.register {
+            // Fail fast: a trunk that cannot register is a fatal config
+            // error (the raw challenge is logged inside register::run).
+            let mut sess = trunk::connect(&ep).await?;
+            let code = trunk::register::run(
+                &mut sess,
+                &ep,
+                trunk_auth.as_mut(),
+                cfg.registrar.expires.max(300),
+            )
+            .await?;
+            tracing::info!("trunk ready (REGISTER {})", code);
+            if ep.keepalive_secs > 0 {
+                tokio::spawn(trunk::keepalive_loop(sess, ep, trunk_auth));
+            }
+        } else if ep.keepalive_secs > 0 {
+            let sess = trunk::connect(&ep).await?;
+            tokio::spawn(trunk::keepalive_loop(sess, ep, trunk_auth));
+        }
+    }
+
     // ---- one originated outbound call -------------------------------------
     if cfg.outbound.enabled {
         let listener = udp_bind;
@@ -350,9 +383,22 @@ fn build_registrar(cfg: &Config) -> Registrar {
         domain: Some(cfg.registrar.domain.clone()),
         min_expires: 30,
         max_expires: cfg.registrar.expires.max(3600),
-        require_auth: false,
+        require_auth: cfg.registrar.require_auth,
     };
-    Registrar::new(config)
+    let mut registrar = Registrar::new(config);
+    if cfg.registrar.require_auth {
+        let realm = cfg
+            .registrar
+            .auth_realm
+            .clone()
+            .unwrap_or_else(|| cfg.registrar.domain.clone());
+        let mut store = registrar::AuthStore::new(&realm);
+        let user = cfg.registrar.auth_user.as_deref().unwrap_or("1000");
+        let pass = cfg.registrar.auth_pass.as_deref().unwrap_or("1000");
+        store.add_user(user, pass);
+        registrar = registrar.with_auth(store);
+    }
+    registrar
 }
 
 /// Registers the daemon's AoR by sending a real REGISTER through the UDP

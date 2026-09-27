@@ -22,6 +22,8 @@ pub struct Config {
     #[serde(default)]
     pub outbound: Outbound,
     #[serde(default)]
+    pub trunk: Trunk,
+    #[serde(default)]
     pub ai_bridge: AiBridge,
     #[serde(default)]
     pub api: Api,
@@ -144,6 +146,17 @@ pub struct Registrar {
     pub aor: String,
     #[serde(default = "default_expires")]
     pub expires: u32,
+    /// Challenge REGISTERs with Digest (401 → credentials → 200).
+    #[serde(default)]
+    pub require_auth: bool,
+    /// Digest user/pass accepted when `require_auth` is on.
+    #[serde(default)]
+    pub auth_user: Option<String>,
+    #[serde(default)]
+    pub auth_pass: Option<String>,
+    /// Challenge realm (defaults to `domain`).
+    #[serde(default)]
+    pub auth_realm: Option<String>,
 }
 
 impl Default for Registrar {
@@ -152,6 +165,10 @@ impl Default for Registrar {
             domain: default_domain(),
             aor: default_aor(),
             expires: default_expires(),
+            require_auth: false,
+            auth_user: None,
+            auth_pass: None,
+            auth_realm: None,
         }
     }
 }
@@ -287,6 +304,80 @@ impl Default for Api {
 
 fn default_api_port() -> u16 {
     8080
+}
+
+// ------------------------------------------------------------------ trunk --
+
+/// Vendor trunk peering: where to reach the provider and how to
+/// authenticate. All auth fields are optional; the mode is picked by
+/// `auth` (ip | digest | bearer | tls_client_cert), defaulting to `ip`.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct Trunk {
+    /// Provider endpoint "HOST:PORT" (or "HOST" for the default port 5060).
+    /// Absent/empty disables the trunk layer entirely.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Outbound transport toward the provider: udp | tcp | tls.
+    #[serde(default = "default_trunk_transport")]
+    pub transport: String,
+    /// Send a REGISTER on startup (register-on-start trunks).
+    #[serde(default)]
+    pub register: bool,
+    /// SIP identity used for REGISTER (e.g. "sip:user@vendor.example").
+    /// Derived from `auth_user` and the address host when absent.
+    #[serde(default)]
+    pub aor: Option<String>,
+    /// Auth mode selector: ip | digest | bearer | tls_client_cert.
+    #[serde(default)]
+    pub auth: Option<String>,
+    /// Digest username (also the REGISTER user part when `aor` is absent).
+    #[serde(default)]
+    pub auth_user: Option<String>,
+    /// Digest password.
+    #[serde(default)]
+    pub auth_pass: Option<String>,
+    /// Expected realm; used as fallback when a challenge omits it.
+    #[serde(default)]
+    pub auth_realm: Option<String>,
+    /// Bearer mode: raw Authorization value override (sent verbatim instead
+    /// of `Bearer <auth_token>`). Never logged.
+    #[serde(default)]
+    pub auth_header: Option<String>,
+    /// Bearer token (overridable via ZRTC_TRUNK_TOKEN). Never logged.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+    /// Client certificate for tls_client_cert mode (PEM).
+    #[serde(default)]
+    pub tls_cert_path: Option<String>,
+    /// Client private key for tls_client_cert mode (PEM).
+    #[serde(default)]
+    pub tls_key_path: Option<String>,
+    /// Optional CA bundle for the client connection (PEM).
+    #[serde(default)]
+    pub tls_ca_path: Option<String>,
+    /// OPTIONS keepalive interval in seconds; 0 disables keepalives.
+    #[serde(default)]
+    pub keepalive_secs: u64,
+}
+
+fn default_trunk_transport() -> String {
+    "udp".into()
+}
+
+impl Config {
+    /// Applies environment overrides on top of the file config. The values
+    /// are secrets and must never be logged.
+    pub fn apply_trunk_env(&mut self) {
+        if let Ok(v) = std::env::var("ZRTC_TRUNK_USER") {
+            self.trunk.auth_user = Some(v);
+        }
+        if let Ok(v) = std::env::var("ZRTC_TRUNK_PASS") {
+            self.trunk.auth_pass = Some(v);
+        }
+        if let Ok(v) = std::env::var("ZRTC_TRUNK_TOKEN") {
+            self.trunk.auth_token = Some(v);
+        }
+    }
 }
 
 impl Config {

@@ -37,12 +37,22 @@ impl Transport {
         }
     }
 
-    fn kind(self) -> TransportKind {
+    pub(crate) fn kind(self) -> TransportKind {
         match self {
             Transport::Udp => TransportKind::Udp,
             Transport::Tcp => TransportKind::Tcp,
             Transport::Tls => TransportKind::Tls,
             Transport::Wss => TransportKind::Wss,
+        }
+    }
+
+    /// Lowercase name for log lines.
+    pub fn name(self) -> &'static str {
+        match self {
+            Transport::Udp => "udp",
+            Transport::Tcp => "tcp",
+            Transport::Tls => "tls",
+            Transport::Wss => "wss",
         }
     }
 }
@@ -59,6 +69,8 @@ pub struct UacOpts {
     pub rtp_ms: u64,
     pub probe: bool,
     pub timeout: Duration,
+    /// Client certificate for mTLS (auth=tls_client_cert trunks).
+    pub tls_identity: Option<crate::tls::TlsClientIdentity>,
 }
 
 impl Default for UacOpts {
@@ -72,6 +84,7 @@ impl Default for UacOpts {
             rtp_ms: 1000,
             probe: false,
             timeout: Duration::from_secs(15),
+            tls_identity: None,
         }
     }
 }
@@ -148,8 +161,9 @@ impl Link {
     }
 }
 
-/// Sequential SIP session over one link.
-struct Session {
+/// Sequential SIP session over one link. Shared by the demo UAC and the
+/// vendor trunk client (REGISTER / INVITE / keepalive).
+pub(crate) struct Session {
     link: Link,
     streaming: bool,
     acc: Vec<u8>,
@@ -157,7 +171,7 @@ struct Session {
 }
 
 impl Session {
-    async fn connect(opts: &UacOpts) -> Result<Self, String> {
+    pub(crate) async fn connect(opts: &UacOpts) -> Result<Self, String> {
         let target = opts.target;
         let (link, streaming, local_override) = match opts.transport {
             Transport::Udp => {
@@ -175,14 +189,20 @@ impl Session {
             Transport::Tls => {
                 let s = TcpStream::connect(target).await.map_err(|e| e.to_string())?;
                 let local = s.local_addr().ok();
-                let connector = crate::tls::client_connector()?;
+                let connector = match &opts.tls_identity {
+                    Some(id) => crate::tls::client_connector_with_identity(id)?,
+                    None => crate::tls::client_connector()?,
+                };
                 let tls = crate::tls::connect_tls(&connector, &target.ip().to_string(), s).await?;
                 (Link::Tls(tls), true, local)
             }
             Transport::Wss => {
                 let s = TcpStream::connect(target).await.map_err(|e| e.to_string())?;
                 let local = s.local_addr().ok();
-                let connector = crate::tls::client_connector()?;
+                let connector = match &opts.tls_identity {
+                    Some(id) => crate::tls::client_connector_with_identity(id)?,
+                    None => crate::tls::client_connector()?,
+                };
                 let tls = crate::tls::connect_tls(&connector, &target.ip().to_string(), s).await?;
                 // WebSocket client handshake over the established TLS stream.
                 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -207,12 +227,12 @@ impl Session {
         })
     }
 
-    async fn send_msg(&mut self, msg: &SipMessage) -> Result<(), String> {
+    pub(crate) async fn send_msg(&mut self, msg: &SipMessage) -> Result<(), String> {
         let bytes = serialize(msg);
         self.link.send(&bytes).await
     }
 
-    async fn recv_msg(&mut self) -> Result<SipMessage, String> {
+    pub(crate) async fn recv_msg(&mut self) -> Result<SipMessage, String> {
         let mut buf = vec![0u8; 16_384];
         loop {
             if self.streaming {
@@ -239,7 +259,7 @@ impl Session {
         }
     }
 
-    fn via(&self) -> String {
+    pub(crate) fn via(&self) -> String {
         self.via_host.clone()
     }
 }

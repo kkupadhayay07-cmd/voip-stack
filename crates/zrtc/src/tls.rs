@@ -81,10 +81,48 @@ pub async fn accept_tls(
     Ok(stream)
 }
 
+/// Client-side identity for mTLS trunks (auth=tls_client_cert): the PEM
+/// cert/key are presented during the handshake.
+#[derive(Debug, Clone)]
+pub struct TlsClientIdentity {
+    pub cert_path: String,
+    pub key_path: String,
+    pub ca_path: Option<String>,
+}
+
 /// Client-side TLS connector that accepts self-signed local certs (demo
 /// topologies only).
 pub fn client_connector() -> Result<SslConnector, String> {
     let mut b = SslConnector::builder(SslMethod::tls()).map_err(|e| e.to_string())?;
+    b.set_verify(SslVerifyMode::NONE);
+    Ok(b.build())
+}
+
+/// Client connector presenting a client certificate (mTLS). Server cert
+/// verification stays relaxed to match the demo topology the plain
+/// connector serves; the optional CA bundle is loaded into the store.
+pub fn client_connector_with_identity(id: &TlsClientIdentity) -> Result<SslConnector, String> {
+    let cert_pem = std::fs::read(&id.cert_path)
+        .map_err(|e| format!("tls client cert {}: {e}", id.cert_path))?;
+    let key_pem = std::fs::read(&id.key_path)
+        .map_err(|e| format!("tls client key {}: {e}", id.key_path))?;
+    let cert = X509::from_pem(&cert_pem).map_err(|e| format!("parse client cert: {e}"))?;
+    let key = PKey::private_key_from_pem(&key_pem)
+        .map_err(|e| format!("parse client key: {e}"))?;
+    let mut b = SslConnector::builder(SslMethod::tls()).map_err(|e| e.to_string())?;
+    b.set_certificate(&cert).map_err(|e| e.to_string())?;
+    b.set_private_key(&key).map_err(|e| e.to_string())?;
+    b.check_private_key().map_err(|e| e.to_string())?;
+    if let Some(ca) = &id.ca_path {
+        let ca_pem = std::fs::read(ca).map_err(|e| format!("tls ca {ca}: {e}"))?;
+        for ca_cert in X509::stack_from_pem(&ca_pem)
+            .map_err(|e| format!("parse ca bundle: {e}"))?
+        {
+            b.cert_store_mut()
+                .add_cert(ca_cert)
+                .map_err(|e| format!("load ca cert: {e}"))?;
+        }
+    }
     b.set_verify(SslVerifyMode::NONE);
     Ok(b.build())
 }

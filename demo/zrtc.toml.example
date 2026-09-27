@@ -1,0 +1,130 @@
+# zrtc trunk configuration examples — all five auth modes.
+#
+# Copy the [trunk] block that matches your vendor into your zrtc.toml
+# (the rest of the file below is the standard demo config). Secrets should
+# normally come from the environment, which overrides the file values:
+#
+#   ZRTC_TRUNK_USER   -> auth_user
+#   ZRTC_TRUNK_PASS   -> auth_pass
+#   ZRTC_TRUNK_TOKEN  -> auth_token
+#
+# Mode selector: [trunk] auth = "ip" | "digest" | "bearer" | "tls_client_cert"
+
+# ---------------------------------------------------------------------------
+# Mode 1 — IP peering: no SIP credentials, no REGISTER. The provider
+# authenticates you by source address. OPTIONS keepalives every 60 s.
+# ---------------------------------------------------------------------------
+[trunk]
+address = "sip-gw.your-vendor.example:5060"
+transport = "udp"
+auth = "ip"
+register = false
+keepalive_secs = 60
+
+# ---------------------------------------------------------------------------
+# Mode 2 — Digest + REGISTER on start (RFC 3261 §22.4 / RFC 7616).
+# The daemon sends REGISTER, replies to the 401/407 challenge with
+# Digest credentials and logs the final code. Startup fails fast (non-zero
+# exit) when the vendor rejects the credentials.
+# ---------------------------------------------------------------------------
+# [trunk]
+# address = "sip-gw.your-vendor.example:5060"
+# transport = "udp"
+# auth = "digest"
+# register = true
+# auth_user = "trunk-user"        # or ZRTC_TRUNK_USER
+# auth_pass = "secret"            # or ZRTC_TRUNK_PASS
+# # auth_realm = "your-vendor.example"
+# # aor = "sip:trunk-user@your-vendor.example"
+# keepalive_secs = 60
+
+# ---------------------------------------------------------------------------
+# Mode 3 — Digest, INVITE-only (register = false): the first INVITE goes
+# out unsigned; the 401/407 challenge is answered once with Digest
+# credentials and the INVITE is re-sent.
+# ---------------------------------------------------------------------------
+# [trunk]
+# address = "sip-gw.your-vendor.example:5060"
+# transport = "udp"
+# auth = "digest"
+# register = false
+# auth_user = "trunk-user"
+# auth_pass = "secret"
+# keepalive_secs = 60
+
+# ---------------------------------------------------------------------------
+# Mode 4 — Static Bearer token: every request carries
+# `Authorization: Bearer <auth_token>`. Set auth_header to send a raw
+# value instead of the `Bearer ` scheme form.
+# ---------------------------------------------------------------------------
+# [trunk]
+# address = "sip-gw.your-vendor.example:5060"
+# transport = "tls"
+# auth = "bearer"
+# register = false
+# auth_token = "vendor-issued-token"   # or ZRTC_TRUNK_TOKEN
+# # auth_header = "SharedKey vendor-issued-token"
+# keepalive_secs = 60
+
+# ---------------------------------------------------------------------------
+# Mode 5 — TLS client certificate (mTLS): the credential is presented at
+# the TLS handshake; no SIP-level auth headers, no REGISTER. Paths must
+# exist and be readable, and transport must be "tls" (validated at startup).
+# ---------------------------------------------------------------------------
+# [trunk]
+# address = "sip-gw.your-vendor.example:5061"
+# transport = "tls"
+# auth = "tls_client_cert"
+# register = false
+# tls_cert_path = "/etc/zrtc/tls/client.crt"
+# tls_key_path = "/etc/zrtc/tls/client.key"
+# tls_ca_path = "/etc/zrtc/tls/vendor-ca.crt"
+# keepalive_secs = 60
+
+# ---------------------------------------------------------------------------
+# Standard demo config (unchanged) ------------------------------------------
+# ---------------------------------------------------------------------------
+
+[daemon]
+log_level = "info"
+
+[sip]
+host = "127.0.0.1"
+udp_port = 5060
+tcp_port = 5060
+tls_port = 5061
+wss_port = 5063
+
+[sbc]
+allow = ["127.0.0.0/8", "::1/128"]
+rate_per_second = 100.0
+rate_burst = 200.0
+topology_hiding = false
+
+[registrar]
+domain = "zrtc.local"
+aor = "sip:1000@zrtc.local"
+expires = 300
+
+[b2bua]
+port = 5070
+media_host = "127.0.0.1"
+routes = [
+  { prefix = "1000", target = "sip:sink@127.0.0.1:5090" },
+]
+default_target = "sip:sink@127.0.0.1:5090"
+
+[sink]
+port = 5090
+
+[outbound]
+enabled = true
+delay_ms = 3500
+target = "sip:sink@127.0.0.1:5090"
+rtp_ms = 1000
+
+[ai_bridge]
+enabled = true
+
+[api]
+port = 8080
