@@ -66,19 +66,21 @@ COPY --from=builder /out/bin/ /usr/local/bin/
 # Log to stdout by default; docker-compose / `docker run -e` can override.
 ENV RUST_LOG=info
 
-# SIP over UDP and TCP; 5061 reserved for SIPS/TLS; 8080 for the future
-# HTTP/metrics surface (Phase 6 control plane).
-EXPOSE 5060/udp 5060/tcp 5061/tcp 8080/tcp
+# SIP over UDP and TCP; 5061 for SIPS/TLS; 5063 for WSS; 8080 for the
+# HTTP/metrics/control-plane surface.
+EXPOSE 5060/udp 5060/tcp 5061/tcp 5063/tcp 8080/tcp
 
-# TODO(healthcheck): replace with a real liveness probe once `voipd` exists —
-# e.g. `--health-cmd "voipd-healthcheck"` or a SIP OPTIONS ping to 127.0.0.1:5060.
+# TODO(healthcheck): replace with a real liveness probe for the `zrtc` daemon —
+# e.g. a GET /healthz against the REST API or a SIP OPTIONS ping to 127.0.0.1:5060.
 # /bin/true keeps the plumbing in place and always reports healthy for now.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD ["/bin/true"]
 
-# TODO(b2bua): once the `voipd` demo daemon lands, replace the placeholder CMD:
-#   ENTRYPOINT ["/usr/local/bin/voipd"]
-# Until then the image starts, exits cleanly, and is exercised via CI.
+# TODO(zrtc): wire the daemon as the entrypoint once a container config story
+# lands (mount a zrtc.toml + media port range):
+#   ENTRYPOINT ["/usr/local/bin/zrtc", "--config", "/etc/zrtc/zrtc.toml"]
+# Until then the image validates the build pipeline end-to-end and stages the
+# binaries (`zrtc`, `b2bua-demo`); it starts, exits cleanly, and is exercised via CI.
 CMD ["/bin/true"]
 
 USER zrtc

@@ -1,8 +1,10 @@
 # Deployment Guide
 
-How to build, run and operate the ZRTC VoIP stack. Status notes are honest:
-Phase 1 ships **libraries + tests**; the B2BUA demo daemon (`voipd`) is the
-next work package, so binary-level sections below are marked accordingly.
+How to build, run and operate the ZRTC VoIP stack. The stack ships as
+libraries **and** as a runnable service: the `zrtc` daemon wires the whole
+stack (SIP listeners on UDP/TCP/TLS/WSS, SBC → proxy → registrar, B2BUA +
+loopback sink, outbound trunk, AI tap, REST API, observability) behind one
+`zrtc.toml` config.
 
 ## 1. Prerequisites
 
@@ -34,25 +36,54 @@ Local-sandbox convention (single-machine multi-agent setups): set
 `CARGO_TARGET_DIR=/tmp/voip-target` so builds don't collide with other
 projects' file watchers. CI uses the default target dir.
 
-## 3. Running the demo binaries — status
+## 3. Running the stack
 
-| Binary | Status |
-|--------|--------|
-| `voipd` (B2BUA demo daemon) | **Not yet built** — the `b2bua` crate is still a placeholder; the two-leg call bridge with anchored RTP relay is the current/next work package. |
-| `codecs` examples (`codec_report`) | **Planned** — the codec-contract sketch exists; the example lands with the media pipeline. |
+### 3.1 Binaries
 
-Today the runnable artifacts are the test suites and benchmarks:
+| Binary | Crate | Purpose |
+|--------|-------|---------|
+| `zrtc` | `zrtc` | The full daemon: SIP listeners (UDP/TCP/TLS/WSS), SBC, registrar, proxy, B2BUA + loopback sink, outbound trunk + originator, AI tap, REST API, observability |
+| `b2bua-demo` | `b2bua` | Standalone B2BUA demo daemon (listens on `0.0.0.0:5060`, logs every CDR event) |
+
+### 3.2 Full-stack demo (one command)
+
+```sh
+./demo/run.sh
+```
+
+The script builds `zrtc`, starts it with `demo/zrtc.toml`, waits for the
+configured AoR (`sip:1000@zrtc.local`) to REGISTER, probes the TCP/TLS/WSS
+listeners with the in-repo UAC, places one inbound call (UDP) and one
+daemon-originated outbound call, then fetches `GET /cdrs` and prints both
+records. Exit 0 = two answered CDRs. Daemon log: `/tmp/zrtc-demo.log`;
+observability output: `/tmp/zrtc-observ/` (`sip.pcap`, `rtp.pcap`,
+per-call `trace-*.log`).
+
+### 3.3 Running `zrtc` directly
+
+```sh
+cargo build --release -p zrtc
+./target/release/zrtc --config /path/to/zrtc.toml
+```
+
+`zrtc.toml` sections: `[daemon]` (log level), `[sip]` (host +
+udp/tcp/tls/wss ports), `[sbc]` (CIDR allow-list, rate limit, topology
+hiding), `[registrar]` (domain, AoR, expiry), `[b2bua]` (port, media host,
+prefix routes), `[sink]` (loopback UAS for demos), `[outbound]`
+(daemon-originated call: delay, target, duration), `[ai_bridge]`, `[api]`
+(REST port), `[observ]` (enable, log dir, pcap + trace options), and
+`[trunk]` for outbound carrier peering — auth modes `ip`, `digest`
+(REGISTER or INVITE-challenge), `bearer`, or `tls_client_cert` (mTLS);
+see `demo/zrtc.toml.example` for a worked example of each.
+
+The UAC probe supports `--transport udp|tcp|tls|wss`, `--to`, `--from`,
+`--rtp-ms`, `--timeout-secs`.
+
+### 3.4 Tests and benchmarks
 
 ```sh
 cargo test --workspace
 cargo bench -p sdp               # criterion benches where present
-```
-
-Once `voipd` lands (and this section will be updated then), the intended
-shape is:
-
-```sh
-./target/release/voipd --sip-listen 0.0.0.0:5060 --rtp-start 10000 --http 0.0.0.0:8080
 ```
 
 ## 4. Docker
@@ -74,11 +105,14 @@ docker run --rm -e RUST_LOG=info \
 ```
 
 * The `HEALTHCHECK` is currently a `/bin/true` **placeholder** (always
-  healthy). Replace it with a real probe (SIP OPTIONS ping or `voipd`
-  health endpoint) when the daemon lands — there is a `TODO(healthcheck)`
+  healthy). Replace it with a real probe (REST `/healthz` or a SIP OPTIONS
+  ping) when the container entrypoint is wired — there is a `TODO(healthcheck)`
   in the Dockerfile.
-* Until `voipd` exists the container starts and exits cleanly; the image
-  still validates the build pipeline end-to-end.
+* The image builds the whole workspace and stages every binary (`zrtc`,
+  `b2bua-demo`) into `/usr/local/bin`; the **entrypoint is still a
+  placeholder** (`CMD ["/bin/true"]`) — the container validates the build
+  pipeline end-to-end but does not yet run the daemon (config + media port
+  range mounting is the pending piece).
 
 ## 5. Docker Compose
 
@@ -95,13 +129,15 @@ state, dialer) — uncomment when those land.
 
 ## 6. Ports
 
-| Port | Proto | Purpose | Since |
-|------|-------|---------|-------|
-| 5060 | UDP | SIP signaling | Phase 1 (transports in flight) |
-| 5060 | TCP | SIP signaling | Phase 1 (transports in flight) |
-| 5061 | TCP | SIPS (TLS) — exposed in the image, not mapped by compose | Phase 2 |
-| 10000–20000/udp | RTP/RTCP (muxed per RFC 5761) | media anchors | Phase 2 (B2BUA relay) |
-| 8080 | TCP | HTTP: metrics/control plane | Phase 6 |
+| Port | Proto | Purpose | Status |
+|------|-------|---------|--------|
+| 5060 | UDP | SIP signaling | live (`[sip].udp_port`) |
+| 5060 | TCP | SIP signaling | live (`[sip].tcp_port`) |
+| 5061 | TCP | SIPS (TLS) — self-signed identity generated at startup, or mTLS for trunks | live (`[sip].tls_port`) |
+| 5063 | TCP | SIP over WSS (WebSocket Secure, RFC 7118) | live (`[sip].wss_port`) |
+| 5070 | UDP | B2BUA leg (internal) | live (`[b2bua].port`) |
+| 10000–20000/udp | RTP/RTCP (muxed per RFC 5761) | media anchors | live |
+| 8080 | TCP | HTTP: REST/WS control plane + `/metrics` | live (`[api].port`) |
 
 ## 7. Environment variables
 
@@ -109,9 +145,13 @@ state, dialer) — uncomment when those land.
 |----------|---------|---------|
 | `RUST_LOG` | `info` (set in the image) | `tracing` env-filter. Examples: `info`, `info,b2bua=debug`, `warn,rtp::jitter=trace`. |
 | `RUST_LOG_STYLE` | — | `tracing_subscriber` style override (auto/always/never). |
+| `ZRTC_TRUNK_USER` | — | Trunk Digest auth user (overrides `[trunk].auth_user`). |
+| `ZRTC_TRUNK_PASS` | — | Trunk Digest auth password (overrides `[trunk].auth_pass`). |
+| `ZRTC_TRUNK_TOKEN` | — | Trunk bearer token (overrides `[trunk].auth_token`). |
+| `ZRTC_DEMO_LOG` | `/tmp/zrtc-demo.log` | Daemon log path used by `demo/run.sh`. |
 
-Phase-2+ additions (SIP domain, TLS material, CDR sink, dialer pacing) will be
-documented here as they are implemented.
+Observability (pcap files, per-call traces, diag counters) is configured in
+the `[observ]` section of `zrtc.toml`, not via environment variables.
 
 ## 8. Operational notes
 
@@ -143,21 +183,21 @@ configured bounds. Guidance:
   libopus0 in sync with the one used at build time (bookworm-slim pairing in
   the Dockerfile guarantees this).
 
-## 9. Roadmap (Phase 2+)
+## 9. Roadmap
 
-1. **Security & WebRTC** — SRTP/SRTCP (RFC 3711/7714), DTLS-SRTP
-   (RFC 5764/6347), STUN/TURN (5389/5766), ICE (8445); WS/WSS transports.
-2. **Server roles** — registrar, stateful proxy, SBC, full B2BUA media
-   anchoring; TLS (5061).
-3. **Media pipeline** — N-way mixing, recording, transcoding engine, VAD,
-   streaming resampler integration.
-4. **Outbound dialer** — predictive/progressive/preview pacing with
-   TCPA abandonment-rate governance; AMD.
-5. **AI bridge & control plane** — AudioSocket TCP + WebSocket media
-   streaming (<50 ms added latency), CDR pipeline, REST/WebSocket control
-   API, Prometheus metrics, OpenTelemetry traces.
-6. **Scale targets** — 1,000 concurrent calls on 8 cores, <50 ms media path,
-   <150 ms SIP setup, graceful restart with zero dropped calls.
+1. **Transport hardening** — systematic TCP/TLS/WSS framing audit under
+   adverse input (split/coalesced/flooded streams) against the daemon.
+2. **Session timers** (RFC 4028) on both B2BUA legs.
+3. **Dialog layer extraction** (§12) from the B2BUA's per-leg state;
+   `sip-tx` adoption in the proxy.
+4. **Load harness** — 1000-concurrent-call soak with per-leg SRTP +
+   transcoding on 8-core hardware; publish numbers here.
+5. **Postgres CDR backend** (sqlx) + retention/archival policies.
+6. **WebRTC hardening** — RTX/NACK resend path, TWCC-driven bandwidth
+   estimation, data channels (SCTP).
+7. **Container entrypoint** — wire `zrtc` as the image entrypoint with a
+   mounted config + real healthcheck.
+8. **PRACK/100rel, GRUU/Outbound, NAPTR/SRV** for carrier-grade signaling.
 
 See `docs/DESIGN.md` for the full architecture contract and
 `docs/COMPLIANCE.md` for the per-RFC status matrix.

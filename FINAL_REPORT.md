@@ -126,3 +126,28 @@ verified by SNR on real audio).
 5. **WebRTC hardening** — RTX/NACK resend path, TWCC-driven bandwidth
    estimation, data channels (SCTP).
 6. **PRACK/100rel, GRUU/Outbound, NAPTR/SRV** for carrier-grade signaling.
+
+---
+
+## 7. Addendum — post-report hardening (2026-09, after the six-phase baseline)
+
+The report above is the six-phase completion snapshot. Work continued; this
+addendum records what landed since, so the document stays honest.
+
+| Commit | Scope |
+|--------|-------|
+| `72b53e0` | `zrtc` daemon — the whole stack wired into one runnable voice service (UDP/TCP/TLS/WSS listeners, SBC → proxy → registrar, B2BUA + loopback sink, AI tap, REST API) |
+| `c24e2cb` | Trunk layer — IP peering / Digest (REGISTER or INVITE-challenge) / Bearer / mTLS client-cert auth, OPTIONS keepalives, env-var secrets |
+| `96c9b0b` | `observ` crate — in-process observability: Wireshark-openable pcap capture (SIP + RTP), human-readable per-call traces, per-leg media diag counters, Call-ID correlation |
+| `8ebb920` | Trace noise + loss semantics — per-packet RTP removed from human traces (308→32 lines on the demo call, pcap keeps every packet); `lost` reports only sequence-proven loss; scheduler-driven concealment renamed `plc`→`concealed` |
+| `9d4e4a8` | CDR consistency — `plc_events`→`concealed_events`, filled from the same pump totals the diag reports (diag and CDR now always agree) |
+| `c0f310a` | clippy 1.98 `-D warnings` hygiene across observ/zrtc |
+| `3d87fb8` | `sip-tx` crate — RFC 3261 §17 client/server INVITE + non-INVITE state machines (Timers A/B/D, E/F/K, G/H/I, J, §17.1.3/§17.2.3 matching), pure + fake-clock tested; B2BUA legs now driven by real transactions (leg-B INVITE on the wire at t=0, retransmissions absorbed, non-2xx finals ACKed) |
+
+**Current baseline (supersedes the header numbers):** 19 crates, **359 tests
+across 52 suites**, `clippy -D warnings` clean, `cargo audit` clean.
+
+**§6 next-steps status:** item 1 (transaction layer) ✅ done as `sip-tx`;
+item 2 (service assembly binary) ✅ done as `zrtc`. Remaining: load harness,
+Postgres CDR backend, WebRTC hardening (RTX/NACK, TWCC, data channels),
+PRACK/100rel, GRUU/Outbound, NAPTR/SRV — see README "Roadmap (next)".

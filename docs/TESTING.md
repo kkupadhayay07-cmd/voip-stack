@@ -1,6 +1,6 @@
 # ZRTC — Testing Guide
 
-**Version 1.0 · Phase 1 · How the stack is verified**
+**Version 1.1 · Post-Phase-6 hardening · How the stack is verified**
 
 Rules of the road: every public function carries tests (workspace rule);
 parsers are tested for round-trip equality *and* panic-freedom; timing paths
@@ -12,26 +12,41 @@ are tested with virtual/configurable time, never sleeps.
 
 ```sh
 cargo test --workspace                  # unit + integration + interop suites
+cargo test -p sip-tx --release          # transaction state machines at exact timer instants
 cargo test -p sip-core                  # single crate
 cargo test --workspace --no-default-features
                                         # build/test without system libopus
 cargo bench -p sdp                      # criterion benches where present
 RUST_LOG="info,b2bua=debug" cargo test -p b2bua -- --nocapture
-                                        # verbose engine runs once b2bua lands
+                                        # verbose engine runs
 ```
 
 Toolchain is pinned by `rust-toolchain.toml` (stable). System dependency:
 `pkg-config` + `libopus-dev` unless building `--no-default-features`.
 
-## 2. Suite inventory (last verified full run)
+## 2. Suite inventory (last verified full run: 359 tests, 52 suites)
 
 | Crate | Tests | Focus |
 |-------|-------|-------|
-| `sip-core` | 50 | URI/headers/message model; datagram + stream framing (split reads, folding, limits, §18.3 trailing octets); canonical serializer round-trips; digest RFC 2617 vectors; builder defaults |
-| `sdp` | 16 | parser grammar + positioned errors; canonical serialization; RFC 3264 offer/answer (codec/direction intersection, mux, ICE/DTLS carry); `StreamPlan` projection |
-| `rtp` | 37 | packet/RTCP parse+serialize round-trips; RFC 8285 extensions; RFC 4733 events; RFC 5761 demux; jitter buffer with virtual time (reorder, loss→PLC, duplicates, wrap, SSRC restart, adaptive depth) |
-| `codecs` | 92 | G.711/G.722 bit-exactness; G.729 ITU tables + interop gates (below); Opus binding; L16/CN/PLC; resampler; registry |
-| `b2bua` | — | placeholder (engine + loopback integration test land with the crate) |
+| `sip-core` | 51 | URI/headers/message model; datagram + stream framing (split reads, folding, limits, §18.3 trailing octets); canonical serializer round-trips; digest RFC 2617 vectors; fuzz-smoke corpus; builder defaults |
+| `sip-tx` | 14 | RFC 3261 §17 state machines with a fake clock: exact timer fire instants (0/500/1500/3500/7500/15500/31500 ms), T2 caps, 64·T1 timeouts, retransmission absorption, wrong-branch/wrong-CSeq rejection, 2xx-ACK-is-a-new-transaction, reliable-transport timer elision, transport-error teardown |
+| `sdp` | 17 | parser grammar + positioned errors; canonical serialization; RFC 3264 offer/answer (codec/direction intersection, mux, ICE/DTLS carry); `StreamPlan` projection; fuzz-smoke corpus |
+| `rtp` | 41 | packet/RTCP parse+serialize round-trips; RFC 8285 extensions; RFC 4733 events; RFC 5761 demux; jitter buffer with virtual time (reorder, loss→PLC, duplicates, wrap, SSRC restart, adaptive depth); fuzz-smoke corpus |
+| `codecs` | 91 | G.711/G.722 bit-exactness; G.729 ITU tables + interop gates (§3); Opus binding; L16/CN/PLC; resampler; registry |
+| `b2bua` | 3 | engine unit tests + full-loopback integration call: 100/180/200/ACK ordering, PCMU→PCMA transcode with SNR gate, DTMF relay, BYE, CDR trail; both legs driven by `sip-tx` transactions |
+| `srtp` | 35 | RFC 3711 B.2/B.3 + RFC 7714 §16 vectors; round-trips; replay window/ROC semantics |
+| `dtls` | 10 | real DTLS 1.2 handshake over UDP loopback, fingerprint pinning, key export, loss-resilient flights, SRTP roundtrip on exported keys |
+| `ice` | 17 | STUN codec vs RFC 5769 vectors; agent gathering/checks/nomination/role-conflict; TURN allocation/permissions/relay; STUN server oracle |
+| `sbc` | 6 | ACL, token-bucket rate limiting, NAT latch, topology hiding, rport |
+| `media` | 13 | resampler anti-alias/streaming parity, mixer, recorder, VAD, full codec pipeline test |
+| `cdr` | 6 | lifecycle builder, dispositions, bounded store, filters/stats, JSON |
+| `dialer` | 8 | pacing modes, TCPA window, DNC, attempts/cooldowns, caller-ID rotation |
+| `ai-bridge` | 4 | AudioSocket framing, WS tap, VAD events, barge-in latency budget |
+| `api` | 8 | REST black-box: CDR queries/filters, campaign stats, pacing preview, metrics, health |
+| `proxy` | 7 | routing, forking, CANCEL, Via/Record-Route, 483, NAT response routing |
+| `registrar` | 9 | bindings, expiry, wildcard removal, digest challenge, CSeq/Call-ID consistency |
+| `observ` | 14 | pcap writers, per-call trace buffer, diag counters (rx/tx/lost/jitter/concealed), redaction of per-packet RTP from traces |
+| `zrtc` | 5 | daemon config parsing + assembly smoke |
 
 Counts move with the code; CI (§4) is the authoritative gate on every push.
 
@@ -56,12 +71,17 @@ bitstream, verified by two independent third-party decoders.
 push/PR: **fmt → clippy → test → audit → codec-interop**, with pkg-config +
 libopus installed for workspace jobs.
 
-Current known-state (tracked, temporary):
+Current state:
 
-* `fmt-check` is `continue-on-error` until a formatting pass lands; flips to
-  strict afterwards.
-* clippy runs without `-D warnings` until the workspace is warning-free.
-* `cargo audit` blocks on published advisories for the dependency tree.
+* `fmt-check` is strict (the tree is rustfmt-clean).
+* clippy runs with **`-D warnings`** (workspace is warning-free, pinned
+  clippy 1.98).
+* `cargo audit` blocks on published advisories for the dependency tree
+  (currently 0 vulnerabilities; one informational unmaintained notice on
+  the whitelisted libopus FFI wrapper).
+* The `test` job runs the **full workspace**; the `fuzz-smoke` job runs the
+  deterministic malformed-input corpora for sip-core/sdp/rtp; the
+  `codec-interop` job cross-decodes our G.729 encoder output with ffmpeg.
 
 ## 5. Property & robustness testing
 
@@ -71,10 +91,11 @@ Current known-state (tracked, temporary):
   and structured mutations via in-process loops (stable toolchain, so CI runs
   them everywhere); `cargo-fuzz` targets mirror the same entry points for
   nightly/local campaigns.
-* **Virtual time**: the jitter buffer and transaction timers are driven by
-  injected clocks/virtual time in tests — the same code paths that run in
-  production, without wall-clock sleeps. T1 is configurable (default 500 ms;
-  integration tests use 10 ms).
+* **Virtual time**: the jitter buffer and the `sip-tx` transaction timers
+  are driven by injected clocks/virtual time in tests — the same code paths
+  that run in production, without wall-clock sleeps. T1 is configurable
+  (default 500 ms; the `sip-tx` tests assert exact fire instants with a
+  fake clock).
 
 ## 6. Integration & end-to-end (as crates land)
 

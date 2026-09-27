@@ -70,15 +70,10 @@ jobs:
       - name: Install system deps (libopus)
         run: sudo apt-get update && sudo apt-get install -y pkg-config libopus-dev
       - uses: Swatinem/rust-cache@v2
-      # Per-crate, sequential: keeps the door open for memory-constrained
-      # runners and gives per-crate timing in the log.
-      - name: cargo test (per crate, sequential)
-        run: |
-          cargo test -p codecs
-          cargo test -p sip-core
-          cargo test -p sdp
-          cargo test -p rtp
-          cargo test -p b2bua
+      # Full workspace: GitHub runners have ample memory; the per-crate
+      # sequential split remains an option for memory-constrained runners.
+      - name: cargo test (workspace)
+        run: cargo test --workspace
 
   audit:
     name: cargo-audit

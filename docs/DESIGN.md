@@ -2,6 +2,11 @@
 
 **Technical Design Document — v1.0 (Phase 1)**
 
+> **Status note (updated):** all six phases of this contract are implemented,
+> plus the hardening series (`sip-tx` §17 transaction layer, `observ`
+> observability, trunk auth, daemon transports). Current per-RFC status:
+> [`COMPLIANCE.md`](COMPLIANCE.md) · system structure: [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 A from-scratch, production-grade SIP and media protocol stack written in Rust.
 No external SIP proxies, media servers, or softphone libraries are used or
 wrapped (no Kamailio, OpenSIPS, FreeSWITCH, Asterisk, RTPengine, Janus,

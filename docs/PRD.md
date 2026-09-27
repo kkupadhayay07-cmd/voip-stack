@@ -1,6 +1,6 @@
 # ZRTC — Product Requirements Document
 
-**Version 1.0 · Phase 1 · Status: living document**
+**Version 1.1 · All phases implemented + hardening · Status: living document**
 
 ZRTC is a from-scratch, production-grade SIP and media protocol stack written
 in Rust. It wraps **no** external SIP/media servers (no Kamailio, OpenSIPS,
@@ -75,9 +75,9 @@ Status legend: **Done** · **In progress** · **Planned** (phase). Verified per
 | FR-SIP-3 | Canonical serializer (Via/From/To/Call-ID/CSeq order, recomputed Content-Length), round-trip equality | P0 | **Done** |
 | FR-SIP-4 | URI model: `sip:`/`sips:`/`tel:`, IPv6, params, header-level tags, escaping | P0 | **Done** |
 | FR-SIP-5 | Digest auth helpers RFC 2617/7616 (MD5, MD5-sess, SHA-256(-sess), qop auth/auth-int/none) | P1 | **Done** (helpers; server nonce flows with registrar) |
-| FR-SIP-6 | Transaction layer §17: INVITE/non-INVITE client+server, Timers A–K, T1 configurable | P0 | **In progress** (Phase 1) |
-| FR-SIP-7 | Dialog layer §12: route sets, CSeq, ACK rules (2xx vs non-2xx), in-dialog helpers | P0 | **Planned** (Phase 1) |
-| FR-SIP-8 | Transports §18: UDP, TCP (connection registry), TLS (rustls), WS/WSS (RFC 7118) | P0 | **In progress** (UDP/TCP first; TLS/WS Phase 2) |
+| FR-SIP-6 | Transaction layer §17: INVITE/non-INVITE client+server, Timers A–K, T1 configurable | P0 | **Done** (`sip-tx` crate; B2BUA legs driven by it) |
+| FR-SIP-7 | Dialog layer §12: route sets, CSeq, ACK rules (2xx vs non-2xx), in-dialog helpers | P0 | **Partial** (per-leg dialog state in B2BUA; generic layer not extracted) |
+| FR-SIP-8 | Transports §18: UDP, TCP (connection registry), TLS (rustls), WS/WSS (RFC 7118) | P0 | **Done** (UDP/TCP/TLS/WSS listeners in `zrtc`; TLS via whitelisted OpenSSL) |
 
 ### FR-SDP — session description (`sdp`)
 
@@ -109,20 +109,20 @@ Status legend: **Done** · **In progress** · **Planned** (phase). Verified per
 
 | ID | Requirement | Priority | Status |
 |----|-------------|----------|--------|
-| FR-ROLE-1 | B2BUA: two-leg call bridge, anchored RTP relay, topology isolation (regenerated tags/branches/CSeq) | P0 | **Planned** (Phase 1 — `b2bua` crate placeholder present) |
-| FR-ROLE-2 | `voipd` demo daemon: config-driven, UDP/TCP bind, `--bridge-to` routing, graceful shutdown | P1 | **Planned** (Phase 1) |
-| FR-ROLE-3 | Registrar / proxy / SBC roles on the shared core | P1 | **Planned** (Phase 3) |
-| FR-ROLE-4 | Single `zrtc` daemon composing the full stack end-to-end | P1 | **Planned** (Phase 6) |
+| FR-ROLE-1 | B2BUA: two-leg call bridge, anchored RTP relay, topology isolation (regenerated tags/branches/CSeq) | P0 | **Done** |
+| FR-ROLE-2 | `voipd` demo daemon: config-driven, UDP/TCP bind, `--bridge-to` routing, graceful shutdown | P1 | **Done** (as `b2bua-demo` + the config-driven `zrtc` daemon) |
+| FR-ROLE-3 | Registrar / proxy / SBC roles on the shared core | P1 | **Done** |
+| FR-ROLE-4 | Single `zrtc` daemon composing the full stack end-to-end | P1 | **Done** (UDP/TCP/TLS/WSS, trunk auth, observability) |
 
 ### FR-MEDIA / FR-OUTBOUND / FR-AI / FR-API — later phases
 
 | ID | Requirement | Phase | Status |
 |----|-------------|-------|--------|
-| FR-MED-1 | Mixing, recording, transcoding graph, VAD | 4 | Planned |
-| FR-DIAL-1 | Predictive/progressive/preview dialer, pacing, TCPA abandonment governance | 5 | Planned |
-| FR-CDR-1 | CDR pipeline: one record per call, search API, JSON export | 5 | Planned |
-| FR-AI-1 | AudioSocket TCP + WebSocket media tap, VAD gating, barge-in, ≤20 ms added latency | 5 | Planned |
-| FR-API-1 | REST + WebSocket control plane, CDR query, Prometheus metrics, OpenAPI | 6 | Planned |
+| FR-MED-1 | Mixing, recording, transcoding graph, VAD | 4 | **Done** |
+| FR-DIAL-1 | Predictive/progressive/preview dialer, pacing, TCPA abandonment governance | 5 | **Done** (core pacing + governance; harness-scale soak pending) |
+| FR-CDR-1 | CDR pipeline: one record per call, search API, JSON export | 5 | **Done** (REST exposure live; Postgres persistence planned) |
+| FR-AI-1 | AudioSocket TCP + WebSocket media tap, VAD gating, barge-in, ≤20 ms added latency | 5 | **Done** |
+| FR-API-1 | REST + WebSocket control plane, CDR query, Prometheus metrics, OpenAPI | 6 | **Done** (OpenAPI spec export still planned) |
 
 ## 5. Non-functional requirements
 

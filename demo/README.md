@@ -1,9 +1,44 @@
 # demo
 
-End-to-end demonstration of the VoIP stack: a **complete call served entirely
+End-to-end demonstrations of the VoIP stack: a **complete call served entirely
 by the native stack** — no external SIP proxy, PBX or media server.
 
-## What the demo shows
+Two ways to run:
+
+1. **Full-stack daemon demo** — `./demo/run.sh` (the `zrtc` service end to end).
+2. **B2BUA loopback call** — `./demo/run_loopback_demo.sh` (in-repo integration test).
+
+## Full-stack daemon demo (`./demo/run.sh`)
+
+One command exercises the whole service, exactly as deployed:
+
+1. builds the `zrtc` daemon;
+2. starts it with `demo/zrtc.toml` — UDP/TCP/TLS/WSS SIP listeners, SBC
+   (CIDR allow-list + rate limit), registrar, B2BUA with a loopback sink,
+   AI-bridge tap, REST API, observability;
+3. waits for the configured AoR (`sip:1000@zrtc.local`) to REGISTER;
+4. probes the **TCP**, **TLS** and **WSS** listeners with the in-repo UAC;
+5. places one **inbound call** over UDP (UAC → SBC → B2BUA → sink), with
+   real RTP both ways;
+6. the daemon **originates one outbound call** itself (after a delay);
+7. fetches `GET /cdrs` and prints both CDR records.
+
+Exit 0 = **two answered CDRs** (one inbound, one outbound).
+
+Observability output lands in `/tmp/zrtc-observ/`:
+
+| File | Content |
+|------|---------|
+| `sip.pcap` | every SIP packet, Wireshark-openable (SIP dissected natively) |
+| `rtp.pcap` | every RTP packet on every leg, Wireshark-openable |
+| `trace-*.log` | one human-readable trace per call: signaling timeline + per-leg media diag (`rx/tx/lost/jitter/concealed`) |
+
+The per-leg diag counters in the trace and the CDR record
+(`packets_rx`, `packets_tx`, `packets_lost`, `avg_jitter_ms`,
+`concealed_events`) come from the **same pump counters** — the numbers you
+see in Wireshark, the trace and the CDR always agree.
+
+## B2BUA loopback call (`./demo/run_loopback_demo.sh`)
 
 A full RFC 3261 call flows through the B2BUA (back-to-back user agent) with
 **real-time audio transcoding**:
@@ -100,6 +135,7 @@ end-to-end scenario:
 
 | Scenario | Command | What is proven |
 |----------|---------|----------------|
+| Full-stack daemon | `./demo/run.sh` | REGISTER + TCP/TLS/WSS listener probes + inbound & outbound calls + CDRs + pcap/traces |
 | B2BUA loopback call | `./demo/run_loopback_demo.sh` | Full SIP call + PCMU→PCMA transcoding + CDR trail |
 | DTLS-SRTP handshake | `cargo test -p dtls --test handshake` | Real DTLS 1.2 over UDP, fingerprint pinning, key export, loss recovery, SRTP media roundtrip on the exported keys |
 | ICE agent pair | `cargo test -p ice --test integration` | Host-candidate gathering, connectivity checks, nomination, keepalives |

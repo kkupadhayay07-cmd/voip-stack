@@ -2,8 +2,9 @@
 
 Status of the ZRTC VoIP stack against the RFCs and ITU codecs it targets.
 **Honest by design** — no row is marked Done without implementation and tests
-behind it. Last reviewed: 2026-09 (all six phases implemented; 328 tests
-green, commit series through the control plane).
+behind it. Last reviewed: 2026-09 (all six phases implemented plus the
+hardening series: `sip-tx` transaction layer, in-process observability,
+trunk auth, `zrtc` daemon transports; 359 tests green across 52 suites).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
@@ -13,9 +14,9 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 |-----|---------|--------|-------|
 | RFC 3261 | SIP: message layer | **Done** | `sip-core`: strict panic-free byte parser (UDP datagram + TCP/TLS/WS stream framing, §18.3), canonical serializer, URI/header model, branch/tag/Call-ID generators. Parser limits enforced (64 KiB msg, 128 headers, 8 KiB/line). |
 | RFC 3261 | SIP: registrar (§10) | **Done** | `registrar` crate: AoR binding DB (q-ordering, expiry, CSeq/Call-ID consistency, wildcard removal), Digest auth challenge/verify with one-time nonces, domain check. |
-| RFC 3261 | SIP: stateful proxy (§16) | **Done** (core) | `proxy` crate: request validation (483), Route-set processing, Via prepend/pop, Record-Route, parallel forking, 100 Trying, CANCEL matching (§9.1), response routing (received/rport → sent-by). Timer F/H retransmission state machines are simplified (see §5). |
-| RFC 3261 | SIP: transactions (§17) | **Partial** | B2BUA implements Timer A/B retransmissions for INVITE; full independent transaction layer (Timer F/H/I/J) remains a hardening item. |
-| RFC 3261 | SIP: transports (§18) | **Partial** | UDP wired in b2bua/tests; message layer already covers TCP/TLS/WS framing; service-binary TLS/WS/WSS listeners planned. |
+| RFC 3261 | SIP: stateful proxy (§16) | **Done** (core) | `proxy` crate: request validation (483), Route-set processing, Via prepend/pop, Record-Route, parallel forking, 100 Trying, CANCEL matching (§9.1), response routing (received/rport → sent-by). Fork state is in-memory only (no failover); adopting the `sip-tx` timer state machines in the proxy is a planned hardening step. |
+| RFC 3261 | SIP: transactions (§17) | **Done** (core) | `sip-tx` crate: client INVITE (Timers A/B/D), client non-INVITE (E/F/K), server INVITE (G/H/I), server non-INVITE (J); §17.1.3 response matching + §17.2.3 ACK matching; pure state machines, fake-clock tests at exact fire instants. The B2BUA drives both call legs through it. Failover (RFC 3263) remains open. |
+| RFC 3261 | SIP: transports (§18) | **Done** (core) | UDP/TCP/TLS/WSS listeners wired in the `zrtc` daemon (TLS via whitelisted OpenSSL, self-signed identity at startup, mTLS client certs for trunks); message layer covers datagram + stream framing incl. §18.3 robustness. |
 | RFC 3261 | SIP: dialogs (§12) | **Partial** | B2BUA tracks per-leg dialog state (tags/Call-ID/CSeq); generic dialog package not extracted. |
 | RFC 3262 | PRACK / 100rel | **Planned** | `RAck`/`RSeq` header types modelled; reliability state machine not started. |
 | RFC 3263 | DNS (NAPTR/SRV) for SIP | **Partial** | Proxy falls back to system resolver for hostnames; NAPTR/SRV discovery not implemented. |
@@ -28,7 +29,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC 2617/7616 | Digest auth | **Done** (server side) | `sip-core` helpers + registrar nonce store; `respond_to_challenge` used in tests/clients. |
 | RFC 6140 / 5627 | GRUU | **Planned** | Not started. |
 | RFC 5626 / 6223 | Outbound | **Planned** | Not started. |
-| RFC 7118 | SIP over WS | **Partial** | WS framing supported in the message layer; no WS listener wired in a service binary yet. |
+| RFC 7118 | SIP over WS | **Done** | WS/WSS listeners wired in the `zrtc` daemon (WSS = WS over TLS); message layer handles text-frame streaming + Content-Length accumulation. |
 
 ## 2. Media transport
 
@@ -82,12 +83,15 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
 ## 5. Not claimed (honest gaps)
 
-* **Transaction-layer hardening**: Timer F/H/I/J state machines are not a
-  standalone layer; the B2BUA implements INVITE Timer A/B and the proxy
-  tracks fork state in memory. Failover semantics (RFC 3263) not implemented.
-* **Transports in the service binary**: UDP is wired end-to-end in engines
-  and tests; TCP/TLS/WS/WSS listeners and the service assembly binary are
-  the next ops milestone (message-layer framing already exists).
+* **Failover (RFC 3263)**: DNS-based next-server selection on timeout/
+  transport failure is not implemented; the transaction layer (sip-tx)
+  reports timeouts so callers can fail over.
+* **Standalone dialog layer (§12)**: the B2BUA tracks per-leg dialog state;
+  a reusable dialog package has not been extracted yet.
+* **TCP/TLS/WSS framing audit**: listeners are wired and demo-probed; a
+  systematic adverse-input framing audit (split/coalesced/flooded streams)
+  against the service binary is the current hardening item.
+* **Session timers (RFC 4028)**: not implemented.
 * **Postgres CDR persistence**: CDRs are in-memory (bounded) + JSON; sqlx
   storage backend planned.
 * **Load verification**: the 8-core/1000-call target is an architecture goal;
@@ -98,7 +102,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **328 passing**.
+  `cargo test --workspace` → **359 passing across 52 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16),
   STUN (RFC 5769 §2.1/§2.2), G.729 (bcg729 oracle), cross-decode by ffmpeg.
 * End-to-end in-repo: B2BUA loopback call, DTLS-SRTP handshake → SRTP media,
