@@ -24,16 +24,16 @@ RUST_LOG="info,b2bua=debug" cargo test -p b2bua -- --nocapture
 Toolchain is pinned by `rust-toolchain.toml` (stable). System dependency:
 `pkg-config` + `libopus-dev` unless building `--no-default-features`.
 
-## 2. Suite inventory (last verified full run: 385 tests, 53 suites)
+## 2. Suite inventory (last verified full run: 396 tests, 54 suites)
 
 | Crate | Tests | Focus |
 |-------|-------|-------|
-| `sip-core` | 61 | URI/headers/message model incl. host-only URIs (§19.1) and `Session-Expires`/`refresher` accessors (RFC 4028); datagram + stream framing (split reads, folding, limits, §18.3 trailing octets); canonical serializer round-trips; digest RFC 2617 vectors; fuzz-smoke corpus; builder defaults |
+| `sip-core` | 62 | URI/headers/message model incl. host-only URIs (§19.1), `Session-Expires`/`refresher` accessors (RFC 4028) and `RSeq`/`RAck` accessors (RFC 3262); datagram + stream framing (split reads, folding, limits, §18.3 trailing octets); canonical serializer round-trips; digest RFC 2617 vectors; fuzz-smoke corpus; builder defaults |
 | `sip-tx` | 14 | RFC 3261 §17 state machines with a fake clock: exact timer fire instants (0/500/1500/3500/7500/15500/31500 ms), T2 caps, 64·T1 timeouts, retransmission absorption, wrong-branch/wrong-CSeq rejection, 2xx-ACK-is-a-new-transaction, reliable-transport timer elision, transport-error teardown |
 | `sdp` | 17 | parser grammar + positioned errors; canonical serialization; RFC 3264 offer/answer (codec/direction intersection, mux, ICE/DTLS carry); `StreamPlan` projection; fuzz-smoke corpus |
 | `rtp` | 41 | packet/RTCP parse+serialize round-trips; RFC 8285 extensions; RFC 4733 events; RFC 5761 demux; jitter buffer with virtual time (reorder, loss→PLC, duplicates, wrap, SSRC restart, adaptive depth); fuzz-smoke corpus |
 | `codecs` | 91 | G.711/G.722 bit-exactness; G.729 ITU tables + interop gates (§3); Opus binding; L16/CN/PLC; resampler; registry |
-| `b2bua` | 11 | RFC 4028 timer negotiation matrix + refresh/expiry clock math (unit); full-loopback integration call: 100/180/200/ACK ordering, PCMU→PCMA transcode with SNR gate, DTMF relay, BYE, CDR trail; session-timer integration flows: negotiation mirrored on the 200s, downstream half-interval refresh, leg-A refresher election, 422/Min-SE floor, 422 retry with the peer's Min-SE, UPDATE refresh, expiry teardown with BYEs on both legs; both legs driven by `sip-tx` transactions |
+| `b2bua` | 21 | RFC 4028 timer negotiation matrix + refresh/expiry clock math (unit); RFC 3262 rel100 rules (Timer-G backoff clock, PRACK decision matrix, RAck matching) (unit); full-loopback integration call: 100/180/200/ACK ordering, PCMU→PCMA transcode with SNR gate, DTMF relay, BYE, CDR trail; session-timer integration flows: negotiation mirrored on the 200s, downstream half-interval refresh, leg-A refresher election, 422/Min-SE floor, 422 retry with the peer's Min-SE, UPDATE refresh, expiry teardown with BYEs on both legs; rel100 integration flows: reliable 180 with the parked 200 (§3), retransmission until PRACK, RAck verdicts (481/488), plain-180 + unsolicited PRACK, both-legs PRACK incl. lost-PRACK recovery, 421 dial retry; both legs driven by `sip-tx` transactions |
 | `srtp` | 35 | RFC 3711 B.2/B.3 + RFC 7714 §16 vectors; round-trips; replay window/ROC semantics |
 | `dtls` | 10 | real DTLS 1.2 handshake over UDP loopback, fingerprint pinning, key export, loss-resilient flights, SRTP roundtrip on exported keys |
 | `ice` | 17 | STUN codec vs RFC 5769 vectors; agent gathering/checks/nomination/role-conflict; TURN allocation/permissions/relay; STUN server oracle |
@@ -103,7 +103,7 @@ Current state:
 |-------|----------|-----------------|
 | Transport | UDP loopback; TCP split-read + coalesced messages; TLS loopback with self-signed test certs; WS/WSS framing | message-level equality, framing invariants |
 | Transaction | UAC/UAS INVITE + non-INVITE state walks; retransmit cadence; timeout paths; stray-packet absorption | state/order assertions at T1=10 ms |
-| B2BUA | UAC ↔ B2BUA ↔ UAS full call: 100/180/200/ACK ordering, bidirectional RTP, DTMF relay, BYE teardown, CDR trail | signaling order + audio SNR gates (e.g. ≥12 dB transcode) + event completeness |
+| B2BUA | UAC ↔ B2BUA ↔ UAS full call: 100/180/200/ACK ordering, bidirectional RTP, DTMF relay, BYE teardown, CDR trail; RFC 3262 reliable-1xx flows on both legs | signaling order + audio SNR gates (e.g. ≥12 dB transcode) + event completeness |
 | Load (later) | N concurrent calls smoke; Phase-6 harness | setup-time P95, zero-call-loss under restart |
 
 ## 7. Benchmarks (targets)

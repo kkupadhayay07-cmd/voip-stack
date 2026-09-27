@@ -5,7 +5,8 @@ Status of the ZRTC VoIP stack against the RFCs and ITU codecs it targets.
 behind it. Last reviewed: 2026-09 (all six phases implemented plus the
 hardening series: `sip-tx` transaction layer, in-process observability,
 trunk auth, `zrtc` daemon transports, the TCP/TLS/WSS framing audit, RFC 4028
-session timers on both B2BUA legs; 385 tests green across 53 suites).
+session timers and RFC 3262 PRACK/100rel on both B2BUA legs; 396 tests green
+across 54 suites).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
@@ -19,7 +20,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC 3261 | SIP: transactions (§17) | **Done** (core) | `sip-tx` crate: client INVITE (Timers A/B/D), client non-INVITE (E/F/K), server INVITE (G/H/I), server non-INVITE (J); §17.1.3 response matching + §17.2.3 ACK matching; pure state machines, fake-clock tests at exact fire instants. The B2BUA drives both call legs through it. Failover (RFC 3263) remains open. |
 | RFC 3261 | SIP: transports (§18) | **Done** (core) | UDP/TCP/TLS/WSS listeners wired in the `zrtc` daemon (TLS via whitelisted OpenSSL, self-signed identity at startup, mTLS client certs for trunks); message layer covers datagram + stream framing incl. §18.3 robustness. |
 | RFC 3261 | SIP: dialogs (§12) | **Partial** | B2BUA tracks per-leg dialog state (tags/Call-ID/CSeq); generic dialog package not extracted. |
-| RFC 3262 | PRACK / 100rel | **Planned** | `RAck`/`RSeq` header types modelled; reliability state machine not started. |
+| RFC 3262 | PRACK / 100rel | **Done** (core) | B2BUA, both legs. UAS: reliable 180 (`Require: 100rel` + `RSeq` from [1, 2³¹−1], To-tagged early dialog) when the caller advertises 100rel, Timer-G-style retransmission (T1 doubling to T2) until `PRACK`, 64·T1 give-up with 503 + BYE, the final 200 parked until the PRACK arrives (§3), RAck matching with 481/400 verdicts and idempotent 200 for retransmitted PRACKs. UAC: reliable 1xx answered with PRACK carrying `RAck` (own dialog CSeq), including retransmissions (lost-PRACK recovery), 421 Extension-Required dial retry once with `Supported: 100rel`; non-INVITE responses excluded from the INVITE transaction slot. |
 | RFC 3263 | DNS (NAPTR/SRV) for SIP | **Partial** | Proxy falls back to system resolver for hostnames; NAPTR/SRV discovery not implemented. |
 | RFC 3264 | Offer/answer | **Done** | `sdp::negotiate`: full RFC 3264 engine with `StreamPlan` projection. |
 | RFC 3326 | Reason header | **Partial** | Header type modelled; no protocol semantics applied yet. |
@@ -93,22 +94,31 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
   reusable dialog package has not been extracted yet.
 * **In-dialog SDP renegotiation**: re-INVITEs that would change the session
   (hold, codec change) are answered 488 instead of renegotiating; only
-  no-change refreshes are accepted.
+  no-change refreshes are accepted. A PRACK carrying an SDP offer is
+  likewise answered 488 (no early-media renegotiation).
+* **PRACK/100rel scope**: exactly one reliable 1xx per call attempt (the
+  180) — no 183 progress responses, no RSeq sequence across multiple
+  provisional responses; reliable 1xx to our own re-INVITEs (session
+  refresh) are not PRACKed (finals answer quickly, stopping peer
+  retransmission); 421 is retried once and only on the initial dial.
 * **Postgres CDR persistence**: CDRs are in-memory (bounded) + JSON; sqlx
   storage backend planned.
 * **Load verification**: the 8-core/1000-call target is an architecture goal;
   a load harness has not been run in this environment.
-* REMB, RTX retransmission, audio-band DTMF detection, PRACK/100rel,
+* REMB, RTX retransmission, audio-band DTMF detection,
   NAPTR/SRV, GRUU/Outbound, WebRTC data channels.
 
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **385 passing across 53 suites**.
+  `cargo test --workspace` → **396 passing across 54 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16),
   STUN (RFC 5769 §2.1/§2.2), G.729 (bcg729 oracle), cross-decode by ffmpeg.
 * End-to-end in-repo: B2BUA loopback call, RFC 4028 session-timer flows
-  (negotiation, refresh, 422 floor/retry, UPDATE, expiry BYEs), DTLS-SRTP
+  (negotiation, refresh, 422 floor/retry, UPDATE, expiry BYEs), RFC 3262
+  rel100 flows (reliable 180 with the parked 200, retransmission until
+  PRACK, RAck verdicts 481/488, plain-180 path, both-legs PRACK incl.
+  retransmission recovery, 421 dial retry), DTLS-SRTP
   handshake → SRTP media, ICE agent pair checks, TURN relay round-trip, REST
   API black-box tests.
 * `cargo audit`: 0 vulnerabilities (1 allowed unmaintained notice on the

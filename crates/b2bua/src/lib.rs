@@ -38,12 +38,21 @@
 //!   re-INVITEs or UPDATEs, expiry tears the call down with BYEs on both
 //!   legs. In-dialog re-INVITEs are answered with the cached answer when
 //!   they do not change the session and `488` otherwise.
+//! * Reliable provisional responses (RFC 3262, `rel100` module): the 180 is
+//!   sent with `Require: 100rel` + `RSeq` when the caller supports it and is
+//!   retransmitted with Timer-G backoff until the caller's `PRACK` (64·T1
+//!   give-up); the final 200 to leg A waits for that PRACK (§3). Downstream,
+//!   reliable 1xx from the peer are answered with `PRACK` carrying `RAck`,
+//!   including retransmissions (lost-PRACK recovery), and a 421
+//!   Extension Required on the dial is retried once with `Supported:
+//!   100rel`.
 //!
 //! CDR events are emitted for every leg transition and call termination on an
 //! [`tokio::sync::mpsc::UnboundedSender`].
 
 pub mod engine;
 pub mod media;
+pub mod rel100;
 pub mod sdp_util;
 pub mod timers;
 

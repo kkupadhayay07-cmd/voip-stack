@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 385 tests passing across 53 suites in 19 crates;
+**Current state: 396 tests passing across 54 suites in 19 crates;
 `clippy -D warnings` clean; `cargo audit` clean.**
 
 ## Workspace layout
@@ -25,7 +25,7 @@ observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 | `crates/sdp` | RFC 4566/8866 SDP parser/serializer + RFC 3264 offer/answer engine (`StreamPlan` projection) | **Done** |
 | `crates/rtp` | RTP/RTCP (RFC 3550/3551), adaptive jitter buffer + PLC, RFC 4733 DTMF, RFC 5761 demux, RFC 8285 extensions, RTCP feedback (NACK/PLI/FIR/TWCC) | **Done** |
 | `crates/codecs` | Full codec suite: **Opus, PCMU, PCMA, G.722, G.729, telephone-event**, L16, CN (RFC 3389), PLC, resampler; G.729 validated against bcg729 oracle vectors | **Done** |
-| `crates/b2bua` | B2BUA call engine: dual-leg SIP driven by `sip-tx` transactions, SDP offer/answer both legs, cross-connected media pumps with 16 kHz transcode bridge (any codec pair), DTMF relay, CDR events, `b2bua-demo` binary, full-loopback integration test | **Done** |
+| `crates/b2bua` | B2BUA call engine: dual-leg SIP driven by `sip-tx` transactions, SDP offer/answer both legs, cross-connected media pumps with 16 kHz transcode bridge (any codec pair), DTMF relay, RFC 4028 session timers, RFC 3262 reliable 1xx + PRACK both legs, CDR events, `b2bua-demo` binary, full-loopback integration test | **Done** |
 | `crates/srtp` | RFC 3711 (AES-CM + HMAC-SHA1, KDF, replay window, ROC estimation) + RFC 7714 AES-GCM AEAD; validated against RFC 3711 B.2/B.3 and RFC 7714 §16 vectors | **Done** |
 | `crates/dtls` | DTLS-SRTP (RFC 5764/6347) via whitelisted OpenSSL: runtime self-signed ECDSA P-256 certs, RFC 8122 fingerprint pinning, use_srtp negotiation, RFC 5764 §4.2 key export, flight retransmission | **Done** |
 | `crates/ice` | RFC 5389 STUN codec (RFC 5769 vectors), RFC 8445 ICE agent (host/srflx/relay gathering, connectivity checks, nomination), RFC 5766 TURN server (long-term auth, permissions, Send/Data, ChannelBind) | **Done** |
@@ -46,7 +46,7 @@ observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 385 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 396 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -71,6 +71,9 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
 * **Transactions**: every §17 timer path (A/B/D, E/F/K, G/H/I, J) exercised
   at exact instants with a fake clock (T1=500 ms derivations, T2 caps,
   64·T1 timeouts), including retransmission absorption and non-2xx ACK.
+* **Reliable provisional responses (RFC 3262)**: reliable 180 with the final
+  200 parked until PRACK, Timer-G retransmission until acknowledged, RAck
+  verdicts (481/400/488), lost-PRACK recovery on leg B, 421 dial retry.
 * **Codecs**: every codec round-trips; G.729 additionally validated against
   ITU reference (bcg729) oracle vectors; Opus via system libopus FFI.
 * **WebRTC path**: DTLS-SRTP handshake (self-signed P-256 certs, fingerprint
@@ -95,7 +98,8 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
 * **Hardening** — RFC 3261 §17 transaction layer (`sip-tx`), in-process
   observability (pcap/traces/diag/CDR), trunk auth (IP/Digest/Bearer/mTLS),
   UDP/TCP/TLS/WSS listeners, TCP/TLS/WSS framing audit under adverse input,
-  RFC 4028 session timers on both B2BUA legs. ✅
+  RFC 4028 session timers, RFC 3262 PRACK/100rel — both on both B2BUA
+  legs. ✅
 
 ## Roadmap (next)
 
@@ -104,7 +108,8 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
 3. Postgres CDR persistence (sqlx) + retention policies.
 4. WebRTC hardening — RTX/NACK resend path, TWCC-driven bandwidth estimation,
    data channels (SCTP).
-5. PRACK/100rel, GRUU/Outbound, NAPTR/SRV for carrier-grade signaling.
+5. SDP hardening (IPv6, BUNDLE, rejected m-lines), GRUU/Outbound, NAPTR/SRV
+   for carrier-grade signaling.
 
 ## Documentation
 

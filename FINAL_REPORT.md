@@ -148,11 +148,13 @@ addendum records what landed since, so the document stays honest.
 | `v0.4.0-sip-tx` | Tag closing the sip-tx + framing arc |
 | SipUri host-only | `sip:atlanta.com` (no userinfo) parsed correctly — the split-on-`@` bug rejected RFC 3261 §19.1-valid URIs (found during the framing audit, blocked real-world REGISTERs); last-`@` boundary for unescaped user parts |
 | RFC 4028 | Session timers on both B2BUA legs — `Min-SE`/422 floor, `Session-Expires`+`refresher` negotiation mirrored end-to-end, half-interval no-change refresh re-INVITEs, UPDATE refresh, expiry teardown with BYEs on both legs, 422-retry with the peer's `Min-SE`; in-dialog re-INVITE/UPDATE routing with tag checks (481/491/488) — previously a post-2xx re-INVITE was silently ignored |
+| RFC 3262 | PRACK/100rel on both B2BUA legs — reliable 180 (`Require: 100rel` + `RSeq`, To-tagged early dialog) with Timer-G retransmission and 64·T1 give-up, the final 200 parked until PRACK (§3), RAck matching (200/481/400) + idempotent re-answer, leg B PRACKs reliable 1xx incl. retransmission recovery, 421 Extension-Required dial retry, non-INVITE responses excluded from the INVITE transaction slot; `sip-core`: `RSeq`/`RAckValue` typed accessors |
 
-**Current baseline (supersedes the header numbers):** 19 crates, **385 tests
-across 53 suites**, `clippy -D warnings` clean, `cargo audit` clean.
+**Current baseline (supersedes the header numbers):** 19 crates, **396 tests
+across 54 suites**, `clippy -D warnings` clean, `cargo audit` clean.
 
 **§6 next-steps status:** item 1 (transaction layer) ✅ done as `sip-tx`;
 item 2 (service assembly binary) ✅ done as `zrtc`. Remaining: load harness,
 Postgres CDR backend, WebRTC hardening (RTX/NACK, TWCC, data channels),
-PRACK/100rel, GRUU/Outbound, NAPTR/SRV — see README "Roadmap (next)".
+SDP hardening (IPv6/BUNDLE/rejected m-lines), GRUU/Outbound, NAPTR/SRV —
+see README "Roadmap (next)".

@@ -356,6 +356,16 @@ impl HeaderMap {
         self.get("RAck")
     }
 
+    /// `RAck` parsed into its parts (RFC 3262 §3.1).
+    pub fn rack_value(&self) -> Option<RAckValue> {
+        self.get("RAck").and_then(|v| RAckValue::parse(v).ok())
+    }
+
+    /// `RSeq` as a number (RFC 3262 §3).
+    pub fn rseq(&self) -> Option<u32> {
+        self.get("RSeq").and_then(|v| v.trim().parse().ok())
+    }
+
     /// `Refer-To` header parsed as a name-addr.
     pub fn refer_to(&self) -> Option<NameAddr> {
         self.get("Refer-To").and_then(|v| NameAddr::parse(v).ok())
@@ -639,6 +649,50 @@ impl CSeq {
 impl fmt::Display for CSeq {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {}", self.seq, self.method)
+    }
+}
+
+/// `RAck` header value (RFC 3262 §3.1): the `RSeq` being acknowledged plus
+/// the `CSeq` (number and method) of the request that produced the reliable
+/// provisional response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RAckValue {
+    /// The `RSeq` of the reliable provisional response being acknowledged.
+    pub rseq: u32,
+    /// Sequence number of the request the response belongs to.
+    pub cseq: u32,
+    /// Method of that request (almost always `INVITE`).
+    pub method: Method,
+}
+
+impl RAckValue {
+    /// Parses `RAck: 274826 314159 INVITE`.
+    pub fn parse(s: &str) -> Result<RAckValue> {
+        let mut parts = s.split_whitespace();
+        let rseq = parts
+            .next()
+            .ok_or_else(|| ParseError::malformed("RAck needs an RSeq"))?
+            .parse::<u32>()
+            .map_err(|_| ParseError::malformed("bad RAck RSeq"))?;
+        let cseq = parts
+            .next()
+            .ok_or_else(|| ParseError::malformed("RAck needs a CSeq"))?
+            .parse::<u32>()
+            .map_err(|_| ParseError::malformed("bad RAck CSeq"))?;
+        let method = parts
+            .next()
+            .ok_or_else(|| ParseError::malformed("RAck needs a method"))?;
+        Ok(RAckValue {
+            rseq,
+            cseq,
+            method: Method::parse(method),
+        })
+    }
+}
+
+impl fmt::Display for RAckValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {} {}", self.rseq, self.cseq, self.method)
     }
 }
 
@@ -1005,6 +1059,48 @@ mod tests {
         assert_eq!(c.to_string(), "314159 INVITE");
         assert!(CSeq::parse("abc INVITE").is_err());
         assert!(CSeq::parse("314159").is_err());
+    }
+
+    #[test]
+    fn rack_parse_and_rseq_accessor() {
+        let r = RAckValue::parse("274826 314159 INVITE").unwrap();
+        assert_eq!(r.rseq, 274826);
+        assert_eq!(r.cseq, 314159);
+        assert_eq!(r.method, Method::Invite);
+        assert_eq!(r.to_string(), "274826 314159 INVITE");
+        // Method token is matched case-insensitively like everywhere else.
+        assert_eq!(
+            RAckValue::parse("5 1 invite").unwrap().method,
+            Method::Invite
+        );
+        // Missing pieces and garbage numbers are rejected.
+        assert!(RAckValue::parse("274826").is_err());
+        assert!(RAckValue::parse("274826 314159").is_err());
+        assert!(RAckValue::parse("x 1 INVITE").is_err());
+        assert!(RAckValue::parse("1 x INVITE").is_err());
+
+        // HeaderMap accessors: RSeq numeric, RAck structured.
+        let mut h = HeaderMap::default();
+        h.add("RSeq", "77");
+        h.add("RAck", "77 1 INVITE");
+        assert_eq!(h.rseq(), Some(77));
+        assert_eq!(
+            h.rack_value(),
+            Some(RAckValue {
+                rseq: 77,
+                cseq: 1,
+                method: Method::Invite
+            })
+        );
+        assert_eq!(h.rseq(), h.rack_value().map(|v| v.rseq));
+        h.remove_all("RSeq");
+        h.add("RSeq", "soon");
+        assert_eq!(h.rseq(), None, "garbage RSeq must not parse as a number");
+        let mut empty = HeaderMap::default();
+        assert_eq!(empty.rseq(), None);
+        assert_eq!(empty.rack_value(), None);
+        empty.add("RAck", "1 2 PRACK");
+        assert_eq!(empty.rack_value().unwrap().method, Method::Prack);
     }
 
     #[test]

@@ -57,8 +57,9 @@ pub use digest::{Algorithm, Qop};
 pub use error::{ParseError, Result};
 pub use headers::{
     Allow, AllowEvents, AuthChallenge, AuthResponse, CSeq, ContactList, ContentLength, ContentType,
-    Event, Expires, FromTo, HeaderMap, MaxForwards, MinSe, ProxyRequire, RAck, Reason, ReferTo,
-    Require, RetryAfter, RouteSet, SessionExpires, SubscriptionState, Supported, TokenList, Via,
+    Event, Expires, FromTo, HeaderMap, MaxForwards, MinSe, ProxyRequire, RAck, RAckValue, Reason,
+    ReferTo, Require, RetryAfter, RouteSet, SessionExpires, SubscriptionState, Supported,
+    TokenList, Via,
 };
 pub use ids::{new_branch, new_call_id, new_tag};
 pub use message::{Method, Request, Response, SipMessage, Version};
