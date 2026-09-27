@@ -227,15 +227,35 @@ async fn rtp_tap(
 
     let mut buf = vec![0u8; 4096];
     let mut pcm_out = Vec::with_capacity(2048);
+    // The sink is a distinct RTP endpoint with its own stream identity:
+    // SSRC drawn once per task, seq/ts seeded randomly and advanced locally.
+    let echo_ssrc: u32 = rand::random();
+    let mut echo_seq: u16 = rand::random();
+    let mut echo_ts: u32 = rand::random();
     loop {
         tokio::select! {
             _ = stop.changed() => break,
             r = rtp.recv_from(&mut buf) => {
-                let Ok((n, _)) = r else { break };
+                let Ok((n, src)) = r else { break };
                 if rtp::looks_like_rtcp(&buf[..n]) {
                     continue;
                 }
                 let Ok(pkt) = RtpPacket::parse(&buf[..n]) else { continue };
+                // Bi-directional echo: rebuild the packet with our own stream
+                // identity (SSRC/seq/ts) and send it back to the pump's source
+                // address. Never echo raw bytes — the peer's jitter buffer must
+                // not see its own SSRC reflected back.
+                let echo = RtpPacket::new(
+                    pkt.payload_type(),
+                    echo_seq,
+                    echo_ts,
+                    echo_ssrc,
+                    pkt.header.marker,
+                    bytes::Bytes::copy_from_slice(&pkt.payload),
+                );
+                echo_seq = echo_seq.wrapping_add(1);
+                echo_ts = echo_ts.wrapping_add(160); // 20 ms @ 8 kHz
+                let _ = rtp.send_to(&echo.encode(), src).await;
                 let (Some((dec, _)), Some(id)) = (dec.as_mut(), codec) else {
                     continue;
                 };
