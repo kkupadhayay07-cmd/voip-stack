@@ -321,7 +321,7 @@ fn compact(ev: &Event) -> String {
     match &ev.kind {
         EventKind::SipRx { bytes, .. } | EventKind::SipTx { bytes, .. } => {
             let first = String::from_utf8_lossy(bytes.split(|&b| b == b'\r').next().unwrap_or(bytes));
-            format!("{}", first.trim_end())
+            first.trim_end().to_string()
         }
         EventKind::RtpRx { ssrc, seq, pt, .. } | EventKind::RtpTx { ssrc, seq, pt, .. } => {
             format!("rtp ssrc={ssrc:#x} seq={seq} pt={pt}")
@@ -366,7 +366,7 @@ mod tests {
         let line = fmt_event(&e, true, true);
         assert!(line.starts_with("2023-11-14T22:13:20.000Z cid=c9 leg=core sip-rx"), "{line}");
         assert!(line.contains("INVITE sip:1000@zrtc.local SIP/2.0"), "{line}");
-        assert!(line.contains("sdp_bytes=") == false, "no SDP in this message");
+        assert!(!line.contains("sdp_bytes="), "no SDP in this message");
     }
 
     #[test]
@@ -380,10 +380,10 @@ mod tests {
         sink.on_event(ev("cA", EventKind::MediaStart { pump_leg: Leg::A, local: "127.0.0.1:40000".parse().unwrap(), rx_codec: "PCMU".into(), tx_codec: "PCMU".into() }));
         sink.on_event(ev("cA", EventKind::CdrWritten { record: serde_json::json!({"id": "r1", "disposition": "answered", "talk_secs": 2, "media": {"packets_rx": 74}}) }));
         // Call must be gone from memory after CDR.
-        assert!(sink.calls.get("cA").is_none());
+        assert!(!sink.calls.contains_key("cA"));
         // A call without a CDR stays buffered (active).
         sink.on_event(ev("cB", EventKind::Vad { state: "speech_start".into() }));
-        assert!(sink.calls.get("cB").is_some());
+        assert!(sink.calls.contains_key("cB"));
         sink.flush_files();
         let log = std::fs::read_to_string(sink.log_file).unwrap();
         assert!(log.contains("════ CALL cA ════"), "{log}");

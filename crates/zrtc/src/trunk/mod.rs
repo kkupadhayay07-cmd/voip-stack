@@ -117,6 +117,7 @@ pub(crate) async fn connect(ep: &Endpoint) -> Result<uac::Session, String> {
 
 /// Builds a request with the endpoint's standard header set plus `extra`
 /// (auth) headers.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn request(
     method: Method,
     uri: &str,

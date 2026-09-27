@@ -164,6 +164,7 @@ pub async fn run(cfg: &Config, e164: &str, rtp_ms: u64) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn invite_request(
     ep: &Endpoint,
     sess: &mut crate::uac::Session,

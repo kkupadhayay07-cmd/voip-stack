@@ -190,20 +190,17 @@ fn trace_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
                         if line.trim().is_empty() {
                             continue;
                         }
-                        match serde_json::from_str::<Event>(line) {
-                            Ok(ev) => {
-                                if let Some(id) = &call_id {
-                                    if &ev.call_id != id {
-                                        continue;
-                                    }
-                                }
-                                if json {
-                                    println!("{line}");
-                                } else {
-                                    println!("{}", human_line(&ev));
+                        if let Ok(ev) = serde_json::from_str::<Event>(line) {
+                            if let Some(id) = &call_id {
+                                if &ev.call_id != id {
+                                    continue;
                                 }
                             }
-                            Err(_) => {}
+                            if json {
+                                println!("{line}");
+                            } else {
+                                println!("{}", human_line(&ev));
+                            }
                         }
                     }
                 }
@@ -304,10 +301,8 @@ fn calls_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
         );
         println!("{id:<38} {dir:<9} {disp:<12} {secs:<8} {}", ts_hms(c.last_ms));
         shown += 1;
-        if active || recent.is_none() {
-            if shown >= 25 {
-                break;
-            }
+        if (active || recent.is_none()) && shown >= 25 {
+            break;
         }
     }
     if shown == 0 {

@@ -99,6 +99,7 @@ pub async fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send(
     sess: &mut crate::uac::Session,
     ep: &Endpoint,
