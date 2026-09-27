@@ -471,7 +471,14 @@ fn parse_sip_uri(s: &str) -> Result<SipUri> {
     // Split off ?headers first, then ;params, then userinfo@hostport.
     let (main, hdr) = split_once(rest, '?');
     let (userinfo_hostport, params_str) = split_once(main, ';');
-    let (userinfo, hostport) = split_once(userinfo_hostport, '@');
+    // Host-only URIs (`sip:atlanta.com`, no userinfo) are valid per RFC 3261
+    // §19.1, so the split must only happen when an `@` is actually present —
+    // and it happens at the LAST `@`, since an unescaped `@` in the user part
+    // must not swallow the host.
+    let (userinfo, hostport) = match userinfo_hostport.rfind('@') {
+        Some(at) => (&userinfo_hostport[..at], &userinfo_hostport[at + 1..]),
+        None => ("", userinfo_hostport),
+    };
     let (user, password) = if userinfo_hostport.contains('@') {
         let (u, p) = split_once(userinfo, ':');
         (
@@ -635,8 +642,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_host_only_uri() {
+        // RFC 3261 §19.1: userinfo is optional — `sip:host` must parse.
+        let u = SipUri::parse("sip:atlanta.com").unwrap();
+        assert_eq!(u.user, None);
+        assert_eq!(u.host, Host::Domain("atlanta.com".into()));
+        assert_eq!(u.port, None);
+        assert_eq!(u.to_string(), "sip:atlanta.com");
+        // With port / params / URI headers, still host-only.
+        let u2 = SipUri::parse("sips:atlanta.com:5061;transport=tcp;lr").unwrap();
+        assert_eq!(u2.user, None);
+        assert_eq!(u2.port, Some(5061));
+        assert_eq!(u2.transport(), TransportKind::Tcp);
+        assert!(u2.is_lr());
+        let u3 = SipUri::parse("sip:example.com?X=1").unwrap();
+        assert_eq!(u3.user, None);
+        assert_eq!(u3.headers, vec![("X".to_string(), "1".to_string())]);
+        // Host-only inside a name-addr (carriers send these in To/From).
+        let n = NameAddr::parse("<sip:atlanta.com>").unwrap();
+        assert!(n.sip_uri().is_some());
+        assert_eq!(n.addr.host_str(), "atlanta.com");
+        // Unescaped `@` in the user part must not swallow the host.
+        let u4 = SipUri::parse("sip:al@ice@atlanta.com").unwrap();
+        assert_eq!(u4.user.as_deref(), Some("al@ice"));
+        assert_eq!(u4.host, Host::Domain("atlanta.com".into()));
+    }
+
+    #[test]
     fn uri_roundtrip() {
         for s in [
+            "sip:atlanta.com",
             "sip:alice@atlanta.com",
             "sips:bob@biloxi.com;transport=tls",
             "sip:+15551234567@pstn.example.com;user=phone",
@@ -653,6 +688,7 @@ mod tests {
         assert!(SipUri::parse("http://example.com").is_err());
         assert!(SipUri::parse("sip:").is_err());
         assert!(SipUri::parse("sip:alice@").is_err());
+        assert!(SipUri::parse("sip:@").is_err());
         assert!(SipUri::parse("sip:alice@[2001:db8::x]").is_err());
         assert!(SipUri::parse("sip:alice@example.com:notaport").is_err());
     }
