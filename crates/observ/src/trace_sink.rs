@@ -1,10 +1,13 @@
 //! Human-readable + jsonl trace writer.
 //!
 //! One line per event lands in `trace-YYYYMMDD.log` (human) and
-//! `trace-YYYYMMDD.jsonl` (machine, consumed by the zrtc CLI). Every event
-//! is buffered per Call-ID; when `cdr-written` arrives the whole per-call
-//! block is dumped (header + ordered events + media + timing) and the call
-//! leaves memory. Also maintains `status.json` for `zrtc capture status`.
+//! `trace-YYYYMMDD.jsonl` (machine, consumed by the zrtc CLI). Per-packet
+//! media events (`RtpRx`/`RtpTx`) are captured by the pcap sinks only and
+//! never reach the trace files — the trace keeps signaling, media
+//! lifecycle/stats, pipeline and error events. Every event is buffered per
+//! Call-ID; when `cdr-written` arrives the whole per-call block is dumped
+//! (header + ordered events + media + timing) and the call leaves memory.
+//! Also maintains `status.json` for `zrtc capture status`.
 
 use crate::event::{ts_iso, Event, EventKind, Leg};
 use std::collections::HashMap;
@@ -116,6 +119,11 @@ impl TraceSink {
     }
 
     fn on_event(&mut self, ev: Event) {
+        // Per-packet media goes to the pcap sinks (they subscribe to the
+        // same bus); the trace only carries media lifecycle/stats events.
+        if matches!(ev.kind, EventKind::RtpRx { .. } | EventKind::RtpTx { .. }) {
+            return;
+        }
         if let Err(e) = self.roll_day() {
             tracing::error!("trace sink: {e}");
             return;
@@ -249,16 +257,16 @@ pub fn fmt_event(ev: &Event, include_sdp: bool, include_sip_bodies: bool) -> Str
         EventKind::MediaStart { pump_leg, local, rx_codec, tx_codec } => {
             format!("{head} local={local} rx_codec={rx_codec} tx_codec={tx_codec} pump_leg={}", pump_leg.as_str())
         }
-        EventKind::MediaStats { pump_leg, rx, tx, lost, jitter_ms, plc }
-        | EventKind::MediaEnd { pump_leg, rx, tx, lost, jitter_ms, plc, .. } => {
-            let end = matches!(ev.kind, EventKind::MediaEnd { .. });
+        EventKind::MediaStats { pump_leg, rx, tx, lost, jitter_ms, concealed }
+        | EventKind::MediaEnd { pump_leg, rx, tx, lost, jitter_ms, concealed, .. } => {
             let mut s = format!(
-                "{head} pump_leg={} rx={rx} tx={tx} lost={lost} jitter_ms={jitter_ms:.1} plc={plc}",
+                "{head} pump_leg={} rx={rx} tx={tx} lost={lost} jitter_ms={jitter_ms:.1} concealed={concealed}",
                 pump_leg.as_str()
             );
-            if end {
-                if let EventKind::MediaEnd { talk_ms, .. } = &ev.kind {
-                    s.push_str(&format!(" talk_ms={talk_ms}"));
+            if let EventKind::MediaEnd { talk_ms, remote, .. } = &ev.kind {
+                s.push_str(&format!(" talk_ms={talk_ms}"));
+                if let Some(r) = remote {
+                    s.push_str(&format!(" remote={r}"));
                 }
             }
             s
@@ -331,9 +339,9 @@ fn compact(ev: &Event) -> String {
 /// only for the sink's own tests).
 pub fn last_stats(events: &[Event], leg: Leg) -> Option<(u64, u64, u64, f64, u64)> {
     events.iter().rev().find_map(|ev| match &ev.kind {
-        EventKind::MediaStats { pump_leg: l, rx, tx, lost, jitter_ms, plc }
-        | EventKind::MediaEnd { pump_leg: l, rx, tx, lost, jitter_ms, plc, .. } if *l == leg => {
-            Some((*rx, *tx, *lost, *jitter_ms, *plc))
+        EventKind::MediaStats { pump_leg: l, rx, tx, lost, jitter_ms, concealed }
+        | EventKind::MediaEnd { pump_leg: l, rx, tx, lost, jitter_ms, concealed, .. } if *l == leg => {
+            Some((*rx, *tx, *lost, *jitter_ms, *concealed))
         }
         _ => None,
     })
@@ -388,9 +396,57 @@ mod tests {
 
     #[test]
     fn last_stats_picks_latest_per_leg() {
-        let mk = |rx: u64| ev("c", EventKind::MediaStats { pump_leg: Leg::A, rx, tx: 1, lost: 0, jitter_ms: 1.0, plc: 0 });
+        let mk = |rx: u64| ev("c", EventKind::MediaStats { pump_leg: Leg::A, rx, tx: 1, lost: 0, jitter_ms: 1.0, concealed: 0 });
         let events = vec![mk(10), mk(20)];
         assert_eq!(last_stats(&events, Leg::A).map(|(rx, _, _, _, _)| rx), Some(20));
         assert_eq!(last_stats(&events, Leg::B), None);
+    }
+
+    #[test]
+    fn per_packet_rtp_never_reaches_the_trace() {
+        let dir = std::env::temp_dir().join(format!("observ-trace-rtp-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let status = Arc::new(StatusShared::default());
+        let mut sink = TraceSink::new(dir.clone(), true, true, status.clone());
+
+        sink.on_event(ev("cR", EventKind::RtpRx {
+            src: "127.0.0.1:40000".parse().unwrap(),
+            dst: "127.0.0.1:40002".parse().unwrap(),
+            pump_leg: Leg::A,
+            bytes: vec![0x80, 0, 0, 1, 0, 0, 0, 1, 1, 2, 3, 4, 0xaa],
+            ssrc: 0x01020304,
+            seq: 1,
+            pt: 0,
+        }));
+        sink.on_event(ev("cR", EventKind::RtpTx {
+            src: "127.0.0.1:40002".parse().unwrap(),
+            dst: "127.0.0.1:40000".parse().unwrap(),
+            pump_leg: Leg::A,
+            bytes: vec![0x80, 0, 0, 2, 0, 0, 0, 161, 1, 2, 3, 4, 0xbb],
+            ssrc: 0x01020304,
+            seq: 2,
+            pt: 0,
+        }));
+        sink.on_event(ev("cR", EventKind::MediaEnd {
+            pump_leg: Leg::A,
+            rx: 1,
+            tx: 1,
+            lost: 0,
+            jitter_ms: 0.4,
+            concealed: 0,
+            talk_ms: 40,
+            remote: Some("127.0.0.1:40000".parse().unwrap()),
+        }));
+        sink.flush_files();
+
+        let log = std::fs::read_to_string(sink.log_file).unwrap();
+        assert!(!log.contains("rtp-rx") && !log.contains("rtp-tx"), "{log}");
+        assert!(log.contains("media-end"), "{log}");
+        assert!(log.contains("remote=127.0.0.1:40000"), "{log}");
+        let jsonl = std::fs::read_to_string(sink.jsonl_file).unwrap();
+        assert_eq!(jsonl.lines().count(), 1, "only the media-end event: {jsonl}");
+        assert!(sink.calls.get("cR").map(|b| b.events.len()) == Some(1));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

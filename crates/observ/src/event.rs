@@ -155,24 +155,30 @@ pub enum EventKind {
     B2buaLegDown { side: String, reason: String },
     /// Media pump started for one leg (`pump_leg`: the pump's leg).
     MediaStart { pump_leg: Leg, local: SocketAddr, rx_codec: String, tx_codec: String },
-    /// Rolling media counters (every 5 s per pump).
+    /// Rolling media counters (every 5 s per pump). `lost` counts packets
+    /// the sender demonstrably sent but never arrived (sequence-proven
+    /// gaps); `concealed` counts playout slots the PLC path filled because
+    /// no media was ready — that includes benign under-run around silence,
+    /// so it is a separate measurement from `lost`.
     MediaStats {
         pump_leg: Leg,
         rx: u64,
         tx: u64,
         lost: u64,
         jitter_ms: f64,
-        plc: u64,
+        concealed: u64,
     },
-    /// Media pump stopped; final counters.
+    /// Media pump stopped; final counters. `remote` is the last peer the
+    /// pump exchanged RTP with (None when nothing ever arrived).
     MediaEnd {
         pump_leg: Leg,
         rx: u64,
         tx: u64,
         lost: u64,
         jitter_ms: f64,
-        plc: u64,
+        concealed: u64,
         talk_ms: u64,
+        remote: Option<SocketAddr>,
     },
     /// Voice-activity transition on caller audio.
     Vad { state: String },

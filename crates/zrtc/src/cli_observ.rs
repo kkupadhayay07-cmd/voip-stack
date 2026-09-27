@@ -8,7 +8,6 @@ use crate::config::Config;
 use observ::event::{Event, EventKind};
 use observ::pcap_sink::{self, PcapWriter, RawFrame};
 use std::collections::{BTreeSet, HashMap};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 /// Log dir resolution order: --config's [observ].log_dir, $ZRTC_LOG_DIR,
@@ -401,11 +400,11 @@ fn diag_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
     println!("\n── media summary ──");
     let mut printed_leg: Vec<observ::event::Leg> = Vec::new();
     for ev in c.events.iter().rev() {
-        if let EventKind::MediaEnd { pump_leg: leg, rx, tx, lost, jitter_ms, plc, talk_ms } = &ev.kind {
+        if let EventKind::MediaEnd { pump_leg: leg, rx, tx, lost, jitter_ms, concealed, talk_ms, .. } = &ev.kind {
                 if !printed_leg.contains(leg) {
                     printed_leg.push(*leg);
                     println!(
-                        "  leg {}: rx={rx} tx={tx} lost={lost} jitter={jitter_ms:.1}ms plc={plc} talk_ms={talk_ms}",
+                        "  leg {}: rx={rx} tx={tx} lost={lost} jitter={jitter_ms:.1}ms concealed={concealed} talk_ms={talk_ms}",
                         leg.as_str()
                     );
                 }
@@ -455,13 +454,16 @@ fn diag_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
         None => println!("  none (call not finalized)"),
     }
 
-    // 6. Suggested Wireshark filter.
+    // 6. Suggested Wireshark filter. RTP ports come from the media
+    // lifecycle events (per-packet RtpRx/RtpTx never reach the trace).
     let mut rtp_ports: BTreeSet<u16> = BTreeSet::new();
     for ev in &c.events {
         match &ev.kind {
-            EventKind::RtpRx { src, dst, .. } | EventKind::RtpTx { src, dst, .. } => {
-                rtp_ports.insert(src.port());
-                rtp_ports.insert(dst.port());
+            EventKind::MediaStart { local, .. } => {
+                rtp_ports.insert(local.port());
+            }
+            EventKind::MediaEnd { remote: Some(r), .. } => {
+                rtp_ports.insert(r.port());
             }
             _ => {}
         }
@@ -524,17 +526,21 @@ fn capture_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
             let kind = flag_value(args, "--type").unwrap_or_else(|| "both".into());
             let events = load_events(log_dir)?;
 
-            // RTP endpoints for this call (from the trace stream).
-            let mut endpoints: BTreeSet<(u32, u16, u32, u16)> = BTreeSet::new();
+            // RTP ports for this call, from the media lifecycle events
+            // (per-packet RtpRx/RtpTx never reach the trace stream; each
+            // pump binds its own ephemeral port, so the port set is
+            // call-precise).
+            let mut rtp_ports: BTreeSet<u16> = BTreeSet::new();
             for ev in &events {
                 if ev.call_id != call_id {
                     continue;
                 }
                 match &ev.kind {
-                    EventKind::RtpRx { src, dst, .. } | EventKind::RtpTx { src, dst, .. } => {
-                        if let (Some(s), Some(d)) = (parse_v4(*src), parse_v4(*dst)) {
-                            endpoints.insert((s, src.port(), d, dst.port()));
-                        }
+                    EventKind::MediaStart { local, .. } => {
+                        rtp_ports.insert(local.port());
+                    }
+                    EventKind::MediaEnd { remote: Some(r), .. } => {
+                        rtp_ports.insert(r.port());
                     }
                     _ => {}
                 }
@@ -561,10 +567,7 @@ fn capture_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
                     let take = if sip {
                         find_sub(&f.payload, needle)
                     } else {
-                        match (parse_v4(f.src), parse_v4(f.dst)) {
-                            (Some(s), Some(d)) => endpoints.contains(&(s, f.src.port(), d, f.dst.port())),
-                            _ => false,
-                        }
+                        rtp_ports.contains(&f.src.port()) || rtp_ports.contains(&f.dst.port())
                     };
                     if take {
                         let _ = w.write_udp(f.ts_us, f.src, f.dst, &f.payload);
@@ -602,13 +605,6 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len().max(1)).any(|w| w == needle)
 }
 
-fn parse_v4(a: SocketAddr) -> Option<u32> {
-    match a {
-        SocketAddr::V4(v4) => Some(u32::from(*v4.ip())),
-        SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped().map(u32::from),
-    }
-}
-
 // ------------------------------------------------------------- metrics ----
 
 fn metrics_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
@@ -616,7 +612,7 @@ fn metrics_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
     let cutoff = since_ms(args);
     let events = load_events(log_dir)?;
     let mut calls: BTreeSet<String> = BTreeSet::new();
-    let (mut rx, mut tx, mut lost, mut plc) = (0u64, 0u64, 0u64, 0u64);
+    let (mut rx, mut tx, mut lost, mut concealed) = (0u64, 0u64, 0u64, 0u64);
     let mut jitter_sum = 0.0f64;
     let mut jitter_n = 0usize;
     let mut saw_media = false;
@@ -633,13 +629,13 @@ fn metrics_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
             }
         }
         match &ev.kind {
-            EventKind::MediaEnd { pump_leg: _, rx: r, tx: t, lost: l, jitter_ms: j, plc: p, .. } => {
+            EventKind::MediaEnd { pump_leg: _, rx: r, tx: t, lost: l, jitter_ms: j, concealed: co, .. } => {
                 saw_media = true;
                 calls.insert(ev.call_id.clone());
                 rx += r;
                 tx += t;
                 lost += l;
-                plc += p;
+                concealed += co;
                 if *j > 0.0 {
                     jitter_sum += j;
                     jitter_n += 1;
@@ -664,7 +660,7 @@ fn metrics_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
     if jitter_n > 0 {
         println!("  avg jitter:  {:.1} ms", jitter_sum / jitter_n as f64);
     }
-    println!("  plc events:  {plc}");
+    println!("  concealed frames: {concealed}");
     if lost + rx > 0 {
         println!("  loss rate:   {:.2}%", 100.0 * lost as f64 / (lost + rx) as f64);
     }

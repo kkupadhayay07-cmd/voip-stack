@@ -94,6 +94,12 @@ pub struct JbStats {
     pub frames_in: u64,
     pub frames_out: u64,
     pub concealed: u64,
+    /// Playout slots covered by concealment whose sequence number was at or
+    /// below the highest sequence received — the peer demonstrably sent at
+    /// least that far, so the packet was genuinely lost. Starved slots
+    /// beyond the highest received sequence (silence / under-run) are
+    /// counted as `concealed` only.
+    pub packets_lost: u64,
     pub late: u64,
     pub duplicates: u64,
     pub resets: u64,
@@ -395,6 +401,14 @@ impl JitterBuffer {
         }
         let seq = self.next_seq;
         let ts = self.next_ts as u32;
+        // Loss accounting: this slot's packet never arrived before its
+        // playout deadline. It only counts as lost when the peer
+        // demonstrably sent at or beyond this sequence (a real stream gap);
+        // slots beyond the highest received sequence are sender under-run
+        // (silence, startup, clock skew), not loss.
+        if seq <= self.highest_ext_seq {
+            self.stats.packets_lost += 1;
+        }
         self.next_seq += 1;
         self.next_ts += self.frame_samples();
         self.stats.concealed += 1;
@@ -531,6 +545,25 @@ mod tests {
         let f3 = b.pop_ready(90).unwrap();
         assert_eq!(f3.seq, 3);
         assert_eq!(b.stats.concealed, 2);
+        // seq 1 and 2 were proven lost (frame 3 arrived beyond them)
+        assert_eq!(b.stats.packets_lost, 2);
+    }
+
+    #[test]
+    fn underrun_conceals_without_counting_loss() {
+        let mut b = jb();
+        push(&mut b, 0, 0, 0);
+        push(&mut b, 1, 160, 20);
+        // sender goes quiet: nothing beyond seq 1 ever arrives
+        assert_eq!(b.pop_ready(30).unwrap().seq, 0);
+        assert_eq!(b.pop_ready(50).unwrap().seq, 1);
+        // slots 2..4 are starved (beyond the highest received seq = 1)
+        let c = b.conceal(90).unwrap();
+        assert_eq!(c.seq, 2);
+        let c2 = b.conceal(110).unwrap();
+        assert_eq!(c2.seq, 3);
+        assert_eq!(b.stats.concealed, 2);
+        assert_eq!(b.stats.packets_lost, 0, "under-run is not packet loss");
     }
 
     #[test]

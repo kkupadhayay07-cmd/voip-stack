@@ -213,7 +213,16 @@ mod tests {
         let rtp = crate::pcap_sink::read_frames(&dir.join("rtp.pcap")).unwrap();
         assert_eq!(rtp.len(), 1);
         assert_eq!(rtp[0].payload.len(), 13);
-        // trace jsonl got both events
+        // trace jsonl only got the SIP event; the RTP packet went to the
+        // rtp.pcap writer alone (per-packet media never reaches the trace)
+        let jsonl: String = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with("trace-")
+                && e.file_name().to_string_lossy().ends_with(".jsonl"))
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .expect("trace jsonl exists");
+        assert_eq!(jsonl.lines().count(), 1, "RTP packets must stay out of the trace: {jsonl}");
+        assert!(jsonl.contains("\"kind\":\"sip_rx\""), "{jsonl}");
         let files: Vec<_> = std::fs::read_dir(&dir).unwrap()
             .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
             .collect();

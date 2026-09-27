@@ -224,13 +224,14 @@ async fn run_pump(
             _ = stop.changed() => break,
             _ = stats_tick.tick() => {
                 // media hook: rolling counters every 5 s
+                stats.packets_lost.store(jb.stats.packets_lost, Relaxed);
                 session.emit(observ::EventKind::MediaStats {
                     pump_leg: session.leg(),
                     rx: stats.packets_rx(),
                     tx: stats.packets_tx(),
                     lost: stats.packets_lost(),
                     jitter_ms: jb.jitter_ms(),
-                    plc: stats.frames_concealed(),
+                    concealed: stats.frames_concealed(),
                 });
             }
             r = rtp.recv_from(&mut buf) => {
@@ -281,7 +282,9 @@ async fn run_pump(
                 ) {
                     PushResult::Buffered => {}
                     PushResult::Probation => {}
-                    PushResult::Late => { stats.packets_lost.fetch_add(1, Relaxed); }
+                    // Late arrivals already missed playout; loss is counted
+                    // by the jitter buffer's sequence-gap accounting.
+                    PushResult::Late => {}
                     PushResult::Duplicate => {}
                 }
             }
@@ -354,14 +357,16 @@ async fn run_pump(
     }
     // media hook: pump end with final counters
     let talk_ms = started.elapsed().as_millis() as u64;
+    stats.packets_lost.store(jb.stats.packets_lost, Relaxed);
     session.emit(observ::EventKind::MediaEnd {
         pump_leg: session.leg(),
         rx: stats.packets_rx(),
         tx: stats.packets_tx(),
         lost: stats.packets_lost(),
         jitter_ms: jb.jitter_ms(),
-        plc: stats.frames_concealed(),
+        concealed: stats.frames_concealed(),
         talk_ms,
+        remote: *remote.lock().await,
     });
     tracing::debug!(
         "pump stopped: encoded={} concealed={}",
