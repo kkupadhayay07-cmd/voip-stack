@@ -70,8 +70,12 @@ cargo audit                                      # 0 vulnerabilities
 
 ## Documentation
 
+* [`docs/PRD.md`](docs/PRD.md) — product requirements: users, functional/non-functional requirements, milestones & acceptance gates
+* [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system architecture: crate graph, runtime model, data flows, deployment view
 * [`docs/DESIGN.md`](docs/DESIGN.md) — technical design (implementation contract)
 * [`docs/COMPLIANCE.md`](docs/COMPLIANCE.md) — honest per-RFC compliance matrix
+* [`docs/TESTING.md`](docs/TESTING.md) — test strategy, suite inventory, interop/conformance gates, CI
+* [`docs/SECURITY_NOTES.md`](docs/SECURITY_NOTES.md) — security posture, parser hardening, threat model
 * [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — build, Docker/compose, ops notes, roadmap
 * [`docs/SECURITY_NOTES.md`](docs/SECURITY_NOTES.md) — crypto design notes
 * [`demo/README.md`](demo/README.md) — loopback demo walkthrough
