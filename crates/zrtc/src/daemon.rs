@@ -126,10 +126,13 @@ pub async fn run(mut cfg: Config) -> Result<(), String> {
     tracing::info!("sip/udp listening on {udp_bind}");
 
     let registry: crate::core::ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
-    let (core_tx, core_rx) = mpsc::unbounded_channel::<Incoming>();
+    // Bounded: when the core pump falls behind, listener tasks back-pressure
+    // instead of queueing attacker-supplied messages without limit.
+    let (core_tx, core_rx) = mpsc::channel::<Incoming>(1024);
     let ctx = ListenerCtx {
         core: core_tx.clone(),
         registry: registry.clone(),
+        idle: transport::STREAM_IDLE,
     };
 
     // ---- core pump -------------------------------------------------------
@@ -357,10 +360,13 @@ async fn udp_listener(
             Ok(msg) => {
                 // socket-boundary tap (SipRx)
                 observ::session::sip_tap(&buf[..n], src, observ::event::Transport::Udp, true);
-                let _ = ctx.core.send(Incoming {
-                    msg,
-                    resp: Responder { src, conn: None },
-                });
+                let _ = ctx
+                    .core
+                    .send(Incoming {
+                        msg,
+                        resp: Responder { src, conn: None },
+                    })
+                    .await;
             }
             Err(e) => tracing::debug!(%src, "udp unparseable: {e}"),
         }

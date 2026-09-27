@@ -26,7 +26,7 @@ use sip_core::builder::respond_to;
 use sip_core::message::{Method, Request, Response, SipMessage};
 use sip_core::serialize;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender};
 
 /// The Via host the `proxy` crate stamps on every hop it adds (see
 /// `proxy::make_via`); responses carrying it on top are routed by the proxy.
@@ -43,13 +43,14 @@ pub struct Incoming {
 pub struct Responder {
     pub src: SocketAddr,
     /// Present for connection-oriented transports: pushes serialized bytes
-    /// onto that connection's writer task.
-    pub conn: Option<UnboundedSender<Vec<u8>>>,
+    /// onto that connection's writer task (bounded: when a peer stops
+    /// reading, responses are dropped instead of buffering without limit).
+    pub conn: Option<Sender<Vec<u8>>>,
 }
 
 /// Registry of live connection-oriented transports (TCP/TLS/WSS), keyed by
 /// the peer socket address.
-pub type ConnRegistry = Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Vec<u8>>>>>;
+pub type ConnRegistry = Arc<Mutex<HashMap<SocketAddr, Sender<Vec<u8>>>>>;
 
 /// The core pipeline: SBC → router → registrar/proxy plus the response path.
 pub struct Core {
@@ -87,8 +88,9 @@ impl Core {
     }
 
     /// The core pump: consumes every incoming message forever, sweeping
-    /// expired registrar bindings every 30 s.
-    pub async fn pump(mut self, mut rx: UnboundedReceiver<Incoming>) {
+    /// expired registrar bindings every 30 s. The input channel is bounded:
+    /// listener tasks back-pressure when the pump falls behind.
+    pub async fn pump(mut self, mut rx: Receiver<Incoming>) {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -253,7 +255,9 @@ impl Core {
                         let tx = self.registry.lock().expect("registry lock").get(&dst).cloned();
                         match tx {
                             Some(tx) => {
-                                let _ = tx.send(bytes);
+                                if let Err(e) = tx.try_send(bytes) {
+                                    tracing::warn!(%dst, "reliable response dropped: {e}");
+                                }
                                 return;
                             }
                             None => {
@@ -271,7 +275,9 @@ impl Core {
     async fn send_to_responder(&self, bytes: &[u8], resp: &Responder) {
         match &resp.conn {
             Some(tx) => {
-                let _ = tx.send(bytes.to_vec());
+                if let Err(e) = tx.try_send(bytes.to_vec()) {
+                    tracing::warn!(src = %resp.src, "connection write dropped: {e}");
+                }
             }
             None => self.send_datagram(bytes, resp.src).await,
         }

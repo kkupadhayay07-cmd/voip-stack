@@ -33,21 +33,43 @@ pub fn parse_message(buf: &[u8]) -> Result<SipMessage> {
 
 /// Parses one message from a stream buffer (TCP/TLS/WS framing, RFC 3261
 /// §18.3 / RFC 7118 §4.2). Returns the message and the number of bytes
-/// consumed (header section + Content-Length body). Returns
-/// [`ParseError::Truncated`] while the buffer ends mid-message.
+/// consumed (leading keepalive CRLFs + header section + Content-Length
+/// body). Returns [`ParseError::Truncated`] while the buffer ends
+/// mid-message.
+///
+/// Adverse-input properties:
+///
+/// * CRLFs (RFC 3261 §7.5 keepalives) preceding the start line are skipped,
+///   not treated as an empty start line; a buffer of only CR/LF bytes is
+///   [`ParseError::Truncated`] (nothing to parse yet).
+/// * The header/body boundary is located on raw bytes, so a TCP segment
+///   that splits a multi-byte UTF-8 character yields [`Truncated`], never
+///   a spurious "invalid UTF-8" error that would discard the message.
+/// * An announced `Content-Length` larger than [`MAX_MESSAGE`] is rejected
+///   immediately (`TooLarge`) instead of stalling the stream until the
+///   64 KiB accumulator cap is reached.
 pub fn parse_stream(buf: &[u8]) -> Result<(SipMessage, usize)> {
     if buf.len() > MAX_MESSAGE {
         return Err(ParseError::TooLarge { limit: MAX_MESSAGE });
     }
 
-    // ---- locate the end of the header section (CRLFCRLF, LF-tolerant) ----
-    let text = std::str::from_utf8(buf)
-        .map_err(|_| ParseError::malformed("message is not valid UTF-8"))?;
-    let (header_end, sep_len) = find_header_end(text).ok_or(ParseError::Truncated {
+    // ---- RFC 3261 §7.5: ignore CRLFs preceding the start line ----
+    let Some(off) = buf.iter().position(|&b| b != b'\r' && b != b'\n') else {
+        return Err(ParseError::Truncated {
+            expected: 0,
+            got: buf.len(),
+        });
+    };
+    let buf = &buf[off..];
+
+    // ---- locate the end of the header section on raw bytes (CRLFCRLF,
+    //      LF-tolerant); UTF-8 is only required for the header section ----
+    let (header_end, sep_len) = find_header_end(buf).ok_or(ParseError::Truncated {
         expected: 0,
         got: buf.len(),
     })?;
-    let head = &text[..header_end];
+    let head = std::str::from_utf8(&buf[..header_end])
+        .map_err(|_| ParseError::malformed("header section is not valid UTF-8"))?;
     let body_start = header_end + sep_len;
 
     // ---- start line ----
@@ -140,6 +162,11 @@ pub fn parse_stream(buf: &[u8]) -> Result<(SipMessage, usize)> {
     }
 
     let cl = content_length.ok_or_else(|| ParseError::malformed("missing Content-Length"))?;
+    if cl > MAX_MESSAGE {
+        // A completed message can never exceed MAX_MESSAGE, so waiting for
+        // the announced body would only stall the stream (adverse input).
+        return Err(ParseError::TooLarge { limit: MAX_MESSAGE });
+    }
     let total_needed = body_start + cl;
     if buf.len() < total_needed {
         return Err(ParseError::Truncated {
@@ -151,7 +178,7 @@ pub fn parse_stream(buf: &[u8]) -> Result<(SipMessage, usize)> {
     // ---- build the message ----
     let body = buf[body_start..body_start + cl].to_vec();
     let msg = build_message(start_line, headers, body, line_no)?;
-    Ok((msg, total_needed))
+    Ok((msg, off + total_needed))
 }
 
 fn build_message(
@@ -236,19 +263,23 @@ fn build_message(
     }
 }
 
-/// Finds the header-terminating blank line. Returns (offset of the blank
-/// line start, separator length). Accepts CRLFCRLF, LFLF, CRLF-LF mixes and
-/// the deprecated bare-LF line endings.
-fn find_header_end(text: &str) -> Option<(usize, usize)> {
-    let b = text.as_bytes();
-    let n = b.len();
+/// Finds the header-terminating blank line in raw bytes. Returns (offset of
+/// the blank line start, separator length). Accepts CRLFCRLF, LFLF, CRLF-LF
+/// mixes and the deprecated bare-LF line endings. Operates on bytes so a
+/// UTF-8 multi-byte sequence split by the transport can never cause a
+/// spurious parse failure before the message is fully buffered.
+fn find_header_end(buf: &[u8]) -> Option<(usize, usize)> {
+    let n = buf.len();
     let mut i = 0usize;
     while i < n {
         // try to find a line that is empty (possibly after \r)
-        let line_len = b[i..].iter().position(|&c| c == b'\n')? + 1;
-        let line = &text[i..i + line_len];
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
+        let line_len = buf[i..].iter().position(|&c| c == b'\n')? + 1;
+        let line = &buf[i..i + line_len];
+        let mut end = line_len;
+        while end > 0 && (line[end - 1] == b'\r' || line[end - 1] == b'\n') {
+            end -= 1;
+        }
+        if end == 0 {
             return Some((i, line_len));
         }
         i += line_len;
@@ -414,5 +445,115 @@ i: folded\n\tcontinuation\r\nt: <sip:a@b>\r\nl: 0\r\n\r\n";
         assert!(is_token_byte(b'-'));
         assert!(!is_token_byte(b':'));
         assert!(!is_token_byte(b' '));
+    }
+
+    // ---- Batch A Task 2: framing audit under adverse input -----------------
+
+    /// RFC 3261 §7.5: CRLFs preceding the start line must be ignored (SIP
+    /// keepalives over stream transports). Used to be a fatal
+    /// "empty start line" that destroyed the buffered message.
+    #[test]
+    fn stream_ignores_leading_crlf_keepalive() {
+        let mut wire = b"\r\n\r\n".to_vec();
+        wire.extend_from_slice(INVITE);
+        let (msg, used) = parse_stream(&wire).unwrap();
+        assert_eq!(msg.method(), Some(Method::Invite));
+        assert_eq!(used, wire.len(), "consumed count includes the keepalive CRLFs");
+        // Datagram framing (UDP) tolerates leading CRLFs the same way.
+        assert!(parse_message(&wire).is_ok());
+    }
+
+    /// Bare-LF keepalives are equally harmless.
+    #[test]
+    fn stream_ignores_leading_bare_lf_keepalive() {
+        let mut wire = b"\n\n".to_vec();
+        wire.extend_from_slice(INVITE);
+        let (msg, used) = parse_stream(&wire).unwrap();
+        assert_eq!(msg.method(), Some(Method::Invite));
+        assert_eq!(used, wire.len());
+    }
+
+    /// A buffer of only CR/LF bytes (pure keepalive) is not an error worth
+    /// reporting upstream — it is "nothing to parse yet".
+    #[test]
+    fn pure_keepalive_is_truncated() {
+        assert!(matches!(
+            parse_stream(b"\r\n\r\n"),
+            Err(ParseError::Truncated { .. })
+        ));
+    }
+
+    /// A TCP segment may split a multi-byte UTF-8 character. The message
+    /// must surface as Truncated (wait for more bytes), never as a UTF-8
+    /// error, and must parse intact once complete. Regression test: the
+    /// old code validated the whole buffer as UTF-8 and discarded the
+    /// partial message on the split.
+    #[test]
+    fn stream_survives_utf8_split_across_segments() {
+        // body = "café" (é = 0xC3 0xA9), Content-Length: 5
+        let wire =
+            b"MESSAGE sip:a@b SIP/2.0\r\nVia: SIP/2.0/TCP h;branch=z9hG4bK1\r\n\
+Call-ID: u8@x\r\nCSeq: 1 MESSAGE\r\nContent-Type: text/plain\r\n\
+Content-Length: 5\r\n\r\ncaf\xC3\xA9";
+        let split = wire.len() - 1; // cut between 0xC3 and 0xA9
+        let (head, tail) = wire.split_at(split);
+        assert!(
+            matches!(parse_stream(head), Err(ParseError::Truncated { .. })),
+            "partial body must be Truncated, not Malformed"
+        );
+        let mut both = head.to_vec();
+        both.extend_from_slice(tail);
+        let (msg, used) = parse_stream(&both).unwrap();
+        assert_eq!(used, both.len());
+        match &msg {
+            SipMessage::Request(r) => assert_eq!(r.body, b"caf\xC3\xA9"),
+            _ => panic!("expected request"),
+        }
+    }
+
+    /// A Content-Length that can never complete (bigger than MAX_MESSAGE)
+    /// is rejected immediately instead of stalling the stream.
+    #[test]
+    fn oversized_content_length_is_too_large() {
+        let wire = b"MESSAGE sip:a@b SIP/2.0\r\nVia: SIP/2.0/TCP h;branch=z9hG4bK1\r\n\
+Call-ID: big@x\r\nCSeq: 1 MESSAGE\r\nContent-Length: 999999999\r\n\r\nshort";
+        assert!(matches!(
+            parse_stream(wire),
+            Err(ParseError::TooLarge { .. })
+        ));
+    }
+
+    /// Two pipelined messages in one buffer peel off one parse_stream call
+    /// at a time, including any keepalive CRLFs between them.
+    #[test]
+    fn stream_peels_pipelined_messages() {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(INVITE);
+        wire.extend_from_slice(b"\r\n"); // inter-message keepalive
+        wire.extend_from_slice(INVITE);
+        let (m1, used1) = parse_stream(&wire).unwrap();
+        assert_eq!(m1.method(), Some(Method::Invite));
+        let rest = &wire[used1..];
+        assert_eq!(rest.len(), b"\r\n".len() + INVITE.len());
+        // The second message parses from the remainder, keepalive included,
+        // and consumes it exactly.
+        let (m2, used2) = parse_stream(rest).unwrap();
+        assert_eq!(m2.method(), Some(Method::Invite));
+        assert_eq!(used2, rest.len());
+        // A keepalive-only remainder is Truncated (nothing to parse), not
+        // an error.
+        assert!(matches!(parse_stream(b"\r\n"), Err(ParseError::Truncated { .. })));
+    }
+
+    /// Invalid UTF-8 inside the header section is still a real error (only
+    /// the body was made byte-opaque).
+    #[test]
+    fn invalid_utf8_in_headers_is_malformed() {
+        let wire = b"MESSAGE sip:a@b SIP/2.0\r\nVia: SIP/2.0/TCP \xFF\xFE;branch=z9hG4bK1\r\n\
+Call-ID: bad@x\r\nCSeq: 1 MESSAGE\r\nContent-Length: 0\r\n\r\n";
+        assert!(matches!(
+            parse_stream(wire),
+            Err(ParseError::Malformed { .. })
+        ));
     }
 }
