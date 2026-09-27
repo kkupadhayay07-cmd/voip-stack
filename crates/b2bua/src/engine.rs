@@ -601,6 +601,12 @@ impl B2bua {
                 at: Instant::now(),
             })
             .ok();
+        // leg-up tap (side B answered)
+        observ::session::emit_for(a_id, observ::EventKind::B2buaLegUp {
+            side: "B".into(),
+            peer: call.leg_b.as_ref().map(|l| l.remote_sip).unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
+            codec: call.leg_b.as_ref().map(Leg::codec_name).unwrap_or_default(),
+        });
         self.cdr
             .send(CdrEvent::LegConfirmed {
                 call_id: a_id.to_string(),
@@ -672,9 +678,13 @@ impl B2bua {
                         // B's encoder and vice versa.
                         let (a_out, b_in) = tokio::sync::mpsc::channel(64);
                         let (b_out, a_in) = tokio::sync::mpsc::channel(64);
+                        let sess_a = observ::CallSession::new(a_id, None, None)
+                            .with_leg(observ::event::Leg::A);
+                        let sess_b = observ::CallSession::new(a_id, None, None)
+                            .with_leg(observ::event::Leg::B);
                         match (
-                            media::start_with_socket(cfg_a, a_sock, a_out, a_in),
-                            media::start_with_socket(cfg_b, b_sock, b_out, b_in),
+                            media::start_with_socket_session(cfg_a, a_sock, a_out, a_in, sess_a),
+                            media::start_with_socket_session(cfg_b, b_sock, b_out, b_in, sess_b),
                         ) {
                             (Ok(ha), Ok(hb)) => {
                                 seed_remote(&ha, &pa).await;
@@ -694,6 +704,12 @@ impl B2bua {
                                         at: Instant::now(),
                                     })
                                     .ok();
+                                // leg-up tap (side A answered)
+                                observ::session::emit_for(a_id, observ::EventKind::B2buaLegUp {
+                                    side: "A".into(),
+                                    peer: call.leg_a.as_ref().map(|l| l.remote_sip).unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
+                                    codec: format!("{ca:?}"),
+                                });
                             }
                             (Err(e), _) | (_, Err(e)) => {
                                 tracing::error!(call_id = %a_id, "pump start failed: {e}");
@@ -925,6 +941,19 @@ impl Leg {
 /// Stops pumps, emits the terminal CDR and drops the call.
 fn teardown(calls: &mut HashMap<String, Call>, id: &str, reason: &str) {
     if let Some(mut c) = calls.remove(id) {
+        // leg-down tap for every leg that was up
+        if c.leg_a.is_some() {
+            observ::session::emit_for(id, observ::EventKind::B2buaLegDown {
+                side: "A".into(),
+                reason: reason.to_string(),
+            });
+        }
+        if c.leg_b.is_some() {
+            observ::session::emit_for(id, observ::EventKind::B2buaLegDown {
+                side: "B".into(),
+                reason: reason.to_string(),
+            });
+        }
         let duration = c.created.elapsed().as_millis() as u64;
         let a2b = c
             .leg_b

@@ -52,6 +52,9 @@ pub struct PumpHandle {
 pub struct MediaStats {
     pub frames_encoded: std::sync::atomic::AtomicU64,
     pub frames_concealed: std::sync::atomic::AtomicU64,
+    pub packets_rx: std::sync::atomic::AtomicU64,
+    pub packets_tx: std::sync::atomic::AtomicU64,
+    pub packets_lost: std::sync::atomic::AtomicU64,
 }
 
 impl MediaStats {
@@ -60,6 +63,15 @@ impl MediaStats {
     }
     pub fn frames_concealed(&self) -> u64 {
         self.frames_concealed.load(Relaxed)
+    }
+    pub fn packets_rx(&self) -> u64 {
+        self.packets_rx.load(Relaxed)
+    }
+    pub fn packets_tx(&self) -> u64 {
+        self.packets_tx.load(Relaxed)
+    }
+    pub fn packets_lost(&self) -> u64 {
+        self.packets_lost.load(Relaxed)
     }
 }
 
@@ -101,6 +113,19 @@ pub fn start_with_socket(
     bridge_out: mpsc::Sender<Vec<i16>>,
     bridge_in: mpsc::Receiver<Vec<i16>>,
 ) -> Result<PumpHandle, codecs::CodecError> {
+    start_with_socket_session(cfg, rtp, bridge_out, bridge_in, observ::CallSession::detached())
+}
+
+/// Same as [`start_with_socket`] but with a call context so the pump emits
+/// correlated observability events (MediaStart/MediaStats/MediaEnd, RTP
+/// packet taps).
+pub fn start_with_socket_session(
+    cfg: PumpConfig,
+    rtp: Arc<UdpSocket>,
+    bridge_out: mpsc::Sender<Vec<i16>>,
+    bridge_in: mpsc::Receiver<Vec<i16>>,
+    session: observ::CallSession,
+) -> Result<PumpHandle, codecs::CodecError> {
     let remote = Arc::new(Mutex::new(None::<SocketAddr>));
     let stats = Arc::new(MediaStats::default());
     let (stop_tx, stop) = watch::channel(false);
@@ -118,6 +143,7 @@ pub fn start_with_socket(
         stop,
         bridge_out,
         bridge_in,
+        session,
     ));
     Ok(PumpHandle {
         stop: stop_tx,
@@ -141,7 +167,27 @@ async fn run_pump(
     mut stop: watch::Receiver<bool>,
     bridge_out: mpsc::Sender<Vec<i16>>,
     mut bridge_in: mpsc::Receiver<Vec<i16>>,
+    session: observ::CallSession,
 ) {
+    let local = rtp
+        .local_addr()
+        .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
+    // A wildcard bind must not leak 0.0.0.0 into capture addresses.
+    let local = if local.ip().is_unspecified() {
+        std::net::SocketAddr::new(
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            local.port(),
+        )
+    } else {
+        local
+    };
+    // media hook: pump start
+    session.emit(observ::EventKind::MediaStart {
+        pump_leg: session.leg(),
+        local,
+        rx_codec: format!("{:?}", cfg.rx_codec),
+        tx_codec: format!("{:?}", cfg.tx_codec),
+    });
     let rx_clock = rtp_clock(cfg.rx_codec);
     let tx_clock = rtp_clock(cfg.tx_codec);
     let rx_channels = dec.channels();
@@ -165,6 +211,8 @@ async fn run_pump(
     let frame_dur = Duration::from_nanos(1_000_000_000 * frame_pcm / u64::from(enc.sample_rate()));
     let mut ticker = tokio::time::interval(frame_dur.max(Duration::from_millis(5)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut stats_tick = tokio::time::interval(Duration::from_secs(5));
+    stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut out_seq: u16 = rand::thread_rng().gen();
     let mut out_ts: u32 = rand::thread_rng().gen();
@@ -174,6 +222,17 @@ async fn run_pump(
     loop {
         tokio::select! {
             _ = stop.changed() => break,
+            _ = stats_tick.tick() => {
+                // media hook: rolling counters every 5 s
+                session.emit(observ::EventKind::MediaStats {
+                    pump_leg: session.leg(),
+                    rx: stats.packets_rx(),
+                    tx: stats.packets_tx(),
+                    lost: stats.packets_lost(),
+                    jitter_ms: jb.jitter_ms(),
+                    plc: stats.frames_concealed(),
+                });
+            }
             r = rtp.recv_from(&mut buf) => {
                 let (n, src) = match r {
                     Ok(x) => x,
@@ -181,6 +240,9 @@ async fn run_pump(
                 };
                 if rtp::looks_like_rtcp(&buf[..n]) { continue; }
                 let Ok(pkt) = RtpPacket::parse(&buf[..n]) else { continue };
+                stats.packets_rx.fetch_add(1, Relaxed);
+                // media hook: RTP packet tap
+                observ::session::rtp_tap(session.call_id(), session.leg(), src, local, &buf[..n], true);
                 {
                     let mut r = remote.lock().await;
                     if r.is_none_or(|a| a != src) {
@@ -200,7 +262,11 @@ async fn run_pump(
                     out_seq = out_seq.wrapping_add(1);
                     let dst = *remote.lock().await;
                     if let Some(dst) = dst {
-                        let _ = rtp.send_to(&relay.encode(), dst).await;
+                        // media hook: DTMF relay tap
+                        let wire = relay.encode();
+                        stats.packets_tx.fetch_add(1, Relaxed);
+                        observ::session::rtp_tap(session.call_id(), session.leg(), local, dst, &wire, false);
+                        let _ = rtp.send_to(&wire, dst).await;
                     }
                     continue;
                 }
@@ -215,7 +281,7 @@ async fn run_pump(
                 ) {
                     PushResult::Buffered => {}
                     PushResult::Probation => {}
-                    PushResult::Late => {}
+                    PushResult::Late => { stats.packets_lost.fetch_add(1, Relaxed); }
                     PushResult::Duplicate => {}
                 }
             }
@@ -274,7 +340,11 @@ async fn run_pump(
                         stats.frames_encoded.fetch_add(1, Relaxed);
                         let dst = *remote.lock().await;
                         if let Some(dst) = dst {
-                            let _ = rtp.send_to(&pkt.encode(), dst).await;
+                            // media hook: encoded frame tap
+                            let encoded = pkt.encode();
+                            stats.packets_tx.fetch_add(1, Relaxed);
+                            observ::session::rtp_tap(session.call_id(), session.leg(), local, dst, &encoded, false);
+                            let _ = rtp.send_to(&encoded, dst).await;
                         }
                     }
                     enc_in.drain(..frame_len);
@@ -282,6 +352,17 @@ async fn run_pump(
             }
         }
     }
+    // media hook: pump end with final counters
+    let talk_ms = started.elapsed().as_millis() as u64;
+    session.emit(observ::EventKind::MediaEnd {
+        pump_leg: session.leg(),
+        rx: stats.packets_rx(),
+        tx: stats.packets_tx(),
+        lost: stats.packets_lost(),
+        jitter_ms: jb.jitter_ms(),
+        plc: stats.frames_concealed(),
+        talk_ms,
+    });
     tracing::debug!(
         "pump stopped: encoded={} concealed={}",
         stats.frames_encoded(),

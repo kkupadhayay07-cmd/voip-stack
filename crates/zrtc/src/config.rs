@@ -27,6 +27,8 @@ pub struct Config {
     pub ai_bridge: AiBridge,
     #[serde(default)]
     pub api: Api,
+    #[serde(default)]
+    pub observ: Observ,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -304,6 +306,103 @@ impl Default for Api {
 
 fn default_api_port() -> u16 {
     8080
+}
+
+// --------------------------------------------------------------- observ --
+
+/// In-process observability: event bus writers (pcap + per-call traces).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Observ {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Directory for pcap files, trace logs and status.json.
+    #[serde(default = "default_log_dir")]
+    pub log_dir: String,
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+    #[serde(default)]
+    pub pcap: ObservPcap,
+    #[serde(default)]
+    pub trace: ObservTrace,
+}
+
+impl Default for Observ {
+    fn default() -> Self {
+        Observ {
+            enabled: true,
+            log_dir: default_log_dir(),
+            log_level: default_log_level(),
+            pcap: ObservPcap::default(),
+            trace: ObservTrace::default(),
+        }
+    }
+}
+
+fn default_log_dir() -> String {
+    "/var/log/zrtc".into()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ObservPcap {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_sip_file")]
+    pub sip_file: String,
+    #[serde(default = "default_rtp_file")]
+    pub rtp_file: String,
+    #[serde(default = "default_true")]
+    pub include_payload: bool,
+    #[serde(default = "default_max_file_mb")]
+    pub max_file_mb: u64,
+}
+
+impl Default for ObservPcap {
+    fn default() -> Self {
+        ObservPcap {
+            enabled: true,
+            sip_file: default_sip_file(),
+            rtp_file: default_rtp_file(),
+            include_payload: true,
+            max_file_mb: default_max_file_mb(),
+        }
+    }
+}
+
+fn default_sip_file() -> String {
+    "sip.pcap".into()
+}
+fn default_rtp_file() -> String {
+    "rtp.pcap".into()
+}
+fn default_max_file_mb() -> u64 {
+    512
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ObservTrace {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub include_sdp: bool,
+    #[serde(default = "default_true")]
+    pub include_sip_bodies: bool,
+    #[serde(default = "default_flush_interval_ms")]
+    pub flush_interval_ms: u64,
+}
+
+impl Default for ObservTrace {
+    fn default() -> Self {
+        ObservTrace {
+            enabled: true,
+            include_sdp: true,
+            include_sip_bodies: true,
+            flush_interval_ms: default_flush_interval_ms(),
+        }
+    }
+}
+
+fn default_flush_interval_ms() -> u64 {
+    100
 }
 
 // ------------------------------------------------------------------ trunk --

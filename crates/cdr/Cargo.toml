@@ -6,6 +6,7 @@ license.workspace = true
 description = "Call Detail Records: lifecycle events, durable store with query API, retention policy, RFC-compliant fields"
 
 [dependencies]
+observ = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

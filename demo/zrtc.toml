@@ -47,3 +47,22 @@ enabled = true
 
 [api]
 port = 8080
+
+[observ]
+enabled = true
+# /var/log/zrtc is the production default; the demo uses a writable dir.
+log_dir = "/tmp/zrtc-observ"
+log_level = "info"
+
+[observ.pcap]
+enabled = true
+sip_file = "sip.pcap"
+rtp_file = "rtp.pcap"
+include_payload = true
+max_file_mb = 512
+
+[observ.trace]
+enabled = true
+include_sdp = true
+include_sip_bodies = true
+flush_interval_ms = 100

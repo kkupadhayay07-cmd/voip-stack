@@ -62,6 +62,35 @@ pub async fn run(mut cfg: Config) -> Result<(), String> {
     let tls_acceptor = identity.acceptor()?;
     let wss_acceptor = identity.acceptor()?;
 
+    // ---- observability ---------------------------------------------------
+    if cfg.observ.enabled {
+        let bus = std::sync::Arc::new(observ::EventBus::new(8192));
+        observ::bus::install_global(bus.clone());
+        let o = &cfg.observ;
+        let handles = observ::spawn::spawn_writers(
+            bus,
+            observ::spawn::WriterConfig {
+                log_dir: o.log_dir.clone().into(),
+                pcap_enabled: o.pcap.enabled,
+                sip_file: o.pcap.sip_file.clone(),
+                rtp_file: o.pcap.rtp_file.clone(),
+                include_payload: o.pcap.include_payload,
+                max_file_mb: o.pcap.max_file_mb,
+                trace_enabled: o.trace.enabled,
+                include_sdp: o.trace.include_sdp,
+                include_sip_bodies: o.trace.include_sip_bodies,
+                flush_interval_ms: o.trace.flush_interval_ms,
+            },
+        );
+        tracing::info!(
+            "observ: log_dir={} pcap={} trace={} ({} writers)",
+            o.log_dir,
+            o.pcap.enabled,
+            o.trace.enabled,
+            handles.len()
+        );
+    }
+
     // ---- CDR store + REST API -------------------------------------------
     let cdr_store = CdrStore::new(10_000);
     let dialer = Dialer::new(cdr_store.clone());
@@ -326,6 +355,8 @@ async fn udp_listener(
             .map_err(|e| format!("udp recv: {e}"))?;
         match parse_message(&buf[..n]) {
             Ok(msg) => {
+                // socket-boundary tap (SipRx)
+                observ::session::sip_tap(&buf[..n], src, observ::event::Transport::Udp, true);
                 let _ = ctx.core.send(Incoming {
                     msg,
                     resp: Responder { src, conn: None },

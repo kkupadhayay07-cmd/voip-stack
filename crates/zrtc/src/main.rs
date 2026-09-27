@@ -24,6 +24,7 @@
 
 mod auth;
 mod cdr_task;
+mod cli_observ;
 mod config;
 mod core;
 mod daemon;
@@ -52,7 +53,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     match first {
         "daemon" => {
             let cfg = load_config(&args[1..])?;
-            init_tracing(&cfg.daemon.log_level);
+            init_tracing(&cfg.daemon.log_level, Some(&cfg.observ.log_level));
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| format!("runtime: {e}"))?;
             rt.block_on(daemon::run(cfg))
@@ -60,7 +61,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "--config" => {
             // `zrtc --config path` == `zrtc daemon --config path`
             let cfg = load_config(&args)?;
-            init_tracing(&cfg.daemon.log_level);
+            init_tracing(&cfg.daemon.log_level, Some(&cfg.observ.log_level));
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| format!("runtime: {e}"))?;
             rt.block_on(daemon::run(cfg))
@@ -86,7 +87,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .ok_or("usage: zrtc call <e164> [--config path]")?
                 .clone();
             let cfg = load_config(rest)?;
-            init_tracing(&cfg.daemon.log_level);
+            init_tracing(&cfg.daemon.log_level, Some(&cfg.observ.log_level));
             let mut cfg = cfg;
             cfg.apply_trunk_env();
             let rtp_ms: u64 = flag_or(rest, "--rtp-ms", "1000")
@@ -106,8 +107,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .map_err(|_| format!("trunk call timed out after {secs}s"))?
             })
         }
+        other if matches!(other, "trace" | "calls" | "diag" | "capture" | "metrics") => {
+            let cfg = load_config_optional(&args[1..]);
+            let log_dir = cli_observ::resolve_log_dir(cfg.as_ref());
+            cli_observ::run(other, &args[1..], &log_dir)
+        }
         other => Err(format!(
-            "unknown subcommand '{other}' (expected daemon, uac or call)"
+            "unknown subcommand '{other}' (expected daemon, uac, call, trace, calls, diag, capture or metrics)"
         )),
     }
 }
@@ -121,13 +127,19 @@ fn load_config(rest: &[String]) -> Result<Config, String> {
     Config::load(std::path::Path::new(&path)).map_err(|e| format!("{e} (from {path})"))
 }
 
-fn init_tracing(level: &str) {
+/// Best-effort config load for read-only CLI commands (trace/calls/...).
+fn load_config_optional(rest: &[String]) -> Option<Config> {
+    load_config(rest).ok()
+}
+
+fn init_tracing(level: &str, observ_level: Option<&str>) {
+    let obs = observ_level.unwrap_or("info");
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| {
                     tracing_subscriber::EnvFilter::new(format!(
-                        "{level},hyper=warn,h2=warn,rustls=warn"
+                        "{level},observ={obs},hyper=warn,h2=warn,rustls=warn"
                     ))
                 }),
         )

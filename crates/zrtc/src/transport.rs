@@ -47,8 +47,15 @@ where
         .insert(peer, tx.clone());
 
     let (mut rd, mut wr) = tokio::io::split(stream);
+    let transport = if label == "tls" {
+        observ::event::Transport::Tls
+    } else {
+        observ::event::Transport::Tcp
+    };
     let writer = tokio::spawn(async move {
         while let Some(bytes) = rx.recv().await {
+            // socket-boundary tap (SipTx over TCP/TLS)
+            observ::session::sip_tap(&bytes, peer, transport, false);
             if wr.write_all(&bytes).await.is_err() {
                 break;
             }
@@ -66,6 +73,8 @@ where
                 loop {
                     match parse_stream(&acc) {
                         Ok((msg, used)) => {
+                            // socket-boundary tap (SipRx over TCP/TLS)
+                            observ::session::sip_tap(&acc[..used], peer, transport, true);
                             acc.drain(..used);
                             let _ = ctx.core.send(Incoming {
                                 msg,
@@ -183,6 +192,9 @@ pub async fn run_wss(
 
             let writer = tokio::spawn(async move {
                 while let Some(bytes) = rx.recv().await {
+                    // socket-boundary tap (SipTx over WSS — cleartext after
+                    // the TLS/WSS layers, so plaintext=true)
+                    observ::session::sip_tap(&bytes, peer, observ::event::Transport::Ws, false);
                     if sink.send(Message::Binary(bytes)).await.is_err() {
                         break;
                     }
@@ -199,6 +211,8 @@ pub async fn run_wss(
                 };
                 match parse_message(&payload) {
                     Ok(msg) => {
+                        // socket-boundary tap (SipRx over WSS)
+                        observ::session::sip_tap(&payload, peer, observ::event::Transport::Ws, true);
                         let _ = ctx.core.send(Incoming {
                             msg,
                             resp: Responder {

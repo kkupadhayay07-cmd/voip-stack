@@ -278,6 +278,8 @@ impl Core {
     }
 
     async fn send_datagram(&self, bytes: &[u8], dst: SocketAddr) {
+        // socket-boundary tap (SipTx over the shared UDP socket)
+        observ::session::sip_tap(bytes, dst, observ::event::Transport::Udp, false);
         if let Err(e) = self.udp.send_to(bytes, dst).await {
             tracing::warn!(%dst, "udp send failed: {e}");
         }

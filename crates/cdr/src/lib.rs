@@ -240,6 +240,13 @@ impl CdrStore {
 
     /// Persist a finished record.
     pub async fn insert(&self, record: CallRecord) {
+        // cdr hook: announce the finished record on the observability bus
+        observ::session::emit_for(
+            &record.a_call_id,
+            observ::EventKind::CdrWritten {
+                record: serde_json::to_value(&record).unwrap_or_default(),
+            },
+        );
         let mut inner = self.inner.write().await;
         if inner.records.len() >= inner.capacity {
             let overflow = inner.records.len() + 1 - inner.capacity;

@@ -6,6 +6,7 @@ license.workspace = true
 description = "Session border controller: topology hiding, ACL, rate limiting, NAT latching"
 
 [dependencies]
+observ = { workspace = true }
 sip-core = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }

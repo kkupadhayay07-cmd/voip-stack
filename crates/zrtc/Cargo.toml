@@ -10,6 +10,7 @@ name = "zrtc"
 path = "src/main.rs"
 
 [dependencies]
+observ = { workspace = true }
 sip-core = { workspace = true }
 sdp = { workspace = true }
 rtp = { workspace = true }

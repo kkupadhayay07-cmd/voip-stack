@@ -6,6 +6,7 @@ license.workspace = true
 description = "SIP registrar (RFC 3261 §10): AoR bindings, Digest authentication, expiry/wildcard handling"
 
 [dependencies]
+observ = { workspace = true }
 sip-core = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }

@@ -6,6 +6,7 @@ license.workspace = true
 description = "Stateful SIP proxy (RFC 3261 §16): routing, forking, Record-Route, Via handling, CANCEL propagation"
 
 [dependencies]
+observ = { workspace = true }
 sip-core = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }

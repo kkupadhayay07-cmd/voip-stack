@@ -128,3 +128,26 @@ enabled = true
 
 [api]
 port = 8080
+
+# ---------------------------------------------------------------------------
+# Observability (Level 1 hardening): everything in-process, correlated by
+# SIP Call-ID. Writers produce Wireshark-openable pcap files plus a
+# human-readable per-call trace.
+# ---------------------------------------------------------------------------
+[observ]
+enabled = true
+log_dir = "/var/log/zrtc"
+log_level = "info"
+
+[observ.pcap]
+enabled = true
+sip_file = "sip.pcap"
+rtp_file = "rtp.pcap"
+include_payload = true
+max_file_mb = 512
+
+[observ.trace]
+enabled = true
+include_sdp = true
+include_sip_bodies = true
+flush_interval_ms = 100

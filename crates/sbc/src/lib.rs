@@ -21,6 +21,8 @@ use sip_core::builder::respond_to;
 use sip_core::ids::new_call_id;
 use sip_core::{Request, Response};
 
+use observ::EventKind;
+
 /// A CIDR range for ACL rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cidr {
@@ -206,10 +208,14 @@ impl Sbc {
     pub fn process_request(&mut self, req: &Request, source: SocketAddr) -> SbcAction {
         // 1. ACL.
         if !self.config.acl.admits(source.ip()) {
+            // decision tap (refuse: acl)
+            observ::session::emit_for(req.headers.call_id().unwrap_or(""), EventKind::SbcDecision { verdict: "refuse".into(), reason: "acl".into(), method: req.method.to_string(), source });
             return SbcAction::Refuse(respond_to(req, 403, "Forbidden", Vec::new(), None));
         }
         // 2. Rate limit.
         if !self.check_rate(source) {
+            // decision tap (refuse: rate)
+            observ::session::emit_for(req.headers.call_id().unwrap_or(""), EventKind::SbcDecision { verdict: "refuse".into(), reason: "rate".into(), method: req.method.to_string(), source });
             return SbcAction::Refuse(respond_to(
                 req,
                 503,
@@ -276,6 +282,8 @@ impl Sbc {
             }
         }
 
+        // decision tap (relay: passed acl + rate)
+        observ::session::emit_for(req.headers.call_id().unwrap_or(""), EventKind::SbcDecision { verdict: "relay".into(), reason: "ok".into(), method: req.method.to_string(), source });
         SbcAction::Relay(req)
     }
 

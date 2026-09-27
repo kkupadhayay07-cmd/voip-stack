@@ -10,6 +10,7 @@ name = "b2bua-demo"
 path = "src/bin/b2bua-demo.rs"
 
 [dependencies]
+observ = { workspace = true }
 sip-core = { workspace = true }
 sdp = { workspace = true }
 rtp = { workspace = true }
