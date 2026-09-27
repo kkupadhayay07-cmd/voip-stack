@@ -174,8 +174,14 @@ impl Core {
                 let call_id = req.headers.call_id().unwrap_or("").to_string();
                 if !call_id.is_empty() {
                     // Learn where this call's client lives (for core→client
-                    // in-dialog requests later).
-                    self.clients.insert(call_id, resp.clone());
+                    // in-dialog requests later); a BYE/CANCEL ends the call —
+                    // drop the learned endpoint so the map cannot grow
+                    // without bound.
+                    if matches!(req.method, Method::Bye | Method::Cancel) {
+                        self.clients.remove(&call_id);
+                    } else {
+                        self.clients.insert(call_id, resp.clone());
+                    }
                 }
                 for action in self.proxy.process_request(&req, src) {
                     match action {
@@ -214,30 +220,46 @@ impl Core {
     }
 
     async fn handle_response(&mut self, resp: Response, from: Responder) {
-        // Responses from the core (b2bua) carry our proxy Via on top.
+        // The top Via host says who owns this response: the proxy (responses
+        // to proxied requests) or the in-process b2bua (responses to its own
+        // in-dialog requests, which the core relays transparently).
         let ours = resp
             .headers
             .first_via()
             .map(|v| v.sent_by.host.to_string())
             .unwrap_or_default();
-        if ours != PROXY_VIA_HOST {
+        let b2bua = ours == self.b2bua_addr.ip().to_string();
+        if ours != PROXY_VIA_HOST && !b2bua {
             // Late stray response (e.g. from a torn-down transaction): drop.
             tracing::debug!(src = %from.src, "unmatched response dropped");
             return;
         }
-
-        // RFC 3261 §18.2.2: over reliable transports a response must travel
-        // on the same connection the request arrived on — route by the
-        // learned per-call client endpoint first.
-        let call_id = resp.headers.call_id().unwrap_or("").to_string();
-        if let Some(client) = self.clients.get(&call_id).cloned() {
+        if b2bua {
+            // The b2bua is a dialog-level UA here: its Via was never touched
+            // by the proxy, so hand the response straight back to it.
             let bytes = serialize(&SipMessage::Response(resp));
-            self.send_to_responder(&bytes, &client).await;
+            self.send_datagram(&bytes, self.b2bua_addr).await;
             return;
         }
 
-        // Fallback: resolve the destination from the remaining top Via.
-        if let Some(proxy::Action::Send(msg, dst)) = self.proxy.process_response(&resp, from.src) {
+        // SBC response processing first: unhide rewritten Call-IDs so the
+        // learned-client lookup (keyed by the real Call-ID) can match.
+        let resp = self.sbc.process_response(&resp);
+        // §16.7: pop the proxy's own Via (this used to be skipped entirely
+        // when a client endpoint was known, leaving the proxy Via unpopped
+        // and making proxy.process_response unreachable dead code).
+        let forwarded = self.proxy.process_response(&resp, from.src);
+
+        // RFC 3261 §18.2.2: prefer the learned per-call endpoint.
+        let call_id = resp.headers.call_id().unwrap_or("").to_string();
+        if let Some(client) = self.clients.get(&call_id).cloned() {
+            if let Some(proxy::Action::Send(msg, _)) = forwarded {
+                let bytes = serialize(&msg);
+                self.send_to_responder(&bytes, &client).await;
+                return;
+            }
+        }
+        if let Some(proxy::Action::Send(msg, dst)) = forwarded {
             self.send_routed_response(msg, dst).await;
         }
     }
@@ -301,7 +323,15 @@ impl Core {
     fn sync_bindings(&mut self) {
         self.proxy.bindings.clear();
         for (aor, entry) in &self.registrar.aors {
-            let user = aor.split('@').next().unwrap_or(aor).to_string();
+            // Aors are "sip:<user>@<domain>" — the proxy keys bindings by
+            // the bare user part (request-URI user), not "sip:<user>".
+            let user = aor
+                .trim_start_matches("sips:")
+                .trim_start_matches("sip:")
+                .split('@')
+                .next()
+                .unwrap_or(aor)
+                .to_string();
             let contacts: Vec<String> = entry
                 .active()
                 .into_iter()

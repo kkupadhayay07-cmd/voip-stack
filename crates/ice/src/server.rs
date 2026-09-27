@@ -288,8 +288,18 @@ impl StunTurnServer {
             return;
         }
 
-        // Bind a relay socket.
-        let Ok(relay) = UdpSocket::bind(("0.0.0.0", 0)).await else {
+        // Bind a relay socket. Advertise a CONCRETE address: the server's
+        // own listen IP when it is specific, otherwise the client's source
+        // IP. 0.0.0.0 is non-routable (and fails outright on Windows,
+        // WSAEADDRNOTAVAIL).
+        let server_ip = self
+            .socket
+            .local_addr()
+            .map(|a| a.ip())
+            .ok()
+            .filter(|ip| !ip.is_unspecified())
+            .unwrap_or_else(|| from.ip());
+        let Ok(relay) = UdpSocket::bind((server_ip, 0)).await else {
             let mut err = stun::Message::new_with_txid(stun::ALLOCATE_ERROR_RESPONSE, msg.tx_id);
             err.add_error_code(508, "Insufficient Capacity");
             let _ = self.socket.send_to(&err.encode(), from).await;

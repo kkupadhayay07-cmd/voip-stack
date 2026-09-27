@@ -43,12 +43,17 @@ impl Endpoint {
             .to_string();
 
         // Accept HOST, HOST:PORT or a full "sip:...@HOST:PORT" — extract the
-        // host:port part and resolve it (DNS allowed).
+        // host:port part and resolve it (DNS allowed). A user@ part is
+        // stripped: "sip:user@host:port" must resolve host:port, not
+        // "user@host".
         let hostport = address
             .strip_prefix("sip:")
             .or_else(|| address.strip_prefix("sips:"))
             .unwrap_or(&address)
             .split(';')
+            .next()
+            .unwrap_or(&address)
+            .rsplit('@')
             .next()
             .unwrap_or(&address)
             .to_string();

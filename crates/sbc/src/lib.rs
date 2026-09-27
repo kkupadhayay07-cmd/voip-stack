@@ -39,25 +39,31 @@ impl Cidr {
     }
 
     /// Does `ip` fall inside the range?
+    ///
+    /// A misconfigured prefix (e.g. `/33` on IPv4) is clamped to the address
+    /// width instead of shifting out of range — an ACL must never be able to
+    /// panic on the packet path.
     pub fn contains(&self, ip: IpAddr) -> bool {
         match (self.addr, ip) {
             (IpAddr::V4(base), IpAddr::V4(other)) => {
                 let base = u32::from(base);
                 let other = u32::from(other);
-                let mask = if self.prefix == 0 {
+                let prefix = (self.prefix as u32).min(32);
+                let mask = if prefix == 0 {
                     0
                 } else {
-                    u32::MAX << (32 - self.prefix as u32)
+                    u32::MAX << (32 - prefix)
                 };
                 base & mask == other & mask
             }
             (IpAddr::V6(base), IpAddr::V6(other)) => {
                 let base = u128::from(base);
                 let other = u128::from(other);
-                let mask = if self.prefix == 0 {
+                let prefix = (self.prefix as u32).min(128);
+                let mask = if prefix == 0 {
                     0
                 } else {
-                    u128::MAX << (128 - self.prefix as u32)
+                    u128::MAX << (128 - prefix)
                 };
                 base & mask == other & mask
             }
@@ -344,5 +350,38 @@ fn rewrite_hosts(value: &str, from_host: &str, to_host: &str) -> String {
         value.replace(from_host, to_host)
     } else {
         value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// Regression: a misconfigured prefix (e.g. /33) used to shift out of
+    /// range and panic on the packet path.
+    #[test]
+    fn cidr_out_of_range_prefix_never_panics() {
+        let c = Cidr::v4(10, 0, 0, 0, 33);
+        assert!(!c.contains(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(c.contains(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0))));
+        let absurd = Cidr::v4(10, 0, 0, 0, 255);
+        assert!(!absurd.contains(IpAddr::V4(Ipv4Addr::new(11, 0, 0, 0))));
+        // Sanity: normal prefixes still behave.
+        assert!(Cidr::v4(0, 0, 0, 0, 0).contains(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))));
+        assert!(Cidr::v4(10, 0, 0, 5, 32).contains(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))));
+        assert!(!Cidr::v4(10, 0, 0, 5, 32).contains(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6))));
+        let v6 = Cidr {
+            addr: IpAddr::V6("2001:db8::".parse().unwrap()),
+            prefix: 200, // clamped to /128: exact match only
+        };
+        assert!(v6.contains(IpAddr::V6("2001:db8::".parse().unwrap())));
+        assert!(!v6.contains(IpAddr::V6("2001:db8::1".parse().unwrap())));
+        let v6net = Cidr {
+            addr: IpAddr::V6("2001:db8::".parse().unwrap()),
+            prefix: 64,
+        };
+        assert!(v6net.contains(IpAddr::V6("2001:db8::1".parse().unwrap())));
+        assert!(!v6net.contains(IpAddr::V6("2001:db9::1".parse().unwrap())));
     }
 }

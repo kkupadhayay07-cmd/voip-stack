@@ -99,10 +99,14 @@ impl ClientInviteTx {
             return Vec::new();
         }
         self.sent = true;
+        // Timer B (INVITE) / F (non-INVITE) apply on EVERY transport
+        // (§17.1.1.2/§17.1.2.2); only the retransmission timers A/E are
+        // UDP-only. Without Timer B a TCP/TLS/WSS peer that stalls would
+        // hang the transaction forever.
+        self.timer_b = Some(add(now, self.cfg.timer_bfh()));
         if !self.transport.is_reliable() {
             self.a_interval = self.cfg.t1;
             self.timer_a = Some(add(now, self.cfg.t1));
-            self.timer_b = Some(add(now, self.cfg.timer_bfh()));
         }
         vec![TxAction::SendRequest(self.req.clone())]
     }
@@ -278,10 +282,12 @@ impl ClientNonInviteTx {
             return Vec::new();
         }
         self.sent = true;
+        // Timer F applies on every transport (§17.1.2.2); Timer E is
+        // UDP-only retransmission.
+        self.timer_f = Some(add(now, self.cfg.timer_bfh()));
         if !self.transport.is_reliable() {
             self.e_interval = self.cfg.t1;
             self.timer_e = Some(add(now, self.cfg.t1));
-            self.timer_f = Some(add(now, self.cfg.timer_bfh()));
         }
         vec![TxAction::SendRequest(self.req.clone())]
     }

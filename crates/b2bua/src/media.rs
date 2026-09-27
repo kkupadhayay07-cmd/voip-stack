@@ -106,12 +106,29 @@ fn to_mono(pcm: &[i16], channels: u8) -> Vec<i16> {
         .collect()
 }
 
+/// One hop across the media bridge: decoded PCM toward the peer pump's
+/// encoder, or an RFC 4733 DTMF event to be packetized onto the peer's
+/// socket. DTMF crosses here (not out the receiving socket) so events reach
+/// the OTHER leg instead of echoing back to the sender.
+#[derive(Debug)]
+pub enum BridgeMsg {
+    Pcm(Vec<i16>),
+    Dtmf {
+        /// Original RTP timestamp of the event.
+        timestamp: u32,
+        /// Original marker bit.
+        marker: bool,
+        /// RFC 4733 event payload bytes.
+        payload: Vec<u8>,
+    },
+}
+
 /// Starts a media pump on an already-bound RTP socket.
 pub fn start_with_socket(
     cfg: PumpConfig,
     rtp: Arc<UdpSocket>,
-    bridge_out: mpsc::Sender<Vec<i16>>,
-    bridge_in: mpsc::Receiver<Vec<i16>>,
+    bridge_out: mpsc::Sender<BridgeMsg>,
+    bridge_in: mpsc::Receiver<BridgeMsg>,
 ) -> Result<PumpHandle, codecs::CodecError> {
     start_with_socket_session(
         cfg,
@@ -128,8 +145,8 @@ pub fn start_with_socket(
 pub fn start_with_socket_session(
     cfg: PumpConfig,
     rtp: Arc<UdpSocket>,
-    bridge_out: mpsc::Sender<Vec<i16>>,
-    bridge_in: mpsc::Receiver<Vec<i16>>,
+    bridge_out: mpsc::Sender<BridgeMsg>,
+    bridge_in: mpsc::Receiver<BridgeMsg>,
     session: observ::CallSession,
 ) -> Result<PumpHandle, codecs::CodecError> {
     let remote = Arc::new(Mutex::new(None::<SocketAddr>));
@@ -171,8 +188,8 @@ async fn run_pump(
     mut dec: Box<dyn Decoder>,
     mut enc: Box<dyn Encoder>,
     mut stop: watch::Receiver<bool>,
-    bridge_out: mpsc::Sender<Vec<i16>>,
-    mut bridge_in: mpsc::Receiver<Vec<i16>>,
+    bridge_out: mpsc::Sender<BridgeMsg>,
+    mut bridge_in: mpsc::Receiver<BridgeMsg>,
     session: observ::CallSession,
 ) {
     let local = rtp
@@ -253,24 +270,17 @@ async fn run_pump(
                         *r = Some(src);
                     }
                 }
-                // RFC 4733 DTMF passthrough (payload relay, PT rewritten).
+                // RFC 4733 DTMF passthrough: the event crosses the bridge
+                // so the PEER leg packetizes and sends it — never back to
+                // the sender this socket just received it from.
                 if Some(pkt.payload_type()) == cfg.te_pt_rx {
-                    let relay = RtpPacket::new(
-                        cfg.te_pt_tx.unwrap_or(cfg.tx_pt),
-                        out_seq,
-                        pkt.header.timestamp,
-                        ssrc,
-                        pkt.header.marker,
-                        Bytes::copy_from_slice(&pkt.payload),
-                    );
-                    out_seq = out_seq.wrapping_add(1);
-                    let dst = *remote.lock().await;
-                    if let Some(dst) = dst {
-                        // media hook: DTMF relay tap
-                        let wire = relay.encode();
-                        stats.packets_tx.fetch_add(1, Relaxed);
-                        observ::session::rtp_tap(session.call_id(), session.leg(), local, dst, &wire, false);
-                        let _ = rtp.send_to(&wire, dst).await;
+                    let msg = BridgeMsg::Dtmf {
+                        timestamp: pkt.header.timestamp,
+                        marker: pkt.header.marker,
+                        payload: pkt.payload.to_vec(),
+                    };
+                    if bridge_out.try_send(msg).is_err() {
+                        tracing::debug!("bridge backpressured; DTMF event dropped");
                     }
                     continue;
                 }
@@ -318,7 +328,7 @@ async fn run_pump(
                         }
                         None => bridge.extend_from_slice(&mono),
                     }
-                    if bridge_out.try_send(bridge).is_err() {
+                    if bridge_out.try_send(BridgeMsg::Pcm(bridge)).is_err() {
                         tracing::debug!("bridge backpressured; frame dropped");
                     } else {
                         continue;
@@ -326,34 +336,63 @@ async fn run_pump(
                     break;
                 }
             }
-            pcm_in = bridge_in.recv() => {
-                let Some(pcm) = pcm_in else { continue };
-                // Peer audio: bridge → TX rate, encode all full frames.
-                let mut enc_in: Vec<i16> = Vec::with_capacity(pcm.len() + 64);
-                match &mut rs_tx {
-                    Some(r) => {
-                        r.process(&pcm, &mut enc_in);
-                    }
-                    None => enc_in.extend_from_slice(&pcm),
-                }
-                let frame_len = enc.frame_samples() * enc.channels() as usize;
-                while enc_in.len() >= frame_len {
-                    let mut wire = Vec::with_capacity(256);
-                    if enc.encode(&enc_in[..frame_len], &mut wire).is_ok() && !wire.is_empty() {
-                        let pkt = RtpPacket::new(cfg.tx_pt, out_seq, out_ts, ssrc, false, Bytes::from(wire));
+            msg_in = bridge_in.recv() => {
+                let Some(msg) = msg_in else { continue };
+                match msg {
+                    BridgeMsg::Dtmf {
+                        timestamp,
+                        marker,
+                        payload,
+                    } => {
+                        // Peer-leg DTMF: packetize with OUR telephone-event
+                        // PT and sequence, keep the original timestamp.
+                        let relay = RtpPacket::new(
+                            cfg.te_pt_tx.unwrap_or(cfg.tx_pt),
+                            out_seq,
+                            timestamp,
+                            ssrc,
+                            marker,
+                            Bytes::from(payload),
+                        );
                         out_seq = out_seq.wrapping_add(1);
-                        out_ts = out_ts.wrapping_add(ts_inc);
-                        stats.frames_encoded.fetch_add(1, Relaxed);
                         let dst = *remote.lock().await;
                         if let Some(dst) = dst {
-                            // media hook: encoded frame tap
-                            let encoded = pkt.encode();
+                            // media hook: DTMF relay tap
+                            let wire = relay.encode();
                             stats.packets_tx.fetch_add(1, Relaxed);
-                            observ::session::rtp_tap(session.call_id(), session.leg(), local, dst, &encoded, false);
-                            let _ = rtp.send_to(&encoded, dst).await;
+                            observ::session::rtp_tap(session.call_id(), session.leg(), local, dst, &wire, false);
+                            let _ = rtp.send_to(&wire, dst).await;
                         }
                     }
-                    enc_in.drain(..frame_len);
+                    BridgeMsg::Pcm(pcm) => {
+                        // Peer audio: bridge → TX rate, encode all full frames.
+                        let mut enc_in: Vec<i16> = Vec::with_capacity(pcm.len() + 64);
+                        match &mut rs_tx {
+                            Some(r) => {
+                                r.process(&pcm, &mut enc_in);
+                            }
+                            None => enc_in.extend_from_slice(&pcm),
+                        }
+                        let frame_len = enc.frame_samples() * enc.channels() as usize;
+                        while enc_in.len() >= frame_len {
+                            let mut wire = Vec::with_capacity(256);
+                            if enc.encode(&enc_in[..frame_len], &mut wire).is_ok() && !wire.is_empty() {
+                                let pkt = RtpPacket::new(cfg.tx_pt, out_seq, out_ts, ssrc, false, Bytes::from(wire));
+                                out_seq = out_seq.wrapping_add(1);
+                                out_ts = out_ts.wrapping_add(ts_inc);
+                                stats.frames_encoded.fetch_add(1, Relaxed);
+                                let dst = *remote.lock().await;
+                                if let Some(dst) = dst {
+                                    // media hook: encoded frame tap
+                                    let encoded = pkt.encode();
+                                    stats.packets_tx.fetch_add(1, Relaxed);
+                                    observ::session::rtp_tap(session.call_id(), session.leg(), local, dst, &encoded, false);
+                                    let _ = rtp.send_to(&encoded, dst).await;
+                                }
+                            }
+                            enc_in.drain(..frame_len);
+                        }
+                    }
                 }
             }
         }

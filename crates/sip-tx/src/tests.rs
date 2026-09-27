@@ -434,7 +434,11 @@ fn reliable_transport_has_no_retransmit_timers() {
     let c = Clock::new();
     let mut tx = ClientInviteTx::new(base_req(Method::Invite), Transport::Tls);
     assert_send_request(&tx.on_event(TxEvent::Send, c.at(0)), 1);
-    assert_eq!(tx.next_deadline(), None, "no Timer A/B on TCP");
+    assert_eq!(
+        tx.next_deadline(),
+        Some(c.at(32_000)),
+        "no Timer A on TCP, but Timer B must still guard the request"
+    );
 
     let actions = tx.on_event(
         TxEvent::Received(resp_for(tx.request(), 486, BRANCH, Some("t"))),

@@ -180,21 +180,17 @@ fn corrupted_tag_and_ciphertext_rejected() {
             "{profile:?}"
         );
 
-        // Payload integrity: GCM authenticates the payload; RFC 3711's
-        // HMAC-SHA1 authenticates header+ROC only, so a payload flip is
-        // undetectable by design (documented property of the transform).
+        // Tamper with the payload (byte 13 = payload byte 1): with the RFC
+        // 3711 §3.1/§4.2 Authenticated Portion (header + payload + ROC) the
+        // forgery must be detected for EVERY profile, AES-CM included.
         let mut pkt = rtp(1, 77, b"secret");
         tx.protect(&mut pkt).unwrap();
         pkt[13] ^= 0x40;
-        if profile.is_aead() {
-            assert_eq!(
-                rx.unprotect(&mut pkt),
-                Err(SrtpError::AuthFailed),
-                "{profile:?}"
-            );
-        } else {
-            rx.unprotect(&mut pkt).unwrap();
-        }
+        assert_eq!(
+            rx.unprotect(&mut pkt),
+            Err(SrtpError::AuthFailed),
+            "payload tampering must be authenticated away: {profile:?}"
+        );
 
         // Tamper with the last byte (inside the tag) — fresh seq so the
         // replay window does not reject it before authentication.

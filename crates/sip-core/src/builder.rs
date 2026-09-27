@@ -28,19 +28,23 @@ impl RequestBuilder {
         }
     }
 
-    /// Adds a top Via hop (`sent_by` as `host` / `host:port`).
+    /// Adds a top Via hop (`sent_by` as `host` / `host:port` / `[v6]:port`).
     pub fn via(
         mut self,
         transport: crate::uri::TransportKind,
         sent_by: &str,
         branch: Option<&str>,
     ) -> Self {
+        // An "ip:port" sent-by must split into host + port; passing the whole
+        // string to Host::parse used to produce Domain("ip:port"), a Via
+        // header no response router could parse back.
+        let (host_txt, port) = split_host_port(sent_by);
         let via = Via {
             transport,
             sent_by: crate::headers::HostPort {
-                host: crate::uri::Host::parse(sent_by, sent_by.contains('['))
-                    .unwrap_or(crate::uri::Host::Domain(sent_by.to_string())),
-                port: None,
+                host: crate::uri::Host::parse(host_txt, host_txt.contains('['))
+                    .unwrap_or(crate::uri::Host::Domain(host_txt.to_string())),
+                port,
             },
             branch: Some(branch.map(str::to_string).unwrap_or_else(new_branch)),
             received: None,
@@ -185,6 +189,23 @@ pub fn respond_to(
     }
 }
 
+/// Splits a Via sent-by into host text and optional port, respecting IPv6
+/// brackets (`host`, `host:port`, `[v6]`, `[v6]:port`).
+fn split_host_port(s: &str) -> (&str, Option<u16>) {
+    if let Some(rb) = s.rfind(']') {
+        if s[rb + 1..].starts_with(':') {
+            return (&s[..=rb], s[rb + 2..].parse().ok());
+        }
+        return (s, None);
+    }
+    match s.rfind(':') {
+        Some(i) if s[i + 1..].parse::<u16>().is_ok() => {
+            (&s[..i], Some(s[i + 1..].parse().unwrap()))
+        }
+        _ => (s, None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +275,33 @@ mod tests {
         assert!(req.headers.call_id().is_some());
         assert_eq!(req.headers.cseq().unwrap().seq, 1);
         assert_eq!(req.headers.cseq().unwrap().method, Method::Options);
+    }
+
+    /// Regression: an "ip:port" sent-by used to become
+    /// Host::Domain("ip:port") — a Via no response router could parse.
+    #[test]
+    fn via_sent_by_splits_host_and_port() {
+        let req = RequestBuilder::new(Method::Options, SipUri::parse("sip:a@b.com").unwrap())
+            .via(TransportKind::Udp, "10.0.0.7:5070", Some("z9hG4bKv"))
+            .build();
+        let v = req.headers.first_via().unwrap();
+        assert_eq!(v.sent_by.host.to_string(), "10.0.0.7");
+        assert_eq!(v.sent_by.port, Some(5070));
+
+        // Bare host keeps port None; IPv6 brackets are respected.
+        let req2 = RequestBuilder::new(Method::Options, SipUri::parse("sip:a@b.com").unwrap())
+            .via(TransportKind::Udp, "proxy.example.com", Some("z9hG4bKv2"))
+            .build();
+        let v2 = req2.headers.first_via().unwrap();
+        assert_eq!(v2.sent_by.host.to_string(), "proxy.example.com");
+        assert_eq!(v2.sent_by.port, None);
+
+        let req3 = RequestBuilder::new(Method::Options, SipUri::parse("sip:a@b.com").unwrap())
+            .via(TransportKind::Udp, "[2001:db8::1]:5060", Some("z9hG4bKv3"))
+            .build();
+        let v3 = req3.headers.first_via().unwrap();
+        // IPv6 hosts display bracketed (wire form per RFC 3261 §19.3).
+        assert_eq!(v3.sent_by.host.to_string(), "[2001:db8::1]");
+        assert_eq!(v3.sent_by.port, Some(5060));
     }
 }

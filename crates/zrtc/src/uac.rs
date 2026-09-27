@@ -181,7 +181,9 @@ impl Session {
         let target = opts.target;
         let (link, streaming, local_override) = match opts.transport {
             Transport::Udp => {
-                let s = UdpSocket::bind(("127.0.0.1", 0))
+                // Wildcard bind: a 127.0.0.1-bound socket cannot talk to any
+                // non-loopback peer (connect() fails with EINVAL).
+                let s = UdpSocket::bind(("0.0.0.0", 0))
                     .await
                     .map_err(|e| e.to_string())?;
                 s.connect(target).await.map_err(|e| e.to_string())?;

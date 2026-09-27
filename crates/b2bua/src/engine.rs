@@ -72,6 +72,24 @@ impl Default for B2buaConfig {
 }
 
 const TICK: Duration = Duration::from_millis(200);
+/// RFC 3261 Timer H budget: how long we wait for the ACK that confirms a
+/// 2xx before declaring the dialog dead (64·T1).
+const ACK_TIMEOUT: Duration = Duration::from_millis(64 * 500);
+
+/// The engine's local listen address, used as the Via sent-by on requests we
+/// originate (a remote peer's address must never appear as OUR sent-by).
+static ENGINE_VIA: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+
+/// Via sent-by text for engine-originated requests: bare IP when the port is
+/// 5060, `ip:port` otherwise.
+fn via_sent_by() -> String {
+    match ENGINE_VIA.get() {
+        Some(a) if a.port() == 5060 => a.ip().to_string(),
+        Some(a) => a.to_string(),
+        // Direct construction without run_on (unit tests): loopback default.
+        None => "127.0.0.1".into(),
+    }
+}
 
 struct Leg {
     call_id: String,
@@ -137,6 +155,10 @@ struct Call {
     a_prack_acked: Option<u32>,
     /// A 421 (`Require: 100rel`) retry was already attempted on the dial.
     b_421_retried: bool,
+    /// Deadline for the caller's ACK after we sent the 200 (Timer H is gone
+    /// with the transaction; without this a dead caller leaks the call and
+    /// both media pumps forever).
+    a_ack_deadline: Option<Instant>,
     created: Instant,
 }
 
@@ -163,6 +185,7 @@ impl Call {
             a_hold: false,
             a_prack_acked: None,
             b_421_retried: false,
+            a_ack_deadline: None,
             created: Instant::now(),
         }
     }
@@ -189,6 +212,7 @@ impl B2bua {
     pub async fn run_on(self, sock: Arc<UdpSocket>) -> std::io::Result<()> {
         self.install_sink();
         let local = sock.local_addr()?;
+        let _ = ENGINE_VIA.set(local);
         tracing::info!(%local, "b2bua engine listening");
 
         let mut buf = vec![0u8; 65_535];
@@ -211,14 +235,19 @@ impl B2bua {
                     self.dispatch(&sock, local, &mut calls, &mut b_to_a, msg, src).await;
                 }
                 _ = ticker.tick() => {
-                    self.timers(&sock, &mut calls).await;
+                    self.timers(&sock, &mut calls, &mut b_to_a).await;
                 }
             }
         }
     }
 
     /// Drives transaction timers and the RFC 4028 session-refresh clocks.
-    async fn timers(&self, sock: &Arc<UdpSocket>, calls: &mut HashMap<String, Call>) {
+    async fn timers(
+        &self,
+        sock: &Arc<UdpSocket>,
+        calls: &mut HashMap<String, Call>,
+        b_to_a: &mut HashMap<String, String>,
+    ) {
         let now = Instant::now();
 
         // Phase 1: drive every transaction whose deadline has passed and
@@ -231,6 +260,7 @@ impl B2bua {
             refresh_a_failed: bool,
             expired: bool,
             prack_gave_up: bool,
+            ack_timeout: bool,
         }
         let mut due: Vec<(String, Due)> = Vec::new();
         for (id, c) in calls.iter_mut() {
@@ -241,6 +271,7 @@ impl B2bua {
                 refresh_a_failed: false,
                 expired: false,
                 prack_gave_up: false,
+                ack_timeout: false,
             };
 
             // Leg B: client INVITE transaction — Timer A retransmissions,
@@ -405,12 +436,23 @@ impl B2bua {
                 }
             }
 
+            // Timer H equivalent at dialog level: a 2xx we sent (confirm_leg_a
+            // took the server transaction, which owned the old Timer H) must
+            // still be ACKed within 64·T1 or the caller is gone.
+            if let Some(dl) = c.a_ack_deadline {
+                let confirmed = c.leg_a.as_ref().map(|a| a.confirmed).unwrap_or(false);
+                if !confirmed && now >= dl {
+                    d.ack_timeout = true;
+                }
+            }
+
             if !d.sends.is_empty()
                 || d.dial_b_failed
                 || d.refresh_a_failed
                 || d.refresh_b_failed
                 || d.expired
                 || d.prack_gave_up
+                || d.ack_timeout
             {
                 due.push((id.clone(), d));
             }
@@ -446,7 +488,7 @@ impl B2bua {
                         }
                     }
                 }
-                teardown(calls, &id, "Timer B");
+                teardown(calls, b_to_a, &id, "Timer B");
             }
             if d.refresh_a_failed || d.refresh_b_failed {
                 tracing::warn!(call_id = %id, "session refresh timed out (Timer B)");
@@ -461,7 +503,7 @@ impl B2bua {
                         Self::send_bye(sock, b).await;
                     }
                 }
-                teardown(calls, &id, "session refresh failed");
+                teardown(calls, b_to_a, &id, "session refresh failed");
             }
             if d.expired {
                 tracing::info!(call_id = %id, "session timer expired (RFC 4028 §10)");
@@ -473,7 +515,7 @@ impl B2bua {
                         Self::send_bye(sock, b).await;
                     }
                 }
-                teardown(calls, &id, "session timer expired");
+                teardown(calls, b_to_a, &id, "session timer expired");
             }
             if d.prack_gave_up {
                 tracing::warn!(
@@ -511,7 +553,16 @@ impl B2bua {
                         }
                     }
                 }
-                teardown(calls, &id, "PRACK never arrived");
+                teardown(calls, b_to_a, &id, "PRACK never arrived");
+            }
+            if d.ack_timeout {
+                tracing::warn!(call_id = %id, "no ACK after 200 (Timer H, dialog level)");
+                if let Some(c) = calls.get_mut(&id) {
+                    if let Some(b) = c.leg_b.as_mut() {
+                        Self::send_bye(sock, b).await;
+                    }
+                }
+                teardown(calls, b_to_a, &id, "no ACK after 200");
             }
         }
     }
@@ -537,7 +588,10 @@ impl B2bua {
                     }
                     Method::Ack => self.on_ack(calls, &req, &call_id),
                     Method::Bye => self.on_bye(sock, calls, b_to_a, &req, call_id, src).await,
-                    Method::Cancel => self.on_cancel(sock, calls, &req, call_id, src).await,
+                    Method::Cancel => {
+                        self.on_cancel(sock, calls, b_to_a, &req, call_id, src)
+                            .await;
+                    }
                     Method::Update => {
                         self.on_update(sock, calls, b_to_a, &req, &call_id, src)
                             .await;
@@ -574,7 +628,7 @@ impl B2bua {
                     // Not a leg-B dialog. The only responses we receive on a
                     // leg-A Call-ID are answers to our own in-dialog requests
                     // (currently the session-refresh re-INVITE).
-                    self.on_a_refresh_response(sock, calls, &call_id, resp)
+                    self.on_a_refresh_response(sock, calls, b_to_a, &call_id, resp)
                         .await;
                     return;
                 };
@@ -643,10 +697,10 @@ impl B2bua {
                     if class == 2 {
                         match kind {
                             BInviteKind::Dial => {
-                                self.on_b_answered(sock, local, calls, &a_id, &call_id, r)
+                                self.on_b_answered(sock, local, calls, b_to_a, &a_id, &call_id, r)
                                     .await;
                             }
-                            BInviteKind::Refresh => self.on_b_refreshed(calls, &a_id, &r),
+                            BInviteKind::Refresh => self.on_b_refreshed(sock, calls, &a_id, &r),
                         }
                     } else {
                         // 421 Extension Required on the initial dial: the
@@ -696,7 +750,7 @@ impl B2bua {
                                         }
                                     }
                                 }
-                                teardown(calls, &a_id, "leg B rejected");
+                                teardown(calls, b_to_a, &a_id, "leg B rejected");
                             }
                             BInviteKind::Refresh => {
                                 // Refresh refused: the session is over
@@ -711,7 +765,7 @@ impl B2bua {
                                         Self::send_bye(sock, a).await;
                                     }
                                 }
-                                teardown(calls, &a_id, "leg B session refresh failed");
+                                teardown(calls, b_to_a, &a_id, "leg B session refresh failed");
                             }
                         }
                     }
@@ -1086,11 +1140,15 @@ impl B2bua {
         calls.insert(call_id, call);
     }
 
+    /// Handles the leg-B 200 (dial). Internal but takes the full per-call
+    /// context, like `on_invite`.
+    #[allow(clippy::too_many_arguments)]
     async fn on_b_answered(
         &self,
         sock: &Arc<UdpSocket>,
         local: SocketAddr,
         calls: &mut HashMap<String, Call>,
+        b_to_a: &mut HashMap<String, String>,
         a_id: &str,
         b_id: &str,
         resp: Response,
@@ -1138,7 +1196,7 @@ impl B2bua {
                             .await;
                     }
                 }
-                teardown(calls, a_id, "bad SDP from leg B");
+                teardown(calls, b_to_a, a_id, "bad SDP from leg B");
                 return;
             }
         }
@@ -1245,12 +1303,14 @@ impl B2bua {
             let _ = sock.send_to(&bytes, a_snapshot.1).await;
         }
 
-        // The leg-A session clock starts at dialog establishment (§10).
+        // The leg-A session clock starts at dialog establishment (§10), and
+        // the ACK deadline arms here too (dialog-level Timer H).
         if let Some(a) = call.leg_a.as_mut() {
             if let Some(t) = a.timer.as_mut() {
                 t.anchored = Instant::now();
             }
         }
+        call.a_ack_deadline = Some(Instant::now() + ACK_TIMEOUT);
 
         // Start both media pumps.
         let sockets = (
@@ -1356,6 +1416,7 @@ impl B2bua {
             if let Some(a) = c.leg_a.as_mut() {
                 if !a.confirmed {
                     a.confirmed = true;
+                    c.a_ack_deadline = None;
                     self.cdr
                         .send(CdrEvent::LegConfirmed {
                             call_id: call_id.to_string(),
@@ -1417,39 +1478,79 @@ impl B2bua {
                 })
                 .ok();
         }
-        teardown(calls, &a_id, "BYE");
-        b_to_a.retain(|_, v| v != &a_id);
+        teardown(calls, b_to_a, &a_id, "BYE");
     }
 
     async fn on_cancel(
         &self,
         sock: &Arc<UdpSocket>,
         calls: &mut HashMap<String, Call>,
+        b_to_a: &mut HashMap<String, String>,
         req: &Request,
         call_id: String,
         src: SocketAddr,
     ) {
+        // 200 to the CANCEL itself.
         let resp = sip_core::builder::respond_to(req, 200, "OK", Vec::new(), None);
         let _ = sock
             .send_to(&serialize(&SipMessage::Response(resp)), src)
             .await;
-        if let Some(c) = calls.get_mut(&call_id) {
-            if let Some(a) = &c.leg_a {
-                if let Some(invite) = &a.invite {
-                    let resp487 = sip_core::builder::respond_to(
-                        invite,
-                        487,
-                        "Request Terminated",
-                        Vec::new(),
-                        None,
-                    );
+        let Some(c) = calls.get_mut(&call_id) else {
+            return;
+        };
+        // RFC 3261 §9.2: a CANCEL has no effect on an INVITE whose final
+        // response is already out — an answered call must survive it.
+        if c.leg_a.as_ref().map(|a| a.confirmed).unwrap_or(false) {
+            return;
+        }
+        // 487 to A through the server transaction when it is still open.
+        if let Some(a) = &c.leg_a {
+            if let Some(invite) = &a.invite {
+                let resp487 = sip_core::builder::respond_to(
+                    invite,
+                    487,
+                    "Request Terminated",
+                    Vec::new(),
+                    Some(&a.local_tag),
+                );
+                if let Some(mut a_tx) = c.a_tx.take() {
+                    send_staged(&mut a_tx, sock, a.remote_sip, resp487).await;
+                } else {
                     let _ = sock
                         .send_to(&serialize(&SipMessage::Response(resp487)), a.remote_sip)
                         .await;
                 }
             }
         }
-        teardown(calls, &call_id, "CANCEL");
+        // §9.1: CANCEL the outgoing dial INVITE (same CSeq + top Via branch).
+        if let Some(b) = c.leg_b.as_ref() {
+            if let Some(b_tx) = c.b_tx.as_ref() {
+                let orig = b_tx.request();
+                let top_branch = via_branch(orig).unwrap_or_default();
+                let cancel = RequestBuilder::new(Method::Cancel, orig.uri.clone())
+                    .via(TransportKind::Udp, &via_sent_by(), Some(&top_branch))
+                    .from(
+                        orig.headers
+                            .get("From")
+                            .map(str::to_string)
+                            .unwrap_or_else(|| "<sip:zrtc@b2bua>".into())
+                            .as_str(),
+                    )
+                    .to(orig
+                        .headers
+                        .get("To")
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "<sip:peer>".into())
+                        .as_str())
+                    .call_id(Some(&b.call_id))
+                    .cseq(orig.headers.cseq().map(|x| x.seq).unwrap_or(1))
+                    .build();
+                let _ = sock
+                    .send_to(&serialize(&SipMessage::Request(cancel)), b.remote_sip)
+                    .await;
+            }
+        }
+        teardown(calls, b_to_a, &call_id, "CANCEL");
     }
 
     fn send_ack(&self, sock: &Arc<UdpSocket>, b: &Leg, cseq: u32) {
@@ -1459,11 +1560,7 @@ impl B2bua {
             .and_then(|c| extract_uri(&c))
             .unwrap_or_else(|| SipUri::parse(&format!("sip:peer@{}", b.remote_sip)).unwrap());
         let ack = RequestBuilder::new(Method::Ack, req_uri)
-            .via(
-                TransportKind::Udp,
-                &b.remote_sip.to_string(),
-                Some(&new_branch()),
-            )
+            .via(TransportKind::Udp, &via_sent_by(), Some(&new_branch()))
             .from(&format!("<sip:zrtc@b2bua>;tag={}", b.local_tag))
             .to(&format!(
                 "<sip:peer>;tag={}",
@@ -1489,11 +1586,7 @@ impl B2bua {
             .unwrap_or_else(|| SipUri::parse(&format!("sip:peer@{}", leg.remote_sip)).unwrap());
         let cseq = take_cseq(leg);
         let bye = RequestBuilder::new(Method::Bye, req_uri)
-            .via(
-                TransportKind::Udp,
-                &leg.remote_sip.to_string(),
-                Some(&new_branch()),
-            )
+            .via(TransportKind::Udp, &via_sent_by(), Some(&new_branch()))
             .from(&format!("<sip:zrtc@b2bua>;tag={}", leg.local_tag))
             .to(&format!(
                 "<sip:peer>;tag={}",
@@ -1507,7 +1600,13 @@ impl B2bua {
     }
 
     /// A 2xx to our leg-B session-refresh re-INVITE: re-anchor the clock.
-    fn on_b_refreshed(&self, calls: &mut HashMap<String, Call>, a_id: &str, resp: &Response) {
+    fn on_b_refreshed(
+        &self,
+        sock: &Arc<UdpSocket>,
+        calls: &mut HashMap<String, Call>,
+        a_id: &str,
+        resp: &Response,
+    ) {
         if let Some(call) = calls.get_mut(a_id) {
             if let Some(b) = call.leg_b.as_mut() {
                 if let Some(t) = b.timer.as_mut() {
@@ -1520,6 +1619,14 @@ impl B2bua {
                         t.interval
                     );
                 }
+                // RFC 3261 §13.2.2.4: a 2xx to our own re-INVITE is ACKed at
+                // dialog level (the client transaction only ACKs non-2xx).
+                if let Some(cseq) = resp.headers.cseq().map(|c| c.seq) {
+                    let ack_cseq = cseq;
+                    if let Some(b) = call.leg_b.as_ref() {
+                        self.send_ack(sock, b, ack_cseq);
+                    }
+                }
             }
         }
     }
@@ -1531,6 +1638,7 @@ impl B2bua {
         &self,
         sock: &Arc<UdpSocket>,
         calls: &mut HashMap<String, Call>,
+        b_to_a: &mut HashMap<String, String>,
         call_id: &str,
         resp: Response,
     ) {
@@ -1593,6 +1701,11 @@ impl B2bua {
                             t.interval
                         );
                     }
+                    // §13.2.2.4: ACK the 2xx at dialog level — without it the
+                    // peer retransmits the 200 for the rest of the session.
+                    if let Some(cseq) = r.headers.cseq().map(|c| c.seq) {
+                        self.send_ack(sock, a, cseq);
+                    }
                 }
             } else {
                 // Refresh refused: session over (RFC 4028 §11).
@@ -1604,7 +1717,7 @@ impl B2bua {
                 if let Some(b) = calls.get_mut(call_id).and_then(|c| c.leg_b.as_mut()) {
                     Self::send_bye(sock, b).await;
                 }
-                teardown(calls, call_id, "leg A session refresh failed");
+                teardown(calls, b_to_a, call_id, "leg A session refresh failed");
             }
         }
     }
@@ -1986,11 +2099,7 @@ impl B2bua {
                 .unwrap_or_else(|| SipUri::parse(&format!("sip:peer@{}", b.remote_sip)).unwrap());
             let cseq = take_cseq(b);
             let prack = RequestBuilder::new(Method::Prack, req_uri)
-                .via(
-                    TransportKind::Udp,
-                    &b.remote_sip.to_string(),
-                    Some(&new_branch()),
-                )
+                .via(TransportKind::Udp, &via_sent_by(), Some(&new_branch()))
                 .from(&format!("<sip:zrtc@b2bua>;tag={}", b.local_tag))
                 .to(&format!(
                     "<sip:peer>;tag={}",
@@ -2263,11 +2372,7 @@ fn refresh_reinvite(leg: &Leg, cseq: u32, we_are_uas: bool, offer: Vec<u8>) -> R
         .and_then(|c| extract_uri(&c))
         .unwrap_or_else(|| SipUri::parse(&format!("sip:peer@{}", leg.remote_sip)).unwrap());
     let mut invite = RequestBuilder::new(Method::Invite, req_uri)
-        .via(
-            TransportKind::Udp,
-            &leg.remote_sip.to_string(),
-            Some(&new_branch()),
-        )
+        .via(TransportKind::Udp, &via_sent_by(), Some(&new_branch()))
         .from(&format!("<sip:zrtc@b2bua>;tag={}", leg.local_tag))
         .to(&format!(
             "<sip:peer>;tag={}",
@@ -2373,8 +2478,16 @@ impl Leg {
     }
 }
 
-/// Stops pumps, emits the terminal CDR and drops the call.
-fn teardown(calls: &mut HashMap<String, Call>, id: &str, reason: &str) {
+/// Stops pumps, emits the terminal CDR and drops the call. Also clears the
+/// leg-B Call-ID alias so the map cannot leak entries on CANCEL, dial
+/// timeout, rejection or session expiry (only BYE used to clean it).
+fn teardown(
+    calls: &mut HashMap<String, Call>,
+    b_to_a: &mut HashMap<String, String>,
+    id: &str,
+    reason: &str,
+) {
+    b_to_a.retain(|_, v| v != id);
     if let Some(mut c) = calls.remove(id) {
         // leg-down tap for every leg that was up
         if c.leg_a.is_some() {

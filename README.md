@@ -119,6 +119,7 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
 * [`docs/DESIGN.md`](docs/DESIGN.md) — technical design (implementation contract)
 * [`docs/COMPLIANCE.md`](docs/COMPLIANCE.md) — honest per-RFC compliance matrix
 * [`docs/TESTING.md`](docs/TESTING.md) — test strategy, suite inventory, interop/conformance gates, CI
+* [`docs/BUG_AUDIT_2026-09.md`](docs/BUG_AUDIT_2026-09.md) — external audit triage: verdict + fix status for every reported finding
 * [`docs/SECURITY_NOTES.md`](docs/SECURITY_NOTES.md) — security posture, parser hardening, threat model
 * [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — build, Docker/compose, ops notes, roadmap
 * [`FINAL_REPORT.md`](FINAL_REPORT.md) — phase-completion report + post-report hardening addendum

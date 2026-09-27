@@ -295,7 +295,10 @@ impl DtlsEndpoint {
             .export_keying_material(
                 &mut material,
                 "EXTRACTOR-dtls_srtp",
-                Some(b"client\x00server\x00"),
+                // RFC 5764 §4.2: the extractor is invoked WITHOUT a context
+                // (use_context = 0). Any context bytes change the PRF seed
+                // and break interop with every compliant WebRTC stack.
+                None,
             )
             .map_err(|e| DtlsError::KeyExport(e.to_string()))?;
 

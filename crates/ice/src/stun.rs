@@ -41,11 +41,11 @@ pub const CHANNEL_BIND_RESPONSE: u16 = 0x0109;
 // -- Attribute registry ------------------------------------------------------
 
 pub const MAPPED_ADDRESS: u16 = 0x0001;
-pub const USERNAME: u16 = 0x0006; // also CHANNEL-NUMBER in ChannelBind
+pub const USERNAME: u16 = 0x0006;
 pub const MESSAGE_INTEGRITY: u16 = 0x0008;
 pub const ERROR_CODE: u16 = 0x0009;
 pub const UNKNOWN_ATTRIBUTES: u16 = 0x000A;
-pub const CHANNEL_NUMBER: u16 = 0x0006;
+pub const CHANNEL_NUMBER: u16 = 0x000C; // RFC 5766 §14.1
 pub const LIFETIME: u16 = 0x000D;
 pub const XOR_PEER_ADDRESS: u16 = 0x0012;
 pub const DATA: u16 = 0x0013;
@@ -250,18 +250,21 @@ impl Message {
         if v.len() < 4 {
             return None;
         }
-        // Error class in bits 7-4 of byte 1, number in byte 2
-        // (RFC 5389 §15.6).
-        let class = (v[1] & 0x07) as u16;
-        let number = v[2] as u16;
+        // RFC 5389 §15.6: value is [0, 0, class, number] + UTF-8 reason —
+        // class in bits 7-4 of byte 2, number in byte 3.
+        let class = (v[2] & 0x07) as u16;
+        let number = v[3] as u16;
         Some((
             class * 100 + number,
-            String::from_utf8_lossy(&v[3..]).into_owned(),
+            String::from_utf8_lossy(&v[4..]).into_owned(),
         ))
     }
 
     pub fn add_error_code(&mut self, code: u16, reason: &str) {
-        let mut v = vec![0u8, (code / 100) as u8, (code % 100) as u8];
+        // RFC 5389 §15.6: 4-byte header [0, 0, class, number] before the
+        // reason phrase (the old 3-byte form shifted everything by one byte
+        // on the wire).
+        let mut v = vec![0u8, 0u8, (code / 100) as u8, (code % 100) as u8];
         v.extend_from_slice(reason.as_bytes());
         self.add(ERROR_CODE, v);
     }
@@ -689,6 +692,10 @@ mod tests {
         m.add_error_code(401, "Unauthorized");
         assert_eq!(m.error_code().unwrap().0, 401);
         assert_eq!(m.error_code().unwrap().1, "Unauthorized");
+        // RFC 5389 §15.6 wire layout: [0, 0, class, number] + reason.
+        let raw = m.get(ERROR_CODE).unwrap();
+        assert_eq!(&raw[..4], &[0, 0, 4, 1]);
+        assert_eq!(&raw[4..], b"Unauthorized");
     }
 
     #[test]

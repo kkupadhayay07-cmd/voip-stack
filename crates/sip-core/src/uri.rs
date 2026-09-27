@@ -414,9 +414,14 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() + 1 && i + 2 < b.len() + 1 && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
+        // %XX decoding is byte-wise: slicing the &str here would panic on
+        // multi-byte UTF-8 following the '%' (untrusted input, RFC 3261
+        // allows any octet percent-encoded).
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = (b[i + 1] as char).to_digit(16);
+            let lo = (b[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push(((hi << 4) | lo) as u8);
                 i += 3;
                 continue;
             }
@@ -548,35 +553,32 @@ fn parse_sip_uri(s: &str) -> Result<SipUri> {
 
 fn parse_name_addr(s: &str) -> Result<NameAddr> {
     let s = s.trim();
-    let (display, uri_and_params) = if let Some(lt) = s.find('<') {
-        let close = s
-            .rfind('>')
-            .ok_or_else(|| ParseError::malformed("unterminated < in name-addr"))?;
-        let display = s[..lt].trim();
-        let display = if display.starts_with('"') && display.ends_with('"') && display.len() >= 2 {
-            display[1..display.len() - 1].to_string()
-        } else {
-            display.to_string()
-        };
-        let display = if display.is_empty() {
-            None
-        } else {
-            Some(display)
-        };
-        (display, &s[lt + 1..close])
-    } else {
-        (None, s)
+    // The closing '>' is searched AFTER the opening '<': a '>' inside the
+    // display name or before the '<' (e.g. `"a>b" <sip:x@y>` or `><`) must
+    // never make the slice bounds inverted (untrusted input).
+    let (display, uri_and_params, params_str) = match s.find('<') {
+        Some(lt) => {
+            let close = s[lt..]
+                .find('>')
+                .map(|off| lt + off)
+                .ok_or_else(|| ParseError::malformed("unterminated < in name-addr"))?;
+            let display = s[..lt].trim();
+            let display =
+                if display.starts_with('"') && display.ends_with('"') && display.len() >= 2 {
+                    display[1..display.len() - 1].to_string()
+                } else {
+                    display.to_string()
+                };
+            let display = if display.is_empty() {
+                None
+            } else {
+                Some(display)
+            };
+            (display, &s[lt + 1..close], &s[close + 1..])
+        }
+        None => (None, s, ""),
     };
-    let (uri_str, params_str) = if let Some(lt) = s.find('<') {
-        let _ = lt;
-        // params after the closing '>' were handled via uri_and_params slicing
-        let close = s.rfind('>').unwrap();
-        (uri_and_params, &s[close + 1..])
-    } else {
-        // bare addr-spec: params are part of the URI itself
-        (uri_and_params, "")
-    };
-    let addr = Addr::parse(uri_str.trim())?;
+    let addr = Addr::parse(uri_and_params.trim())?;
     let mut params = parse_params(params_str)?;
     let mut tag = None;
     params.retain(|p| {
@@ -721,5 +723,43 @@ mod tests {
     fn quoted_param_values() {
         let u = SipUri::parse("sip:a@b.c;method=\"INVITE\"").unwrap();
         assert_eq!(u.params[0].value.as_deref(), Some("INVITE"));
+    }
+
+    /// Regression: `To: ><` used to make `s[lt+1..close]` slice with
+    /// `close < lt+1` and panic on a single unauthenticated packet.
+    #[test]
+    fn name_addr_inverted_angle_brackets_is_an_error_not_a_panic() {
+        assert!(NameAddr::parse("><").is_err());
+        assert!(NameAddr::parse("> <").is_err());
+        // Stray '>' before the display is tolerated leniently (no panic).
+        assert!(NameAddr::parse(">\"x\" <sip:a@b>").is_ok());
+        // Unterminated '<' stays a clean error.
+        assert!(NameAddr::parse("<sip:a@b").is_err());
+    }
+
+    /// Regression: a '>' inside a quoted display name must not defeat the
+    /// closing-bracket search.
+    #[test]
+    fn name_addr_gt_inside_display_quotes() {
+        let n = NameAddr::parse("\"a>b\" <sip:x@y>").unwrap();
+        assert_eq!(n.display.as_deref(), Some("a>b"));
+        assert_eq!(n.addr.host_str(), "y");
+    }
+
+    /// Regression: percent-decoding is byte-wise — a '%' followed by
+    /// multi-byte UTF-8 used to slice inside a char boundary and panic.
+    #[test]
+    fn percent_decode_multibyte_after_percent_does_not_panic() {
+        // '%' + multi-byte é (0xC3 0xA9): neither a panic nor a mangled decode.
+        let s = "p=%a\u{e9}";
+        let out = percent_decode(s);
+        assert!(out.contains('\u{FFFD}') || out.starts_with("p="), "{out:?}");
+        // Valid escapes still decode; trailing garbage passes through.
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("%41%42"), "AB");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("end%4"), "end%4");
+        // High bytes round-trip through the lossy conversion untouched.
+        assert_eq!(percent_decode("caf\u{e9}"), "café");
     }
 }

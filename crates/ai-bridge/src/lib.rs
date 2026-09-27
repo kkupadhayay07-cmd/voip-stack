@@ -341,11 +341,18 @@ pub async fn audiosocket_server(
                 break;
             };
             let tx = events.clone();
-            let (_session, mut ev_rx) = AiSession::new(&peer.to_string());
-            let (_playback_tx, playback_rx) = mpsc::unbounded_channel();
+            let (session, mut ev_rx) = AiSession::new(&peer.to_string());
+            let (playback_tx, playback_rx) = mpsc::unbounded_channel();
             tokio::spawn(async move {
-                let mut session = _session;
+                let mut session = session;
+                // The playback sender must live as long as the connection:
+                // dropping it closes the AudioSocket immediately (the
+                // serve loop sees the channel close).
+                let _keep_playback = playback_tx;
                 let _ = serve_audiosocket(socket, &mut session, playback_rx).await;
+                // Release the session so its event sender drops and the
+                // drain below terminates instead of blocking forever.
+                drop(session);
                 while let Some(ev) = ev_rx.recv().await {
                     let _ = tx.send((peer.to_string(), ev));
                 }

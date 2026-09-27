@@ -606,7 +606,9 @@ impl SrtpSession {
                 let iv = cm_iv(&self.rtp.salt, ssrc, index);
                 xor_keystream(&self.rtp.enc, &iv, &mut packet[header_len..])
                     .map_err(|e| SrtpError::Crypto(e.to_string()))?;
-                let tag = hmac_sha1(&self.rtp.auth, &[&packet[..header_len], &roc.to_be_bytes()]);
+                // RFC 3711 §3.1/§4.2: the Authenticated Portion covers the
+                // whole packet (header + encrypted payload) plus the ROC.
+                let tag = hmac_sha1(&self.rtp.auth, &[&packet[..], &roc.to_be_bytes()]);
                 packet.extend_from_slice(&tag[..self.profile.tag_len()]);
             }
             _ => {
@@ -645,31 +647,32 @@ impl SrtpSession {
         let seq = rtp_seq(packet);
         let ssrc = rtp_ssrc(packet);
 
-        let st = self
-            .recv
-            .entry(ssrc)
-            .or_insert_with(|| RecvStream::new(self.window_size));
-        let (index, v) = match st.s_l {
-            Some(s_l) => estimate_index(s_l, st.roc, seq),
-            None => {
-                let idx = ((st.roc as u64) << 16) | seq as u64;
-                (idx, st.roc)
+        // Stream lookup without allocating: per-SSRC state is committed only
+        // after the tag verifies, so unauthenticated forgeries cannot grow
+        // the receive map.
+        let (index, v, replay_ok) = match self.recv.get_mut(&ssrc) {
+            Some(st) => {
+                let (index, v) = match st.s_l {
+                    Some(s_l) => estimate_index(s_l, st.roc, seq),
+                    None => (((st.roc as u64) << 16) | seq as u64, st.roc),
+                };
+                let ok = st.replay.check(index);
+                (index, v, ok)
             }
+            None => (seq as u64, 0u32, true),
         };
 
         // Replay pre-check (no state mutation yet).
-        if !st.replay.check(index) {
+        if !replay_ok {
             return Err(SrtpError::Replayed);
         }
 
+        let tag_off = packet.len() - tag_len;
         let ok = match self.profile {
             Profile::AesCm128Sha1_80 | Profile::AesCm128Sha1_32 => {
-                // RFC 3711 §4.2: the authenticated portion is the RTP header
-                // (including extension and CSRCs) followed by the ROC — the
-                // payload is NOT authenticated by HMAC-SHA1.
-                let expected =
-                    hmac_sha1(&self.rtp.auth, &[&packet[..header_len], &v.to_be_bytes()]);
-                let tag_off = packet.len() - tag_len;
+                // RFC 3711 §4.2: the Authenticated Portion is the whole
+                // packet (header + encrypted payload) followed by the ROC.
+                let expected = hmac_sha1(&self.rtp.auth, &[&packet[..tag_off], &v.to_be_bytes()]);
                 ct_eq(&packet[tag_off..], &expected[..tag_len])
             }
             _ => true, // GCM verifies during open()
@@ -701,7 +704,10 @@ impl SrtpSession {
         }
 
         // Commit stream state only after full verification.
-        let st = self.recv.get_mut(&ssrc).expect("inserted above");
+        let st = self
+            .recv
+            .entry(ssrc)
+            .or_insert_with(|| RecvStream::new(self.window_size));
         st.replay.mark(index);
         if index >= st.last_index {
             st.last_index = index;
@@ -789,11 +795,13 @@ impl SrtpSession {
         let encrypted = flag >> 31 == 1;
         let index = flag & 0x7FFF_FFFF;
 
-        let st = self
-            .recv_rtcp
-            .entry(ssrc)
-            .or_insert_with(|| RecvStream::new(self.window_size));
-        if !st.replay.check(index as u64) {
+        // Stream lookup without allocating: state is committed only after
+        // the tag verifies.
+        let replay_ok = match self.recv_rtcp.get_mut(&ssrc) {
+            Some(st) => st.replay.check(index as u64),
+            None => true,
+        };
+        if !replay_ok {
             return Err(SrtpError::Replayed);
         }
 
@@ -828,14 +836,20 @@ impl SrtpSession {
                     packet.truncate(8);
                     packet.extend_from_slice(&pt);
                 } else {
-                    // E=0: the whole packet is authenticated as AAD (RFC 7714 §9.3).
+                    // E=0: the whole packet is authenticated as AAD and the
+                    // GCM tag sits alone at the end (RFC 7714 §9.3) — pass
+                    // it as the tag-only "ciphertext" so open() verifies it.
                     aad.extend_from_slice(&packet[8..flag_off]);
-                    let _ = gcm.open(&iv, &aad, &[])?;
+                    gcm.open(&iv, &aad, &packet[tag_off..])?;
                 }
             }
         }
 
-        let st = self.recv_rtcp.get_mut(&ssrc).expect("inserted above");
+        // Commit stream state only after full verification.
+        let st = self
+            .recv_rtcp
+            .entry(ssrc)
+            .or_insert_with(|| RecvStream::new(self.window_size));
         st.replay.mark(index as u64);
         Ok(index)
     }

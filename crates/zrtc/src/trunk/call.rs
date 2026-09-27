@@ -31,13 +31,26 @@ pub async fn run(cfg: &Config, e164: &str, rtp_ms: u64) -> Result<(), String> {
     let call_id = new_call_id("zrtc-trunk-call");
     let from_tag = new_tag();
 
-    // SDP offer: local RTP socket first so the offer carries its port.
-    let rtp = UdpSocket::bind(("127.0.0.1", 0))
+    // SDP offer: local RTP socket first so the offer carries its port. The
+    // advertised media IP must be OUR address toward the trunk (a connected
+    // probe asks the kernel which source IP the route uses) — advertising
+    // the trunk's own IP told the carrier to send RTP to itself.
+    let rtp = UdpSocket::bind(("0.0.0.0", 0))
         .await
         .map_err(|e| e.to_string())?;
     let rtp_port = rtp.local_addr().map(|a| a.port()).unwrap_or(0);
+    let media_host = {
+        let probe = UdpSocket::bind(("0.0.0.0", 0))
+            .await
+            .map_err(|e| e.to_string())?;
+        let _ = probe.connect(ep.target).await;
+        probe
+            .local_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|_| ep.host())
+    };
     let offer =
-        sdp_util::build_offer(&ep.host(), rtp_port, &[CodecId::Pcmu], rand::random()).serialize();
+        sdp_util::build_offer(&media_host, rtp_port, &[CodecId::Pcmu], rand::random()).serialize();
 
     // ---- INVITE #1: auth signs (bearer attaches, digest records ctx) ----
     let mut extra: Vec<(String, String)> = Vec::new();
