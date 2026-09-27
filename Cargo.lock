@@ -193,6 +193,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sip-core",
+ "sip-tx",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -1509,6 +1510,13 @@ dependencies = [
  "rand 0.8.8",
  "sha2",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "sip-tx"
+version = "0.1.0"
+dependencies = [
+ "sip-core",
 ]
 
 [[package]]

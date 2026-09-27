@@ -12,6 +12,7 @@ path = "src/bin/b2bua-demo.rs"
 [dependencies]
 observ = { workspace = true }
 sip-core = { workspace = true }
+sip-tx = { workspace = true }
 sdp = { workspace = true }
 rtp = { workspace = true }
 codecs = { workspace = true }

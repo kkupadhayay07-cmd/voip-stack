@@ -11,6 +11,7 @@ use sip_core::ids::{new_branch, new_call_id, new_tag};
 use sip_core::message::{Method, Request, Response, SipMessage};
 use sip_core::uri::{Host, SipUri, TransportKind};
 use sip_core::{parse_message, serialize};
+use sip_tx::{ClientInviteTx, ServerInviteTx, TxAction, TxEvent, TxState, Transport as TxTransport};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -61,8 +62,6 @@ impl Default for B2buaConfig {
     }
 }
 
-const T1: Duration = Duration::from_millis(500);
-const TIMER_B: Duration = Duration::from_millis(32_000);
 const TICK: Duration = Duration::from_millis(200);
 
 struct Leg {
@@ -83,18 +82,14 @@ struct Leg {
     confirmed: bool,
 }
 
-struct PendingInvite {
-    req: Vec<u8>,
-    dst: SocketAddr,
-    next_retrans: Instant,
-    interval: Duration,
-    deadline: Instant,
-}
-
 struct Call {
     leg_a: Option<Leg>,
     leg_b: Option<Leg>,
-    pending: Option<PendingInvite>,
+    /// Leg B client INVITE transaction (RFC 3261 §17.1.1): Timer A/B/D.
+    b_tx: Option<ClientInviteTx>,
+    /// Leg A server INVITE transaction (RFC 3261 §17.2.1): Timer G/H/I.
+    /// Gone after the 2xx — the ACK for a 2xx is dialog-level (§17.2.3).
+    a_tx: Option<ServerInviteTx>,
     /// SDP answer for leg A (sent with the 200).
     a_answer: String,
     created: Instant,
@@ -105,7 +100,8 @@ impl Call {
         Self {
             leg_a: None,
             leg_b: None,
-            pending: None,
+            b_tx: None,
+            a_tx: None,
             a_answer,
             created: Instant::now(),
         }
@@ -164,55 +160,109 @@ impl B2bua {
     fn timers(sock: &Arc<UdpSocket>, calls: &mut HashMap<String, Call>) {
         let now = Instant::now();
 
-        // Timer B expiry.
-        let expired: Vec<String> = calls
-            .iter()
-            .filter(|(_, c)| c.pending.as_ref().is_some_and(|p| now >= p.deadline))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in expired {
-            tracing::warn!(call_id = %id, "outgoing INVITE timed out (Timer B)");
-            if let Some(c) = calls.get_mut(&id) {
-                c.pending = None;
-                if let Some(a) = &c.leg_a {
-                    if let Some(invite) = &a.invite {
-                        let resp = sip_core::builder::respond_to(
-                            invite,
-                            504,
-                            "Server Time-out",
-                            Vec::new(),
-                            None,
-                        );
-                        let bytes = serialize(&SipMessage::Response(resp));
-                        let sock = sock.clone();
-                        let dst = a.remote_sip;
-                        tokio::spawn(async move {
-                            let _ = sock.send_to(&bytes, dst).await;
-                        });
+        // Phase 1: drive every transaction whose deadline has passed. The
+        // state machines are pure; phase 2 performs the I/O and the
+        // call-level consequences.
+        struct Due {
+            sends: Vec<(Vec<u8>, SocketAddr)>,
+            timer_b_expired: bool,
+        }
+        let mut due: Vec<(String, Due)> = Vec::new();
+        for (id, c) in calls.iter_mut() {
+            let mut d = Due {
+                sends: Vec::new(),
+                timer_b_expired: false,
+            };
+
+            // Leg B: client INVITE transaction — Timer A retransmissions,
+            // Timer B total timeout, Timer D cleanup.
+            if let Some(tx) = c.b_tx.as_mut() {
+                while let Some(dl) = tx.next_deadline() {
+                    if now < dl {
+                        break;
+                    }
+                    let pre = tx.state();
+                    for act in tx.on_event(TxEvent::Timeout, now) {
+                        match act {
+                            TxAction::SendRequest(r) => {
+                                if let Some(b) = &c.leg_b {
+                                    d.sends
+                                        .push((serialize(&SipMessage::Request(r)), b.remote_sip));
+                                }
+                            }
+                            TxAction::DeleteTransaction
+                                if matches!(pre, TxState::Trying | TxState::Proceeding) =>
+                            {
+                                d.timer_b_expired = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if tx.state() == TxState::Terminated {
+                        c.b_tx = None;
+                        break;
                     }
                 }
-                teardown(calls, &id, "Timer B");
+            }
+
+            // Leg A: server INVITE transaction — Timer G final-response
+            // retransmissions, Timer H (no ACK) and Timer I dwell.
+            if let Some(tx) = c.a_tx.as_mut() {
+                while let Some(dl) = tx.next_deadline() {
+                    if now < dl {
+                        break;
+                    }
+                    for act in tx.on_event(TxEvent::Timeout, now) {
+                        if let TxAction::SendResponse(r) = act {
+                            if let Some(a) = &c.leg_a {
+                                d.sends
+                                    .push((serialize(&SipMessage::Response(r)), a.remote_sip));
+                            }
+                        }
+                    }
+                    if tx.state() == TxState::Terminated {
+                        c.a_tx = None;
+                        break;
+                    }
+                }
+            }
+
+            if !d.sends.is_empty() || d.timer_b_expired {
+                due.push((id.clone(), d));
             }
         }
 
-        // INVITE retransmissions (Timer A, doubling, capped at T2).
-        let due: Vec<(String, Vec<u8>, SocketAddr)> = calls
-            .iter()
-            .filter_map(|(id, c)| {
-                let p = c.pending.as_ref()?;
-                (now >= p.next_retrans).then(|| (id.clone(), p.req.clone(), p.dst))
-            })
-            .collect();
-        for (id, req, dst) in due {
-            if let Some(c) = calls.get_mut(&id) {
-                if let Some(p) = c.pending.as_mut() {
-                    p.interval = (p.interval * 2).min(Duration::from_secs(4));
-                    p.next_retrans = Instant::now() + p.interval;
-                    let sock = sock.clone();
-                    tokio::spawn(async move {
-                        let _ = sock.send_to(&req, dst).await;
-                    });
+        // Phase 2: execute the actions.
+        for (id, d) in due {
+            for (bytes, dst) in d.sends {
+                let sock = sock.clone();
+                tokio::spawn(async move {
+                    let _ = sock.send_to(&bytes, dst).await;
+                });
+            }
+            if d.timer_b_expired {
+                tracing::warn!(call_id = %id, "outgoing INVITE timed out (Timer B)");
+                if let Some(c) = calls.get_mut(&id) {
+                    c.b_tx = None;
+                    if let Some(a) = &c.leg_a {
+                        if let Some(invite) = &a.invite {
+                            let resp = sip_core::builder::respond_to(
+                                invite,
+                                504,
+                                "Server Time-out",
+                                Vec::new(),
+                                None,
+                            );
+                            let bytes = serialize(&SipMessage::Response(resp));
+                            let sock = sock.clone();
+                            let dst = a.remote_sip;
+                            tokio::spawn(async move {
+                                let _ = sock.send_to(&bytes, dst).await;
+                            });
+                        }
+                    }
                 }
+                teardown(calls, &id, "Timer B");
             }
         }
     }
@@ -236,7 +286,7 @@ impl B2bua {
                         self.on_invite(sock, local, calls, b_to_a, req, call_id, src)
                             .await;
                     }
-                    Method::Ack => self.on_ack(calls, &call_id),
+                    Method::Ack => self.on_ack(calls, &req, &call_id),
                     Method::Bye => self.on_bye(sock, calls, b_to_a, &req, call_id, src).await,
                     Method::Cancel => self.on_cancel(sock, calls, &req, call_id, src).await,
                     Method::Options => {
@@ -267,13 +317,37 @@ impl B2bua {
                     return;
                 };
                 let class = resp.code / 100;
-                if class == 1 {
-                    return;
-                }
                 let Some(call) = calls.get_mut(&a_id) else {
                     return;
                 };
-                let Some(_pending) = call.pending.take() else {
+                // Drive the leg-B client INVITE transaction (§17.1.1): 1xx
+                // stops Timer A, finals move to Completed (and generate the
+                // ACK for non-2xx), 2xx terminates it.
+                let mut passed: Vec<Response> = Vec::new();
+                let mut ack: Option<(Vec<u8>, SocketAddr)> = None;
+                let mut had_tx = false;
+                if let Some(tx) = call.b_tx.as_mut() {
+                    had_tx = true;
+                    let dst = call.leg_b.as_ref().map(|b| b.remote_sip);
+                    for act in tx.on_event(TxEvent::Received(resp.clone()), Instant::now()) {
+                        match act {
+                            TxAction::PassToTu(SipMessage::Response(r)) => passed.push(r),
+                            TxAction::SendRequest(r) => {
+                                if let Some(dst) = dst {
+                                    ack = Some((serialize(&SipMessage::Request(r)), dst));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if tx.state() == TxState::Terminated {
+                        call.b_tx = None;
+                    }
+                }
+                if let Some((bytes, dst)) = ack {
+                    let _ = sock.send_to(&bytes, dst).await;
+                }
+                if !had_tx {
                     // Late 2xx retransmission: re-ACK.
                     if class == 2 {
                         if let Some(b) = call.leg_b.as_ref() {
@@ -281,33 +355,41 @@ impl B2bua {
                         }
                     }
                     return;
-                };
-                if class == 2 {
-                    self.on_b_answered(sock, local, calls, &a_id, &call_id, resp)
-                        .await;
-                } else {
-                    tracing::info!(call_id = %a_id, "leg B failed with {}", resp.code);
-                    if let Some(a) = call.leg_a.as_ref() {
-                        if let Some(invite) = &a.invite {
-                            let code = if class >= 5 { 503 } else { 486 };
-                            let reason = if class >= 5 {
-                                "Service Unavailable"
-                            } else {
-                                "Busy Here"
-                            };
-                            let fail = sip_core::builder::respond_to(
-                                invite,
-                                code,
-                                reason,
-                                Vec::new(),
-                                None,
-                            );
-                            let _ = sock
-                                .send_to(&serialize(&SipMessage::Response(fail)), a.remote_sip)
-                                .await;
-                        }
+                }
+                for r in passed {
+                    let class = r.code / 100;
+                    if class == 1 {
+                        continue;
                     }
-                    teardown(calls, &a_id, "leg B rejected");
+                    if class == 2 {
+                        self.on_b_answered(sock, local, calls, &a_id, &call_id, r)
+                            .await;
+                    } else {
+                        tracing::info!(call_id = %a_id, "leg B failed with {}", r.code);
+                        if let Some(call) = calls.get_mut(&a_id) {
+                            if let Some(a) = call.leg_a.as_ref() {
+                                if let Some(invite) = &a.invite {
+                                    let code = if class >= 5 { 503 } else { 486 };
+                                    let reason = if class >= 5 {
+                                        "Service Unavailable"
+                                    } else {
+                                        "Busy Here"
+                                    };
+                                    let fail = sip_core::builder::respond_to(
+                                        invite,
+                                        code,
+                                        reason,
+                                        Vec::new(),
+                                        None,
+                                    );
+                                    let _ = sock
+                                        .send_to(&serialize(&SipMessage::Response(fail)), a.remote_sip)
+                                        .await;
+                                }
+                            }
+                        }
+                        teardown(calls, &a_id, "leg B rejected");
+                    }
                 }
             }
         }
@@ -326,64 +408,75 @@ impl B2bua {
         call_id: String,
         src: SocketAddr,
     ) {
-        // Retransmitted INVITE for an existing call → resend cached 200.
+        // Existing call: drive the leg-A server transaction with the
+        // (possibly retransmitted) INVITE first (RFC 3261 §17.2.1).
         if let Some(c) = calls.get_mut(&call_id) {
-            let resent = c.leg_a.as_ref().and_then(|a| {
-                let invite = a.invite.as_ref()?;
-                (via_branch(invite) == via_branch(&req)).then(|| {
-                    let mut response = sip_core::builder::respond_to(
-                        invite,
-                        200,
-                        "OK",
-                        c.a_answer.clone().into_bytes(),
-                        Some(&a.local_tag),
-                    );
-                    response
-                        .headers
-                        .add("Contact", format!("<sip:zrtc@{local}>"));
-                    (serialize(&SipMessage::Response(response)), a.remote_sip)
-                })
-            });
-            if let Some((bytes, dst)) = resent {
-                let _ = sock.send_to(&bytes, dst).await;
-                return;
+            let mut handled = false;
+            if let Some(a_tx) = c.a_tx.as_mut() {
+                for act in a_tx.on_event(TxEvent::ReceivedRequest(req.clone()), Instant::now()) {
+                    if let TxAction::SendResponse(r) = act {
+                        let _ = sock
+                            .send_to(&serialize(&SipMessage::Response(r)), src)
+                            .await;
+                        handled = true;
+                    }
+                }
+                if a_tx.state() == TxState::Terminated {
+                    c.a_tx = None;
+                }
             }
-        }
-        if calls.contains_key(&call_id) {
+            if !handled {
+                // Post-2xx: retransmitted INVITE → resend the cached 200.
+                let resent = c.leg_a.as_ref().and_then(|a| {
+                    let invite = a.invite.as_ref()?;
+                    (via_branch(invite) == via_branch(&req)).then(|| {
+                        let mut response = sip_core::builder::respond_to(
+                            invite,
+                            200,
+                            "OK",
+                            c.a_answer.clone().into_bytes(),
+                            Some(&a.local_tag),
+                        );
+                        response
+                            .headers
+                            .add("Contact", format!("<sip:zrtc@{local}>"));
+                        (serialize(&SipMessage::Response(response)), a.remote_sip)
+                    })
+                });
+                if let Some((bytes, dst)) = resent {
+                    let _ = sock.send_to(&bytes, dst).await;
+                }
+            }
             return; // re-INVITE: Phase 1 does not renegotiate
         }
+
+        // The leg-A server INVITE transaction owns every response we send
+        // for this request (RFC 3261 §17.2.1).
+        let mut a_tx = ServerInviteTx::new(req.clone(), TxTransport::Udp);
 
         // SDP offer required.
         let offer = match sdp::parse::parse(&String::from_utf8_lossy(&req.body)) {
             Ok(o) => o,
             Err(e) => {
                 tracing::info!(%call_id, "INVITE without valid SDP: {e}");
-                let resp = sip_core::builder::respond_to(
-                    &req,
-                    488,
-                    "Not Acceptable Here",
-                    Vec::new(),
-                    None,
-                );
-                let _ = sock
-                    .send_to(&serialize(&SipMessage::Response(resp)), src)
-                    .await;
+                send_staged(
+                    &mut a_tx,
+                    sock,
+                    src,
+                    sip_core::builder::respond_to(&req, 488, "Not Acceptable Here", Vec::new(), None),
+                )
+                .await;
                 return;
             }
         };
 
-        let _ = sock
-            .send_to(
-                &serialize(&SipMessage::Response(sip_core::builder::respond_to(
-                    &req,
-                    100,
-                    "Trying",
-                    Vec::new(),
-                    None,
-                ))),
-                src,
-            )
-            .await;
+        send_staged(
+            &mut a_tx,
+            sock,
+            src,
+            sip_core::builder::respond_to(&req, 100, "Trying", Vec::new(), None),
+        )
+        .await;
 
         // Bind leg A media socket and build the answer.
         let Ok(a_sock) = UdpSocket::bind(("0.0.0.0", self.cfg.media_base_port)).await else {
@@ -397,16 +490,13 @@ impl B2bua {
             Ok(ans) => ans,
             Err(e) => {
                 tracing::info!(%call_id, "SDP negotiation failed: {e:?}");
-                let resp = sip_core::builder::respond_to(
-                    &req,
-                    488,
-                    "Not Acceptable Here",
-                    Vec::new(),
-                    None,
-                );
-                let _ = sock
-                    .send_to(&serialize(&SipMessage::Response(resp)), src)
-                    .await;
+                send_staged(
+                    &mut a_tx,
+                    sock,
+                    src,
+                    sip_core::builder::respond_to(&req, 488, "Not Acceptable Here", Vec::new(), None),
+                )
+                .await;
                 return;
             }
         };
@@ -480,21 +570,26 @@ impl B2bua {
             .header("Allow", "INVITE, ACK, BYE, CANCEL, OPTIONS")
             .body("application/sdp", offer_b.into_bytes())
             .build();
-        let req_bytes = serialize(&SipMessage::Request(invite));
 
-        // 180 Ringing to A.
-        let _ = sock
-            .send_to(
-                &serialize(&SipMessage::Response(sip_core::builder::respond_to(
-                    &req,
-                    180,
-                    "Ringing",
-                    Vec::new(),
-                    None,
-                ))),
-                src,
-            )
-            .await;
+        // Leg B client INVITE transaction: the initial send goes through
+        // TxEvent::Send, which also arms Timer A/B (RFC 3261 §17.1.1.2).
+        let mut b_tx = ClientInviteTx::new(invite.clone(), TxTransport::Udp);
+        for act in b_tx.on_event(TxEvent::Send, Instant::now()) {
+            if let TxAction::SendRequest(r) = act {
+                let _ = sock
+                    .send_to(&serialize(&SipMessage::Request(r)), dst)
+                    .await;
+            }
+        }
+
+        // 180 Ringing to A (through the server transaction).
+        send_staged(
+            &mut a_tx,
+            sock,
+            src,
+            sip_core::builder::respond_to(&req, 180, "Ringing", Vec::new(), None),
+        )
+        .await;
 
         let mut call = Call::new(answer.serialize());
         let leg_a = Leg {
@@ -511,13 +606,8 @@ impl B2bua {
             confirmed: false,
         };
         call.leg_a = Some(leg_a);
-        call.pending = Some(PendingInvite {
-            req: req_bytes,
-            dst,
-            next_retrans: Instant::now() + T1,
-            interval: T1,
-            deadline: Instant::now() + TIMER_B,
-        });
+        call.a_tx = Some(a_tx);
+        call.b_tx = Some(b_tx);
         call.leg_b = Some(Leg {
             call_id: b_call_id.clone(),
             local_tag: b_tag,
@@ -615,8 +705,11 @@ impl B2bua {
             })
             .ok();
 
-        // Confirm A with 200 (cached for INVITE retransmission).
-        let (a_snapshot, bytes) = {
+        // Confirm A with 200 through the server INVITE transaction; after
+        // the 2xx the transaction is gone — the ACK for a 2xx is handled at
+        // dialog level (§17.2.3). The dialog-layer cached-200 path keeps
+        // answering late INVITE retransmissions.
+        let (a_snapshot, response) = {
             let a = match call.leg_a.as_ref() {
                 Some(a) => a,
                 None => return,
@@ -633,11 +726,15 @@ impl B2bua {
                 .headers
                 .add("Contact", format!("<sip:zrtc@{local}>"));
             response.headers.add("Supported", "timer");
-            let bytes = serialize(&SipMessage::Response(response));
             let snapshot = (a.local_tag.clone(), a.remote_sip);
-            (snapshot, bytes)
+            (snapshot, response)
         };
-        let _ = sock.send_to(&bytes, a_snapshot.1).await;
+        if let Some(mut a_tx) = call.a_tx.take() {
+            send_staged(&mut a_tx, sock, a_snapshot.1, response).await;
+        } else {
+            let bytes = serialize(&SipMessage::Response(response));
+            let _ = sock.send_to(&bytes, a_snapshot.1).await;
+        }
 
         // Start both media pumps.
         let sockets = (
@@ -723,8 +820,17 @@ impl B2bua {
         let _ = b_id;
     }
 
-    fn on_ack(&self, calls: &mut HashMap<String, Call>, call_id: &str) {
+    fn on_ack(&self, calls: &mut HashMap<String, Call>, ack: &Request, call_id: &str) {
         if let Some(c) = calls.get_mut(call_id) {
+            // Feed the ACK to the leg-A server transaction (§17.2.3): it
+            // confirms the transaction and arms Timer I. After a 2xx the
+            // transaction is already gone and this is a no-op.
+            if let Some(tx) = c.a_tx.as_mut() {
+                let _ = tx.on_event(TxEvent::ReceivedRequest(ack.clone()), Instant::now());
+                if tx.state() == TxState::Terminated {
+                    c.a_tx = None;
+                }
+            }
             if let Some(a) = c.leg_a.as_mut() {
                 if !a.confirmed {
                     a.confirmed = true;
@@ -876,6 +982,22 @@ impl B2bua {
 }
 
 // ---- helpers ---------------------------------------------------------------
+
+/// Stages `resp` on a server transaction and transmits whatever the state
+/// machine emits (SendResponse actions only; timers are the caller's job).
+async fn send_staged(
+    tx: &mut ServerInviteTx,
+    sock: &Arc<UdpSocket>,
+    dst: SocketAddr,
+    resp: Response,
+) {
+    tx.stage(resp);
+    for act in tx.on_event(TxEvent::Send, Instant::now()) {
+        if let TxAction::SendResponse(r) = act {
+            let _ = sock.send_to(&serialize(&SipMessage::Response(r)), dst).await;
+        }
+    }
+}
 
 /// Seeds the pump's remote media address from the negotiated SDP plan
 /// (latching still overrides on the first inbound packet).

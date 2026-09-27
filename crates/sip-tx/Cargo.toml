@@ -1,0 +1,10 @@
+[package]
+name = "sip-tx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "RFC 3261 transaction layer: pure SIP transaction state machines, no I/O, caller-driven time"
+
+[dependencies]
+sip-core = { workspace = true }

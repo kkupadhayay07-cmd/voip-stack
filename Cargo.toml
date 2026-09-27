@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/sip-core",
+    "crates/sip-tx",
     "crates/sdp",
     "crates/rtp",
     "crates/codecs",
@@ -47,6 +48,7 @@ axum = { version = "0.8", features = ["ws"] }
 opus = "0.3"
 
 sip-core = { path = "crates/sip-core" }
+sip-tx = { path = "crates/sip-tx" }
 sdp = { path = "crates/sdp" }
 rtp = { path = "crates/rtp" }
 codecs = { path = "crates/codecs" }
