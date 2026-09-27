@@ -109,6 +109,7 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
 
 ## Documentation
 
+* [`docs/VISION.md`](docs/VISION.md) — **the destination**: the dream platform, non-negotiables, milestones with verifiable checkpoints, order of operations — every task is measured against this
 * [`docs/PRD.md`](docs/PRD.md) — product requirements: users, functional/non-functional requirements, milestones & acceptance gates
 * [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system architecture: crate graph, runtime model, data flows, deployment view
 * [`docs/DESIGN.md`](docs/DESIGN.md) — technical design (implementation contract)
