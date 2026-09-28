@@ -187,8 +187,14 @@ configured bounds. Guidance:
 
 1. **Dialog layer extraction** (§12) from the B2BUA's per-leg state;
    `sip-tx` adoption in the proxy.
-2. **Load harness** — 1000-concurrent-call soak with per-leg SRTP +
-   transcoding on 8-core hardware; publish numbers here.
+2. **Load harness** ✅ shipped — `zrtc load` (`--calls`/`--concurrency`/`--pace-ms`,
+   `--json`) drives N concurrent calls through the full pipeline and reports
+   setup-latency percentiles + failure breakdowns; `demo/soak.sh` adds a
+   port pre-flight, CDR cross-check and panic gate. Sandbox baseline
+   (2 vCPU, debug build, 500 ms media/call): 200 calls at concurrency 20 →
+   200/200 answered, setup p50 116 ms / p95 305 ms, 5.3 calls/s. The
+   release-build 1000-concurrent soak on 8-core hardware remains the
+   published follow-up.
 3. **Postgres CDR backend** (sqlx) + retention/archival policies.
 4. **WebRTC hardening** — RTX/NACK resend path, TWCC-driven bandwidth
    estimation, data channels (SCTP).

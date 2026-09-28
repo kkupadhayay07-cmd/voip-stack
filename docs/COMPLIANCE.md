@@ -18,7 +18,8 @@ non-2xx ACK, non-INVITE Proceeding + method matching, registrar 423
 mini-CA/SAN certs, real CDR final codes, safe `--since` parsing, wired
 Prometheus call counters + gauge semantics), and the SDP IPv6/BUNDLE answer
 hardening (IP4/IP6 `o=`/`c=` address types picked from the local host
-literal, RFC 8843 BUNDLE group echo with the accepted mids); 474 tests green
+literal, RFC 8843 BUNDLE group echo with the accepted mids), and a
+concurrent-call load harness with percentile reporting; 480 tests green
 across 54 suites — **every audit finding at every severity is fixed**).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
@@ -125,7 +126,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **474 passing across 54 suites**.
+  `cargo test --workspace` → **480 passing across 54 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16 + §17.1/§17.3
   SRTCP AEAD), STUN (RFC 5769 §2.1/§2.2; MD5 long-term keys + MESSAGE-INTEGRITY
   against independent vectors), G.729 (bcg729 oracle), cross-decode by ffmpeg.

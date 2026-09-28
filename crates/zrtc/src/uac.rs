@@ -69,6 +69,9 @@ pub struct UacOpts {
     pub rtp_ms: u64,
     pub probe: bool,
     pub timeout: Duration,
+    /// Post-RTP tail before BYE (lets the jitter buffer drain). The demo
+    /// uses 600 ms; the load harness shortens it for throughput.
+    pub tail_ms: u64,
     /// Client certificate for mTLS (auth=tls_client_cert trunks).
     pub tls_identity: Option<crate::tls::TlsClientIdentity>,
 }
@@ -84,9 +87,19 @@ impl Default for UacOpts {
             rtp_ms: 1000,
             probe: false,
             timeout: Duration::from_secs(15),
+            tail_ms: 600,
             tls_identity: None,
         }
     }
+}
+
+/// Metrics from one completed call.
+#[derive(Debug, Clone)]
+pub struct PlacedCall {
+    /// INVITE sent → 200 OK received.
+    pub setup: Duration,
+    /// RTP frames actually sent.
+    pub rtp_frames: usize,
 }
 
 /// One transport link: datagram or stream, owned by the session.
@@ -277,18 +290,33 @@ impl Session {
     }
 }
 
-/// Entry point: probe or full call.
-pub async fn run(opts: UacOpts) -> Result<(), String> {
+/// Entry point: probe or full call, with metrics (load harness + CLI).
+pub async fn run_call(opts: UacOpts) -> Result<PlacedCall, String> {
     let tout = opts.timeout;
     timeout(tout, async move {
         let mut sess = Session::connect(&opts).await?;
         if opts.probe {
-            return probe(&mut sess, &opts).await;
+            probe(&mut sess, &opts).await?;
+            return Ok(PlacedCall {
+                setup: Duration::ZERO,
+                rtp_frames: 0,
+            });
         }
         place_call(&mut sess, &opts).await
     })
     .await
     .map_err(|_| format!("uac timed out after {tout:?}"))?
+}
+
+/// CLI entry point: probe or full call (metrics logged, not returned).
+pub async fn run(opts: UacOpts) -> Result<(), String> {
+    run_call(opts).await.map(|pc| {
+        tracing::info!(
+            setup_ms = pc.setup.as_millis() as u64,
+            frames = pc.rtp_frames,
+            "uac: call complete"
+        );
+    })
 }
 
 async fn probe(sess: &mut Session, opts: &UacOpts) -> Result<(), String> {
@@ -319,7 +347,7 @@ async fn probe(sess: &mut Session, opts: &UacOpts) -> Result<(), String> {
     }
 }
 
-async fn place_call(sess: &mut Session, opts: &UacOpts) -> Result<(), String> {
+async fn place_call(sess: &mut Session, opts: &UacOpts) -> Result<PlacedCall, String> {
     // RTP socket (plain RTP/AVP over UDP regardless of SIP transport).
     let rtp = UdpSocket::bind(("127.0.0.1", 0))
         .await
@@ -342,6 +370,7 @@ async fn place_call(sess: &mut Session, opts: &UacOpts) -> Result<(), String> {
     .body("application/sdp", offer.serialize().into_bytes())
     .build();
     tracing::info!(call_id = %opts.call_id, transport = ?opts.transport, "uac: INVITE -> {}", opts.target);
+    let setup_started = Instant::now();
     sess.send_msg(&SipMessage::Request(invite)).await?;
 
     // 100 / 180 / 200.
@@ -364,7 +393,8 @@ async fn place_call(sess: &mut Session, opts: &UacOpts) -> Result<(), String> {
     let answer = String::from_utf8_lossy(&ok.body).to_string();
     let audio_port = extract_audio_port(&answer).ok_or("no m=audio port in answer")?;
     let remote_tag = to_tag_of(&ok);
-    tracing::info!(call_id = %opts.call_id, "uac: 200 OK (answer audio port {audio_port})");
+    let setup = setup_started.elapsed();
+    tracing::info!(call_id = %opts.call_id, "uac: 200 OK in {:?} (answer audio port {audio_port})", setup);
 
     // ACK.
     let ack = RequestBuilder::new(
@@ -408,7 +438,7 @@ async fn place_call(sess: &mut Session, opts: &UacOpts) -> Result<(), String> {
     tracing::info!(call_id = %opts.call_id, "uac: sent {} frames of RTP", samples.div_ceil(160));
 
     // Let the jitter buffer play the tail out before tearing down.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::time::sleep(Duration::from_millis(opts.tail_ms)).await;
 
     // BYE.
     let bye = RequestBuilder::new(
@@ -443,7 +473,10 @@ async fn place_call(sess: &mut Session, opts: &UacOpts) -> Result<(), String> {
         }
     }
     tracing::info!(call_id = %opts.call_id, "uac: call complete (BYE 200)");
-    Ok(())
+    Ok(PlacedCall {
+        setup,
+        rtp_frames: samples.div_ceil(160),
+    })
 }
 
 fn to_tag_of(resp: &Response) -> String {

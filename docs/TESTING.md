@@ -24,7 +24,7 @@ RUST_LOG="info,b2bua=debug" cargo test -p b2bua -- --nocapture
 Toolchain is pinned by `rust-toolchain.toml` (stable). System dependency:
 `pkg-config` + `libopus-dev` unless building `--no-default-features`.
 
-## 2. Suite inventory (last verified full run: 474 tests, 54 suites)
+## 2. Suite inventory (last verified full run: 480 tests, 54 suites)
 
 | Crate | Tests | Focus |
 |-------|-------|-------|
@@ -46,7 +46,7 @@ Toolchain is pinned by `rust-toolchain.toml` (stable). System dependency:
 | `proxy` | 9 | routing, forking, CANCEL matched on the upstream Via branch, shared request/response transaction keying, Via/Record-Route, 483, NAT response routing |
 | `registrar` | 11 | bindings, expiry, wildcard removal, digest challenge, CSeq/Call-ID consistency; 423 `Interval Too Brief` + `Min-Expires` below the configured minimum (binding untouched, expiry 0 exempt); nonce table pruned of expired entries on every challenge |
 | `observ` | 16 | pcap writers, per-call trace buffer, diag counters (rx/tx/lost/jitter/concealed), redaction of per-packet RTP from traces, obs-fold auth continuation-line redaction |
-| `zrtc` | 19 | daemon config parsing + assembly smoke; core response-path regressions (proxy Via pop + SBC processing, b2bua-Via relay, bindings key, client-map cleanup); loopback sink end-to-end (Contact = own host, cached-200 retransmission, PT-filtered echo with negotiated-clock ts step, telephone-event never echoed, no-BYE idle reap); TLS/WSS handshake-budget regressions (silent peer released, slot reusable); TLS client connector chain-verifies the server cert against a configured CA (matching CA accepted, foreign CA rejected); `--since` window parsing (valid windows, malformed values incl. `""` rejected without panic) |
+| `zrtc` | 25 | daemon config parsing + assembly smoke; core response-path regressions (proxy Via pop + SBC processing, b2bua-Via relay, bindings key, client-map cleanup); loopback sink end-to-end (Contact = own host, cached-200 retransmission, PT-filtered echo with negotiated-clock ts step, telephone-event never echoed, no-BYE idle reap); TLS/WSS handshake-budget regressions (silent peer released, slot reusable); TLS client connector chain-verifies the server cert against a configured CA (matching CA accepted, foreign CA rejected); `--since` window parsing (valid windows, malformed values incl. `""` rejected without panic); load-harness stats (nearest-rank percentiles, report aggregation with failure dedup, JSON validity, zero-args validation) — the call loop itself is exercised by `demo/soak.sh` |
 
 Counts move with the code; CI (§4) is the authoritative gate on every push.
 

@@ -6,6 +6,19 @@
 //!   zrtc daemon [--config <path>]
 //!   zrtc uac [options]         in-repo SIP client (demo calls / probes)
 //!   zrtc call <e164> [options] place one call out the configured [trunk]
+//!   zrtc load [options]        concurrent call generator + latency report
+//!
+//! Load options:
+//!   --target HOST:PORT     listener address          (default 127.0.0.1:5060)
+//!   --transport NAME       udp | tcp | tls | wss     (default udp)
+//!   --to URI               request-URI / To          (default sip:1000@zrtc.local)
+//!   --calls N              total call attempts       (default 100)
+//!   --concurrency N        max calls in flight       (default 20)
+//!   --pace-ms N            delay between launches    (default 0)
+//!   --rtp-ms N             RTP duration per call     (default 500)
+//!   --tail-ms N            post-RTP tail before BYE  (default 150)
+//!   --timeout-secs N       per-call timeout          (default 20)
+//!   --json                 print the report as one JSON line
 //!
 //! UAC options:
 //!   --target HOST:PORT     listener address          (default 127.0.0.1:5060)
@@ -28,6 +41,7 @@ mod cli_observ;
 mod config;
 mod core;
 mod daemon;
+mod load;
 mod sink;
 mod tls;
 mod transport;
@@ -35,6 +49,7 @@ mod trunk;
 mod uac;
 
 use config::Config;
+use std::net::SocketAddr;
 use std::time::Duration;
 use uac::{Transport, UacOpts};
 
@@ -107,13 +122,40 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 .map_err(|_| format!("trunk call timed out after {secs}s"))?
             })
         }
+        "load" => {
+            let (opts, json) = parse_load(&args[1..])?;
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "warn".into()),
+                )
+                .try_init();
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| format!("runtime: {e}"))?;
+            let report = rt.block_on(load::run_load(opts.clone()))?;
+            if json {
+                // Machine mode: the JSON line is the only stdout output; the
+                // human summary goes to stderr so `> report.json` stays pure.
+                println!("{}", load::report_json(&report, &opts));
+                eprint!("{}", load::render(&report, &opts));
+            } else {
+                print!("{}", load::render(&report, &opts));
+            }
+            if report.failed > 0 {
+                return Err(format!(
+                    "{} of {} calls failed",
+                    report.failed, report.requested
+                ));
+            }
+            Ok(())
+        }
         other if matches!(other, "trace" | "calls" | "diag" | "capture" | "metrics") => {
             let cfg = load_config_optional(&args[1..]);
             let log_dir = cli_observ::resolve_log_dir(cfg.as_ref());
             cli_observ::run(other, &args[1..], &log_dir)
         }
         other => Err(format!(
-            "unknown subcommand '{other}' (expected daemon, uac, call, trace, calls, diag, capture or metrics)"
+            "unknown subcommand '{other}' (expected daemon, uac, call, load, trace, calls, diag, capture or metrics)"
         )),
     }
 }
@@ -180,4 +222,42 @@ fn parse_uac(args: &[String]) -> Result<UacOpts, String> {
         .map_err(|_| "bad --timeout-secs")?;
     opts.timeout = Duration::from_secs(secs);
     Ok(opts)
+}
+
+fn parse_load(args: &[String]) -> Result<(load::LoadOpts, bool), String> {
+    let target: SocketAddr = flag_or(args, "--target", "127.0.0.1:5060")
+        .parse()
+        .map_err(|_| "bad --target (HOST:PORT)".to_string())?;
+    let transport = Transport::parse(&flag_or(args, "--transport", "udp"))?;
+    let calls: usize = flag_or(args, "--calls", "100")
+        .parse()
+        .map_err(|_| "bad --calls".to_string())?;
+    let concurrency: usize = flag_or(args, "--concurrency", "20")
+        .parse()
+        .map_err(|_| "bad --concurrency".to_string())?;
+    let pace_ms: u64 = flag_or(args, "--pace-ms", "0")
+        .parse()
+        .map_err(|_| "bad --pace-ms".to_string())?;
+    let rtp_ms: u64 = flag_or(args, "--rtp-ms", "500")
+        .parse()
+        .map_err(|_| "bad --rtp-ms".to_string())?;
+    let tail_ms: u64 = flag_or(args, "--tail-ms", "150")
+        .parse()
+        .map_err(|_| "bad --tail-ms".to_string())?;
+    let secs: u64 = flag_or(args, "--timeout-secs", "20")
+        .parse()
+        .map_err(|_| "bad --timeout-secs".to_string())?;
+    let opts = load::LoadOpts {
+        target,
+        transport,
+        to: flag_or(args, "--to", "sip:1000@zrtc.local"),
+        from: flag_or(args, "--from", "sip:load@zrtc.local"),
+        calls,
+        concurrency,
+        pace_ms,
+        rtp_ms,
+        tail_ms,
+        timeout: Duration::from_secs(secs),
+    };
+    Ok((opts, has_flag(args, "--json")))
 }

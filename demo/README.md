@@ -3,10 +3,12 @@
 End-to-end demonstrations of the VoIP stack: a **complete call served entirely
 by the native stack** — no external SIP proxy, PBX or media server.
 
-Two ways to run:
+Three ways to run:
 
 1. **Full-stack daemon demo** — `./demo/run.sh` (the `zrtc` service end to end).
-2. **B2BUA loopback call** — `./demo/run_loopback_demo.sh` (in-repo integration test).
+2. **Load-harness soak** — `CALLS=200 CONCURRENCY=20 ./demo/soak.sh` (N concurrent
+   calls + latency report; see below).
+3. **B2BUA loopback call** — `./demo/run_loopback_demo.sh` (in-repo integration test).
 
 ## Full-stack daemon demo (`./demo/run.sh`)
 
@@ -24,6 +26,28 @@ One command exercises the whole service, exactly as deployed:
 7. fetches `GET /cdrs` and prints both CDR records.
 
 Exit 0 = **two answered CDRs** (one inbound, one outbound).
+
+## Load-harness soak (`./demo/soak.sh`)
+
+`zrtc load` drives `--calls` total call attempts (at most `--concurrency` in
+flight) through the **same full pipeline** as the daemon demo — listener →
+SBC → proxy → B2BUA → sink → real paced RTP both ways — and reports the
+per-call INVITE→200 setup latency (mean / p50 / p95 / p99 / max), answered
+and failed counts with a deduplicated failure breakdown, and the sustained
+calls-per-second. `--json` emits one machine-readable JSON line (the human
+report then goes to stderr, so `> report.json` stays pure). The script also
+cross-checks the daemon's served CDR count against the load report and
+fails on any daemon panic.
+
+Sizing guidance: each in-flight call holds ~5 sockets across the two
+processes (UAC SIP+RTP, two B2BUA leg sockets, sink RTP) — keep
+`CONCURRENCY` well under the `ulimit -n` budget.
+
+Measured baseline (sandbox: 2 vCPU, **debug build**, full pipeline with
+pcap + traces on, 500 ms PCMU per call): 200 calls at concurrency 20 →
+**200/200 answered, setup p50 116 ms / p95 305 ms, 5.3 calls/s**; the
+debug-build knee sits between concurrency 20 and 50. Release-mode soak on
+8-core hardware (the VISION M2 target) is the pending follow-up.
 
 Observability output lands in `/tmp/zrtc-observ/`:
 
@@ -136,6 +160,7 @@ end-to-end scenario:
 | Scenario | Command | What is proven |
 |----------|---------|----------------|
 | Full-stack daemon | `./demo/run.sh` | REGISTER + TCP/TLS/WSS listener probes + inbound & outbound calls + CDRs + pcap/traces |
+| Load-harness soak | `CALLS=200 CONCURRENCY=20 ./demo/soak.sh` | N concurrent calls through the full pipeline, setup-latency percentiles, CDR cross-check, panic gate |
 | B2BUA loopback call | `./demo/run_loopback_demo.sh` | Full SIP call + PCMU→PCMA transcoding + CDR trail |
 | DTLS-SRTP handshake | `cargo test -p dtls --test handshake` | Real DTLS 1.2 over UDP, fingerprint pinning, key export, loss recovery, SRTP media roundtrip on the exported keys |
 | ICE agent pair | `cargo test -p ice --test integration` | Host-candidate gathering, connectivity checks, nomination, keepalives |

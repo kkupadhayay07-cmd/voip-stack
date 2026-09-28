@@ -156,8 +156,9 @@ addendum records what landed since, so the document stays honest.
 | Audit fix wave 3 | The last three confirmed High findings closed: **2.13** RTP padding re-encoded byte-exactly (bit never emitted without its octets), jitter buffer 32-bit timestamp wrap extension (playout stays paced past the ≈6.2-day wrap), `pop_ready` sequence-gap guard (hole slots concealed with proper loss accounting); **2.7** loopback sink — echo ts step follows the negotiated clock (Opus 960/20 ms), PT filter before the echo (telephone-event/CN never corrupt the echo stream), Contact = own host, no-BYE calls reaped by an idle sweep; **2.8** TLS/WSS handshake budget (10 s default) — silent peers release their connection slot, regression-tested for release + reuse |
 | Audit fix wave 4 (P2 sweep) | The complete Medium/Low backlog closed: RTP/RTCP demux no longer rejects SRTCP on %4 alignment (RFC 3711 §3.4 auth trailer); `push_via` prepends to the stack top with wire-order proof; non-2xx ACK = single top Via + original Route set (§17.1.1.2); `ServerNonInviteTx` Proceeding transition + method-inclusive retransmission matching (§17.2.2); registrar 423 `Min-Expires` enforcement + bounded nonce table; codecs — Opus decodes RFC 6716 frames up to 120 ms (PLC always one 20 ms frame), G.722 reset matches a fresh decoder, CN tolerates multi-byte payloads (RFC 3389 §2.2); zrtc trunk TLS chain-verifies the server cert against a configured CA (generated certs are proper mini-CAs with SKID/AKID/SAN), CDRs carry the engine's real final code (486 → Busy instead of blanket Failed/487), `--since ""` parses safely; api — pacing accepts real recent dial/answer counts, `ws_clients_connected` is a gauge, the four call counters are wired via `Metrics::record_cdr` |
 | SDP IPv6 + BUNDLE | Answer hardening in `sdp::negotiate`: the answer's `o=`/`c=` lines pick `IN IP4`/`IN IP6` from the local host literal (RFC 8866 §4.4 — a v6 address is never mislabeled IP4, hostnames stay IP4, the offer's family never dictates the answer's); RFC 8843 §6.2/§7.1.1 BUNDLE group echo — an answer to a bundled offer carries `a=group:BUNDLE` with exactly the accepted mids in the offer group's order, rejected (port 0) m-lines and mid-less m-lines never join the group, answers to unbundled offers stay group-free; 6 new tests |
+| Load harness | `zrtc load` — concurrent UAC call generator driving the full pipeline (listener → SBC → proxy → B2BUA → sink → paced RTP): `--calls`/`--concurrency`/`--pace-ms`, per-call INVITE→200 setup metric (`uac::run_call` → `PlacedCall`), summary report (mean/p50/p95/p99/max, calls-per-second, mean call hold, deduplicated failure breakdown), `--json` single-line output; `demo/soak.sh` wraps it with a port pre-flight, daemon CDR cross-check and panic gate. Unit tests cover the stats math; the loop is exercised by the soak. Sandbox baseline (2 vCPU, debug build): 200 calls at concurrency 20 → 200/200 answered, setup p50 116 ms / p95 305 ms; release/8-core soak is the documented follow-up |
 
-**Current baseline (supersedes the header numbers):** 19 crates, **474 tests
+**Current baseline (supersedes the header numbers):** 19 crates, **480 tests
 across 54 suites**, `clippy -D warnings` clean, `cargo audit` clean. The
 external audit is fully closed at every severity — Critical, High and the
 complete P2 backlog — with regression tests
@@ -165,8 +166,10 @@ complete P2 backlog — with regression tests
 
 **§6 next-steps status:** item 1 (transaction layer) ✅ done as `sip-tx`;
 item 2 (service assembly binary) ✅ done as `zrtc`; item 6 PRACK/100rel ✅
-done. Remaining: load harness, Postgres CDR backend, WebRTC hardening
+done; the load harness ✅ shipped (`zrtc load` + `demo/soak.sh`, debug-build
+sandbox baseline published). Remaining: release-mode soak on 8-core
+hardware, Postgres CDR backend, WebRTC hardening
 (RTX/NACK, TWCC, data channels), SDP hardening (rejected m-lines, port-0
-answers, the §6.1 direction clamp, **IPv6 answer address types and RFC 8843
-BUNDLE group echo — done**), GRUU/Outbound,
+answers, the §6.1 direction clamp, IPv6 answer address types and RFC 8843
+BUNDLE group echo ✅ done), GRUU/Outbound,
 NAPTR/SRV — see README "Roadmap (next)".

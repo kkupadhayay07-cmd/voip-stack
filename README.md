@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 474 tests passing across 54 suites in 19 crates;
+**Current state: 480 tests passing across 54 suites in 19 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
@@ -49,7 +49,7 @@ finding is fixed with regression tests
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 474 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 480 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -121,6 +121,12 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
   accepted mids in the offer group's order (RFC 8843 §6.2) — rejected
   (port 0) m-lines and mid-less m-lines never join the group, and answers
   to unbundled offers stay group-free.
+* **Load harness**: `zrtc load` places N concurrent calls through the full
+  pipeline (listener → SBC → proxy → B2BUA → sink → paced RTP) and reports
+  setup-latency percentiles + a deduplicated failure breakdown (`--json`
+  for machines); `demo/soak.sh` wraps it with a CDR cross-check and a
+  panic gate. Sandbox baseline (2 vCPU, debug build): 200 calls at
+  concurrency 20 → 200/200 answered, setup p50 116 ms / p95 305 ms.
 
 ## Phase status
 
@@ -149,7 +155,10 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
 ## Roadmap (next)
 
 1. Dialog layer extraction (§12) from the B2BUA's per-leg state.
-2. Load harness — 1000-concurrent-call soak on 8-core hardware.
+2. Release-mode soak on 8-core hardware — the load harness (`zrtc load` +
+   `demo/soak.sh`) and the debug-build sandbox baseline (200 calls at
+   concurrency 20, 100% answered, setup p95 305 ms) are shipped; publish
+   the optimized-build numbers next.
 3. Postgres CDR persistence (sqlx) + retention policies.
 4. WebRTC hardening — RTX/NACK resend path, TWCC-driven bandwidth estimation,
    data channels (SCTP).
