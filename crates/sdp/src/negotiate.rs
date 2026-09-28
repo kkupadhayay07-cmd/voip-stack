@@ -140,6 +140,18 @@ pub fn answer_direction(offer: Direction, caps: Direction) -> Direction {
     }
 }
 
+/// Address type for our own `o=`/`c=` lines, derived from the local host
+/// value: an IPv6 literal selects `IP6` (RFC 8866 §4.4/§5.7 — the wire type
+/// must match the literal), anything else (IPv4 literal, hostname) stays
+/// `IP4`. The offer's family never dictates ours: each side describes its
+/// own media address.
+fn addr_type_for_host(host: &str) -> &'static str {
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => "IP6",
+        _ => "IP4",
+    }
+}
+
 /// Protocols accepted by the Phase-1 answer engine.
 fn proto_supported(proto: &str) -> bool {
     matches!(
@@ -292,6 +304,7 @@ pub fn answer_session(offer: &Session, caps: &[MediaCaps]) -> Result<Session, Ne
         return Err(NegotiateError::InvalidOffer("offer has no m-lines".into()));
     }
 
+    let own_addr_type = addr_type_for_host(&caps[0].host);
     let mut answer = Session {
         version: 0,
         origin: Origin {
@@ -299,14 +312,14 @@ pub fn answer_session(offer: &Session, caps: &[MediaCaps]) -> Result<Session, Ne
             sess_id: "0".into(),
             sess_version: "0".into(),
             net_type: "IN".into(),
-            addr_type: "IP4".into(),
+            addr_type: own_addr_type.into(),
             address: caps[0].host.clone(),
         },
         name: "-".into(),
         info: None,
         connection: Some(Connection {
             net_type: "IN".into(),
-            addr_type: "IP4".into(),
+            addr_type: own_addr_type.into(),
             address: caps[0].host.clone(),
         }),
         bandwidths: Vec::new(),
@@ -447,11 +460,41 @@ pub fn answer_session(offer: &Session, caps: &[MediaCaps]) -> Result<Session, Ne
 
         m.connection = Some(Connection {
             net_type: "IN".into(),
-            addr_type: "IP4".into(),
+            addr_type: addr_type_for_host(&caps_m.host).into(),
             address: caps_m.host.clone(),
         });
 
         answer.medias.push(m);
+    }
+
+    // RFC 8843 §6.2/§7.1.1: when the offer groups m-lines with
+    // `a=group:BUNDLE`, an answerer that accepts the grouping echoes the
+    // group listing exactly the mids it accepted, in the offer group's
+    // order. Rejected (port 0) m-lines and accepted m-lines that carried
+    // no mid are never part of the answer group, and an answer to a
+    // non-bundled offer must not grow a group.
+    if let Some(offer_group) = &offer.bundle {
+        let accepted: Vec<&str> = answer
+            .medias
+            .iter()
+            .filter(|m| m.port != 0)
+            .filter_map(|m| m.mid.as_deref())
+            .collect();
+        let mids: Vec<String> = offer_group
+            .mids
+            .iter()
+            .filter(|mid| accepted.contains(&mid.as_str()))
+            .cloned()
+            .collect();
+        if !mids.is_empty() {
+            // Wire form (attributes serialize verbatim) + typed projection
+            // so group-aware callers see the negotiated grouping.
+            answer.attributes.push(Attribute::new(
+                "group",
+                Some(format!("BUNDLE {}", mids.join(" "))),
+            ));
+            answer.bundle = Some(BundleGroup { mids });
+        }
     }
 
     Ok(answer)
@@ -611,6 +654,10 @@ a=ssrc:3520455752 cname:xyz\r\n";
                 .unwrap_or(false)));
         assert_eq!(m.ice_ufrag.as_deref(), Some("ourfrag"));
         assert_eq!(m.connection.as_ref().unwrap().address, "10.0.0.5");
+        // RFC 8843 §6.2: the bundled offer's group is echoed with the
+        // accepted mids, on the wire and in the typed projection.
+        assert_eq!(answer.bundle.as_ref().unwrap().mids, vec!["0"]);
+        assert!(answer.serialize().contains("a=group:BUNDLE 0\r\n"));
         let rt = parse(&answer.serialize()).unwrap();
         assert_eq!(answer, rt);
         // plans
@@ -627,6 +674,174 @@ a=ssrc:3520455752 cname:xyz\r\n";
         let offer = parse(&offer_str).unwrap();
         let answer = answer_session(&offer, &[caps_audio()]).unwrap();
         assert_eq!(answer.medias[0].port, 0);
+        // The only m-line was rejected ⇒ no BUNDLE group may be echoed
+        // (RFC 8843 §6.2: the group lists accepted mids only).
+        assert!(answer.bundle.is_none());
+        assert!(!answer.serialize().contains("a=group"));
+    }
+
+    #[test]
+    fn answer_to_unbundled_offer_has_no_group() {
+        // No a=group:BUNDLE in the offer ⇒ the answer must not grow one.
+        let offer_str = "v=0\r\n\
+            o=- 1 1 IN IP4 1.2.3.4\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 1.2.3.4\r\n\
+            m=audio 5000 RTP/AVP 0\r\n\
+            a=mid:0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n";
+        let offer = parse(offer_str).unwrap();
+        let answer = answer_session(&offer, &[caps_audio()]).unwrap();
+        assert!(answer.bundle.is_none());
+        assert!(!answer.serialize().contains("a=group"));
+        // A mid offered without a group is still echoed (mid continuity).
+        assert_eq!(answer.medias[0].mid.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn answer_echoes_bundle_group_with_accepted_mids() {
+        // Two bundled audio m-lines, both accepted → the answer group
+        // echoes both mids in the offer group's order.
+        let offer_str = "v=0\r\n\
+            o=- 1 1 IN IP4 1.2.3.4\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            a=group:BUNDLE 0 1\r\n\
+            m=audio 5000 RTP/AVP 0\r\n\
+            c=IN IP4 1.2.3.4\r\n\
+            a=mid:0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            m=audio 5002 RTP/AVP 8\r\n\
+            c=IN IP4 1.2.3.4\r\n\
+            a=mid:1\r\n\
+            a=rtpmap:8 PCMA/8000\r\n";
+        let offer = parse(offer_str).unwrap();
+        let answer = answer_session(&offer, &[caps_audio(), caps_audio()]).unwrap();
+        let g = answer.bundle.as_ref().expect("BUNDLE group echoed");
+        assert_eq!(g.mids, vec!["0", "1"]);
+        let out = answer.serialize();
+        assert!(out.contains("a=group:BUNDLE 0 1\r\n"), "{out}");
+        // every bundled m-line echoes its mid (RFC 8843 §7.1.1)
+        assert_eq!(answer.medias[0].mid.as_deref(), Some("0"));
+        assert_eq!(answer.medias[1].mid.as_deref(), Some("1"));
+        assert_eq!(answer, parse(&out).unwrap(), "round-trips");
+    }
+
+    #[test]
+    fn answer_bundle_group_excludes_rejected_mlines() {
+        // m-line "1" is rejected (kind mismatch) ⇒ the echoed group lists
+        // only "0"; the rejected m-line still echoes its mid with port 0.
+        let offer_str = "v=0\r\n\
+            o=- 1 1 IN IP4 1.2.3.4\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            a=group:BUNDLE 0 1\r\n\
+            m=audio 5000 RTP/AVP 0\r\n\
+            c=IN IP4 1.2.3.4\r\n\
+            a=mid:0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            m=audio 5002 RTP/AVP 8\r\n\
+            c=IN IP4 1.2.3.4\r\n\
+            a=mid:1\r\n\
+            a=rtpmap:8 PCMA/8000\r\n";
+        let offer = parse(offer_str).unwrap();
+        let mut mismatch = caps_audio();
+        mismatch.media = "video".into(); // kind mismatch against audio → rejected
+        let answer = answer_session(&offer, &[caps_audio(), mismatch]).unwrap();
+        assert_eq!(answer.medias[1].port, 0);
+        assert_eq!(answer.medias[1].mid.as_deref(), Some("1"));
+        assert_eq!(answer.bundle.as_ref().unwrap().mids, vec!["0"]);
+        assert!(answer.serialize().contains("a=group:BUNDLE 0\r\n"));
+    }
+
+    #[test]
+    fn answer_bundle_group_needs_accepted_mid() {
+        // Offered m-line carries no mid ⇒ it cannot join the group; with
+        // every group mid unaccepted the answer has no group at all.
+        let offer_str = "v=0\r\n\
+            o=- 1 1 IN IP4 1.2.3.4\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            a=group:BUNDLE 0\r\n\
+            m=audio 5000 RTP/AVP 0\r\n\
+            c=IN IP4 1.2.3.4\r\n\
+            a=rtpmap:0 PCMU/8000\r\n";
+        let offer = parse(offer_str).unwrap();
+        let answer = answer_session(&offer, &[caps_audio()]).unwrap();
+        assert_eq!(answer.medias[0].port, 20000, "stream accepted");
+        assert!(answer.bundle.is_none(), "no mid ⇒ not bundled");
+        assert!(!answer.serialize().contains("a=group"));
+    }
+
+    #[test]
+    fn answer_uses_ip6_addr_type_for_ipv6_host() {
+        // An IPv6 local host must emit IN IP6 in o= and c= — a v6 literal
+        // labeled IP4 is a spec violation (RFC 8866 §4.4).
+        let offer = parse(CHROMIUM_LIKE_OFFER).unwrap();
+        let mut c = caps_audio();
+        c.host = "2001:db8::10".into();
+        let answer = answer_session(&offer, &[c]).unwrap();
+        assert_eq!(answer.origin.addr_type.as_str(), "IP6");
+        assert_eq!(answer.origin.address, "2001:db8::10");
+        let sc = answer.connection.as_ref().unwrap();
+        assert_eq!(
+            (sc.addr_type.as_str(), sc.address.as_str()),
+            ("IP6", "2001:db8::10")
+        );
+        let mc = answer.medias[0].connection.as_ref().unwrap();
+        assert_eq!(
+            (mc.addr_type.as_str(), mc.address.as_str()),
+            ("IP6", "2001:db8::10")
+        );
+        let out = answer.serialize();
+        assert!(out.contains("o=- 0 0 IN IP6 2001:db8::10\r\n"), "{out}");
+        assert!(out.contains("c=IN IP6 2001:db8::10\r\n"), "{out}");
+        assert_eq!(answer, parse(&out).unwrap(), "round-trips");
+    }
+
+    #[test]
+    fn answer_address_family_follows_our_host_not_the_offer() {
+        // Each side describes its own media address: a hostname host stays
+        // IP4 even against a pure-IPv6 offer, and a v6 host stays IP6.
+        let offer_str = "v=0\r\n\
+            o=- 1 1 IN IP6 2001:db8::1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP6 2001:db8::1\r\n\
+            m=audio 5000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n";
+        let offer = parse(offer_str).unwrap();
+
+        let mut v6 = caps_audio();
+        v6.host = "2001:db8::10".into();
+        let answer = answer_session(&offer, &[v6]).unwrap();
+        assert_eq!(answer.origin.addr_type.as_str(), "IP6");
+        // IPv6 literals flow through the plan projection unharmed: the
+        // answer's plan carries our own v6 media address, the offer's plan
+        // the remote one.
+        let plans = stream_plans(&answer);
+        assert!(plans[0].active);
+        assert_eq!(plans[0].remote_addr, Some("2001:db8::10".parse().unwrap()));
+        let offer_plans = stream_plans(&offer);
+        assert_eq!(
+            offer_plans[0].remote_addr,
+            Some("2001:db8::1".parse().unwrap())
+        );
+
+        let mut hostname = caps_audio();
+        hostname.host = "media.example.com".into();
+        let answer2 = answer_session(&offer, &[hostname]).unwrap();
+        assert_eq!(answer2.origin.addr_type.as_str(), "IP4");
+        assert_eq!(
+            answer2.medias[0]
+                .connection
+                .as_ref()
+                .unwrap()
+                .addr_type
+                .as_str(),
+            "IP4"
+        );
     }
 
     #[test]

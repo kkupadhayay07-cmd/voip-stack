@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 468 tests passing across 54 suites in 19 crates;
+**Current state: 474 tests passing across 54 suites in 19 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
@@ -49,7 +49,7 @@ finding is fixed with regression tests
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 468 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 474 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -114,6 +114,13 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
   CDRs carry the real final code (486 → Busy, not everything = Failed 487),
   `--since ""` parses safely, and the Prometheus call counters are wired
   with `ws_clients` exposed as a gauge.
+* **SDP hardening (IPv6 + BUNDLE)**: answers pick `IN IP4`/`IN IP6` for
+  their `o=`/`c=` lines from the local host literal (RFC 8866 §4.4 — a v6
+  address is never mislabeled IP4; the offer's family never dictates ours),
+  and an answer to a bundled offer echoes `a=group:BUNDLE` with exactly the
+  accepted mids in the offer group's order (RFC 8843 §6.2) — rejected
+  (port 0) m-lines and mid-less m-lines never join the group, and answers
+  to unbundled offers stay group-free.
 
 ## Phase status
 
@@ -135,7 +142,8 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
   response maps, dialer pacing, mixer, CDR, sink echo/Contact/leak,
   RTP padding/jitter-wrap/concealment, Via/ACK/transaction edge rules,
   registrar 423 + nonce hygiene, TLS CA verification, CDR final codes,
-  metrics wiring).
+  metrics wiring), SDP IPv6/BUNDLE answer hardening (IP4/IP6 `o=`/`c=`
+  address types, RFC 8843 BUNDLE group echo).
   ✅
 
 ## Roadmap (next)
@@ -146,8 +154,9 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
 4. WebRTC hardening — RTX/NACK resend path, TWCC-driven bandwidth estimation,
    data channels (SCTP).
 5. SDP hardening — rejected m-lines, port-0 offers, RFC 3264 §6.1 direction
-   clamp and extras serialization **done**; remaining: IPv6/BUNDLE, plus
-   GRUU/Outbound, NAPTR/SRV for carrier-grade signaling.
+   clamp, extras serialization, **IPv6 answer address types and RFC 8843
+   BUNDLE group echo done**; remaining: GRUU/Outbound, NAPTR/SRV for
+   carrier-grade signaling.
 
 ## Documentation
 

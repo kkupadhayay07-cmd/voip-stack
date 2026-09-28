@@ -16,8 +16,10 @@ timestamp wrap and sequence-gap concealment), and the full P2 sweep
 non-2xx ACK, non-INVITE Proceeding + method matching, registrar 423
 `Min-Expires` + nonce pruning, CA-verified trunk TLS with real
 mini-CA/SAN certs, real CDR final codes, safe `--since` parsing, wired
-Prometheus call counters + gauge semantics); 468 tests green across
-54 suites — **every audit finding at every severity is fixed**).
+Prometheus call counters + gauge semantics), and the SDP IPv6/BUNDLE answer
+hardening (IP4/IP6 `o=`/`c=` address types picked from the local host
+literal, RFC 8843 BUNDLE group echo with the accepted mids); 474 tests green
+across 54 suites — **every audit finding at every severity is fixed**).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
@@ -33,13 +35,14 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC 3261 | SIP: dialogs (§12) | **Partial** | B2BUA tracks per-leg dialog state (tags/Call-ID/CSeq); generic dialog package not extracted. |
 | RFC 3262 | PRACK / 100rel | **Done** (core) | B2BUA, both legs. UAS: reliable 180 (`Require: 100rel` + `RSeq` from [1, 2³¹−1], To-tagged early dialog) when the caller advertises 100rel, Timer-G-style retransmission (T1 doubling to T2) until `PRACK`, 64·T1 give-up with 503 + BYE, the final 200 parked until the PRACK arrives (§3), RAck matching with 481/400 verdicts and idempotent 200 for retransmitted PRACKs. UAC: only a 101–199 carrying BOTH `Require: 100rel` and `RSeq` is PRACKed (§4 — never a 100, never an unmarked 1xx), answered with PRACK carrying `RAck` (own dialog CSeq); a retransmitted 1xx (same `RSeq`) is answered by resending the STORED PRACK byte-identically (same CSeq number and branch, RFC 3261 §17.1.2); 421 Extension-Required dial retry once with the demanded extensions merged into `Supported` (§3); non-INVITE responses excluded from the INVITE transaction slot. |
 | RFC 3263 | DNS (NAPTR/SRV) for SIP | **Partial** | Proxy falls back to system resolver for hostnames; NAPTR/SRV discovery not implemented. |
-| RFC 3264 | Offer/answer | **Done** | `sdp::negotiate`: full RFC 3264 engine with `StreamPlan` projection. Answer direction is the explicit §6.1 matrix clamped to what the offer permits (sendonly offers can never draw a receiving answer, etc.), rejected m-lines are answered with their own m-line at port 0 and a null `c=` line of the offer's address type (§6), port-0 offers are answered port 0. |
+| RFC 3264 | Offer/answer | **Done** | `sdp::negotiate`: full RFC 3264 engine with `StreamPlan` projection. Answer direction is the explicit §6.1 matrix clamped to what the offer permits (sendonly offers can never draw a receiving answer, etc.), rejected m-lines are answered with their own m-line at port 0 and a null `c=` line of the offer's address type (§6), port-0 offers are answered port 0. The answer's own `o=`/`c=` lines pick `IN IP4`/`IN IP6` from the local host literal (RFC 8866 §4.4 — an IPv6 address is never mislabeled IP4); the offer's family never dictates the answer's. |
 | RFC 3326 | Reason header | **Partial** | Header type modelled; no protocol semantics applied yet. |
 | RFC 3515 | REFER | **Planned** | `Refer-To` header type modelled; call flows not implemented. |
 | RFC 3581 | rport / Symmetric RTP | **Done** | SBC marks `rport` on requests and routes responses via received/rport; NAT latch table maps contact → source. |
 | RFC 4028 | Session timers | **Done** | B2BUA, both legs: `Min-SE`/422 floor on inbound INVITEs, `Session-Expires`+`refresher` negotiation mirrored end-to-end on the 200s, half-interval refresh re-INVITEs (no-change offer), in-dialog UPDATE refresh, expiry teardown with BYEs on both legs, 422-retry with the peer's `Min-SE`, tag-checked in-dialog re-INVITE/UPDATE routing (481/491/488). |
 | RFC 4566 | SDP | **Done** | `sdp` crate: strict positioned-error parser + canonical serializer; session extras (`u=/e=/p=/k=/z=`) serialize with their `typ=` prefixes. |
-| RFC 8866 | SDP v2 | **Partial** | Parser/model cover `rtpmap`/`fmtp`, `ice-*`, `fingerprint`, `bundle`, `extmap`; full 8866 grammar validation not complete. |
+| RFC 8843 | BUNDLE (grouping) | **Done** (core) | `sdp`: `a=group:BUNDLE` + `a=mid` parsed into typed projections; the answer echoes the group with exactly the accepted mids in the offer group's order (§6.2/§7.1.1) — rejected (port 0) m-lines and accepted m-lines without a mid never join the group, an answer to an unbundled offer never grows a group; mid echo per accepted m-line. Single-transport reuse by the media engine (m-line demux by mid) is future work. |
+| RFC 8866 | SDP v2 | **Partial** | Parser/model cover `rtpmap`/`fmtp`, `ice-*`, `fingerprint`, `bundle`, `extmap`; answers emit IP4/IP6 connection types per the local literal (§4.4); full 8866 grammar validation not complete. |
 | RFC 2617/7616 | Digest auth | **Done** (server side) | `sip-core` helpers + registrar nonce store; `respond_to_challenge` used in tests/clients. |
 | RFC 6140 / 5627 | GRUU | **Planned** | Not started. |
 | RFC 5626 / 6223 | Outbound | **Planned** | Not started. |
@@ -122,7 +125,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **468 passing across 54 suites**.
+  `cargo test --workspace` → **474 passing across 54 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16 + §17.1/§17.3
   SRTCP AEAD), STUN (RFC 5769 §2.1/§2.2; MD5 long-term keys + MESSAGE-INTEGRITY
   against independent vectors), G.729 (bcg729 oracle), cross-decode by ffmpeg.
