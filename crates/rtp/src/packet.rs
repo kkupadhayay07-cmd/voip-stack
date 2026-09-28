@@ -165,13 +165,28 @@ impl RtpPacket {
     }
 
     /// Serialize into `out`.
+    ///
+    /// Padding is emitted per RFC 3550 §5.1: when the padding bit is set,
+    /// `padding_len` octets are appended after the payload, the last of which
+    /// carries the count (including itself). A packet parsed from the wire
+    /// round-trips byte-exactly; a hand-built packet that sets the padding
+    /// bit without a length emits the RFC-minimal single count octet (1).
     pub fn encode_into(&self, out: &mut BytesMut) {
         let cc = self.header.csrcs.len().min(15);
+        // Source of truth for the wire is `padding_len` (the number of
+        // padding octets, count octet included). Emitting the padding bit
+        // without the corresponding bytes would make the receiver read the
+        // last real payload octet as the padding count.
+        let padding_len = if self.header.padding {
+            self.padding_len.max(1)
+        } else {
+            0
+        };
         let b0 = 0x80u8
-            | if self.header.padding { 0x20 } else { 0 }
+            | if padding_len > 0 { 0x20 } else { 0 }
             | if self.extension.is_some() { 0x10 } else { 0 }
             | cc as u8;
-        out.reserve(12 + cc * 4 + self.payload.len() + 16);
+        out.reserve(12 + cc * 4 + self.payload.len() + padding_len as usize + 16);
         out.put_u8(b0);
         out.put_u8(if self.header.marker { 0x80 } else { 0 } | (self.header.payload_type & 0x7F));
         out.put_u16(self.header.sequence);
@@ -189,6 +204,12 @@ impl RtpPacket {
             out.put_bytes(0, pad);
         }
         out.extend_from_slice(&self.payload);
+        if padding_len > 1 {
+            out.put_bytes(0, padding_len as usize - 1);
+        }
+        if padding_len > 0 {
+            out.put_u8(padding_len);
+        }
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -277,6 +298,43 @@ mod tests {
         let p = RtpPacket::parse(&raw).unwrap();
         assert_eq!(p.payload.as_ref(), b"ab");
         assert_eq!(p.padding_len, 4);
+    }
+
+    /// Regression (audit 2.13a): a padded packet re-encoded after parsing
+    /// must be byte-identical — the padding bit used to be re-emitted
+    /// WITHOUT the padding octets, so the receiver read the last real
+    /// payload byte as the padding count.
+    #[test]
+    fn padded_packet_roundtrips_byte_exactly() {
+        let mut raw = vec![0xA0u8, 0, 0, 1];
+        raw.extend_from_slice(&[0u8; 8]);
+        raw.extend_from_slice(b"ab");
+        raw.extend_from_slice(&[0, 0, 0]);
+        raw.push(4);
+        let p = RtpPacket::parse(&raw).unwrap();
+        assert!(p.header.padding);
+        assert_eq!(p.padding_len, 4);
+        let re = p.encode();
+        assert_eq!(re, raw, "re-encode must reproduce the padded packet");
+        // and the round-tripped parse agrees
+        let q = RtpPacket::parse(&re).unwrap();
+        assert_eq!(q.payload, p.payload);
+        assert_eq!(q.padding_len, 4);
+    }
+
+    /// A hand-built packet that sets the padding bit without a length emits
+    /// the RFC-minimal single count octet (count = 1, zero pad bytes).
+    #[test]
+    fn padding_bit_without_length_emits_minimal_padding() {
+        let mut p = RtpPacket::new(0, 1, 2, 3, false, Bytes::from_static(b"ab"));
+        p.header.padding = true;
+        let enc = p.encode();
+        assert_eq!(enc.len(), 12 + 2 + 1);
+        assert_eq!(enc[0] & 0x20, 0x20, "padding bit set");
+        assert_eq!(enc[14], 1, "final octet is the count (1)");
+        let q = RtpPacket::parse(&enc).unwrap();
+        assert_eq!(q.payload.as_ref(), b"ab");
+        assert_eq!(q.padding_len, 1);
     }
 
     #[test]

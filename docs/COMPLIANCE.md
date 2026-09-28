@@ -9,7 +9,10 @@ session timers and RFC 3262 PRACK/100rel on both B2BUA legs, plus the
 external security/interop audit triage with its follow-up fix waves
 (Remote-DoS parser panics, SRTP payload authentication, G.729 postfilter
 output, ICE IPv6/TURN, SBC/proxy response maps, dialer/mixer/CDR data
-integrity); 446 tests green across 54 suites).
+integrity), and the final Critical/High wave (TLS/WSS handshake budget,
+loopback sink echo/Contact/reaper, RTP padding round-trip, jitter-buffer
+timestamp wrap and sequence-gap concealment); 455 tests green across
+54 suites — **every confirmed Critical + High audit finding is fixed**).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
@@ -41,7 +44,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
 | RFC | Feature | Status | Notes |
 |-----|---------|--------|-------|
-| RFC 3550 | RTP/RTCP | **Done** | `rtp` crate: fixed-header parse/serialize; RTCP SR/RR/SDES/BYE/APP compound parse/encode; interarrival jitter estimator; SSRC probation. |
+| RFC 3550 | RTP/RTCP | **Done** | `rtp` crate: fixed-header parse/serialize; RTCP SR/RR/SDES/BYE/APP compound parse/encode; interarrival jitter estimator; SSRC probation. Padding round-trips byte-exactly (the padding bit is never emitted without its octets); the playout buffer is wrap-safe for both the 16-bit sequence and 32-bit timestamp spaces. |
 | RFC 3551 | RTP/AVP profile | **Done** | Static payload types (0 PCMU, 8 PCMA, 9 G722, 18 G729, 13 CN, 100 telephone-event) + L16 (BE). |
 | RFC 3556 | SDP bandwidth modifiers | **Partial** | `b=` lines parsed/modelled; `TIAS` pacing semantics not applied. |
 | RFC 4585 | RTCP-based feedback | **Partial** | NACK/TWCC/PLI/FIR packets modelled; REMB not implemented; RTX retransmission logic not yet. |
@@ -114,7 +117,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **446 passing across 54 suites**.
+  `cargo test --workspace` → **455 passing across 54 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16 + §17.1/§17.3
   SRTCP AEAD), STUN (RFC 5769 §2.1/§2.2; MD5 long-term keys + MESSAGE-INTEGRITY
   against independent vectors), G.729 (bcg729 oracle), cross-decode by ffmpeg.

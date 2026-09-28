@@ -9,6 +9,10 @@
 //!   violated (garbage, missing/huge `Content-Length`), the byte stream can
 //!   no longer be resynchronized (RFC 3261 §18.3) — the connection is
 //!   closed instead of silently re-syncing on a corrupted stream.
+//! * **Handshake timeout.** A TLS or WSS connection that never completes
+//!   its handshake is closed after [`HANDSHAKE`] — the semaphore permit
+//!   and task are released instead of being parked forever by a silent
+//!   peer (a few hundred such connections used to exhaust the listener).
 //! * **Idle timeout.** A connection that sends no bytes for
 //!   [`STREAM_IDLE`] is closed, so a slow peer cannot park tasks and
 //!   buffers forever (slowloris).
@@ -40,6 +44,11 @@ use crate::core::{ConnRegistry, Incoming, Responder};
 /// closed. SIP keepalives (CRLF over stream transports, OPTIONS) refresh it.
 pub const STREAM_IDLE: Duration = Duration::from_secs(180);
 
+/// Budget for the TLS handshake and (for WSS) the WebSocket upgrade on top
+/// of it. A peer that has not completed the handshake within this window is
+/// disconnected; the connection slot is released.
+pub const HANDSHAKE: Duration = Duration::from_secs(10);
+
 /// Maximum concurrent connections per stream listener. Extra connects wait
 /// in the kernel accept backlog until a slot frees up.
 pub const MAX_STREAM_CONNS: usize = 256;
@@ -68,6 +77,9 @@ pub struct ListenerCtx {
     pub registry: ConnRegistry,
     /// Read-idle window before a connection is closed.
     pub idle: Duration,
+    /// Budget for TLS handshake + WSS upgrade before the connection is
+    /// dropped.
+    pub handshake: Duration,
 }
 
 // ---------------------------------------------------------------- UDP ----
@@ -212,13 +224,20 @@ pub async fn run_tls_on(
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            match crate::tls::accept_tls(&acceptor, tcp).await {
-                Ok(stream) => {
+            // Handshake budget: a silent/stalled peer releases its slot
+            // instead of parking the permit (and the task) forever.
+            match tokio::time::timeout(ctx.handshake, crate::tls::accept_tls(&acceptor, tcp)).await
+            {
+                Ok(Ok(stream)) => {
                     if let Err(e) = stream_loop(stream, peer, ctx, "tls").await {
                         tracing::debug!(%peer, "tls connection ended: {e}");
                     }
                 }
-                Err(e) => tracing::debug!(%peer, "tls handshake failed: {e}"),
+                Ok(Err(e)) => tracing::debug!(%peer, "tls handshake failed: {e}"),
+                Err(_) => tracing::debug!(
+                    %peer,
+                    "tls handshake timeout after {:?}", ctx.handshake
+                ),
             }
         });
     }
@@ -258,24 +277,34 @@ pub async fn run_wss_on(
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let tls = match crate::tls::accept_tls(&acceptor, tcp).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::debug!(%peer, "wss tls handshake failed: {e}");
+            // One budget covers the TLS handshake AND the WebSocket
+            // upgrade: a silent or stalling peer releases its slot instead
+            // of parking the permit forever.
+            let handshake = async {
+                let tls = crate::tls::accept_tls(&acceptor, tcp)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let cfg = WebSocketConfig {
+                    max_message_size: Some(WS_MAX_MESSAGE),
+                    max_frame_size: Some(WS_MAX_FRAME),
+                    ..Default::default()
+                };
+                tokio_tungstenite::accept_async_with_config(tls, Some(cfg))
+                    .await
+                    .map_err(|e| e.to_string())
+            };
+            let ws = match tokio::time::timeout(ctx.handshake, handshake).await {
+                Ok(Ok(w)) => w,
+                Ok(Err(e)) => {
+                    tracing::debug!(%peer, "wss handshake failed: {e}");
                     return;
                 }
-            };
-            // WebSocket upgrade on top of the established TLS stream, with
-            // explicit framing limits (library defaults allow 64 MiB).
-            let cfg = WebSocketConfig {
-                max_message_size: Some(WS_MAX_MESSAGE),
-                max_frame_size: Some(WS_MAX_FRAME),
-                ..Default::default()
-            };
-            let ws = match tokio_tungstenite::accept_async_with_config(tls, Some(cfg)).await {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::debug!(%peer, "wss upgrade failed: {e}");
+                Err(_) => {
+                    tracing::debug!(
+                        %peer,
+                        "wss handshake timeout after {:?}",
+                        ctx.handshake
+                    );
                     return;
                 }
             };
@@ -408,6 +437,7 @@ Content-Length: 999999999\r\n\r\nshort";
             core: core_tx,
             registry: Arc::new(Mutex::new(HashMap::new())),
             idle,
+            handshake: Duration::from_millis(100),
         };
         (ctx, core_rx)
     }
@@ -612,5 +642,62 @@ Content-Length: 999999999\r\n\r\nshort";
         ws_payload_incoming(&payload, peer, &ctx, &tx).await;
         let msg = next_incoming(&mut core_rx).await;
         assert_register(&msg, "text-framed message");
+    }
+
+    /// Regression (audit 2.8): a TLS peer that connects and then goes
+    /// silent must be disconnected when the handshake budget expires —
+    /// previously the task (and its semaphore permit) parked forever, so
+    /// enough silent connects exhausted the listener. Also proves the slot
+    /// is reusable: a well-behaved peer completes a handshake afterwards.
+    #[tokio::test]
+    async fn tls_silent_peer_released_after_handshake_budget() {
+        let (ctx, _core_rx) = test_ctx(STREAM_IDLE);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let id = crate::tls::TlsIdentity::generate("127.0.0.1").unwrap();
+        let acceptor = id.acceptor().unwrap();
+        tokio::spawn(run_tls_on(listener, acceptor, ctx));
+
+        // Silent peer: connect, send nothing, wait past the 100 ms budget.
+        let silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        expect_eof(silent).await;
+
+        // The slot was released: a real handshake still succeeds.
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let connector = crate::tls::client_connector().unwrap();
+        let mut tls = crate::tls::connect_tls(&connector, "127.0.0.1", tcp)
+            .await
+            .unwrap();
+        tls.write_all(REGISTER).await.unwrap();
+        // next_incoming would need the same ctx's core_rx; instead assert
+        // the write path is alive by reading nothing back and completing:
+        // reaching here without error proves the handshake succeeded.
+    }
+
+    /// Regression (audit 2.8): same for WSS — a silent peer must not hold
+    /// its connection slot through an unbounded TLS+upgrade wait.
+    #[tokio::test]
+    async fn wss_silent_peer_released_after_handshake_budget() {
+        let (ctx, _core_rx) = test_ctx(STREAM_IDLE);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let id = crate::tls::TlsIdentity::generate("127.0.0.1").unwrap();
+        let acceptor = id.acceptor().unwrap();
+        tokio::spawn(run_wss_on(listener, acceptor, ctx));
+
+        let silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        expect_eof(silent).await;
+
+        // Slot reusable: a full TLS+WS handshake completes afterwards.
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let connector = crate::tls::client_connector().unwrap();
+        let tls = crate::tls::connect_tls(&connector, "127.0.0.1", tcp)
+            .await
+            .unwrap();
+        let (mut ws, _resp) = tokio_tungstenite::client_async("wss://127.0.0.1/", tls)
+            .await
+            .unwrap();
+        use futures_util::SinkExt;
+        ws.send(Message::Binary(REGISTER.to_vec())).await.unwrap();
     }
 }

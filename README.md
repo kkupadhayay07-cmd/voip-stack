@@ -13,10 +13,10 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 446 tests passing across 54 suites in 19 crates;
-`clippy -D warnings` clean; `cargo audit` clean. External security/interop
-audit (42 findings) triaged — every Critical/High confirmed finding either
-fixed with regression tests or tracked open in
+**Current state: 455 tests passing across 54 suites in 19 crates;
+`clippy -D warnings` clean; `cargo audit` clean. The external security/interop
+audit (42 findings) is fully triaged — every Critical and High finding is
+fixed with regression tests; the remaining P2 list is tracked in
 [`docs/BUG_AUDIT_2026-09.md`](docs/BUG_AUDIT_2026-09.md).**
 
 ## Workspace layout
@@ -49,7 +49,7 @@ fixed with regression tests or tracked open in
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 446 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 455 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -89,6 +89,10 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
   pinning, `use_srtp`) → RFC 5764 key export → SRTP sessions protect real
   media; ICE agents complete checks over UDP loopback; TURN relays through
   our own server.
+* **Media transport**: RTP packets round-trip byte-exactly INCLUDING the
+  padding case (bit never emitted without its octets); the jitter buffer
+  stays paced across the 32-bit timestamp wrap and never jumps sequence
+  gaps (hole slots are concealed with proper loss accounting).
 * **Security primitives**: SRTP validated against RFC 3711 B.2/B.3 and
   RFC 7714 §16 conformance vectors; SRTCP AEAD against RFC 7714 §17.1/§17.3
   (encrypted, tagging-only E=0, tamper); STUN against RFC 5769 §2.1/§2.2;
@@ -111,10 +115,13 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
 * **Hardening** — RFC 3261 §17 transaction layer (`sip-tx`), in-process
   observability (pcap/traces/diag/CDR), trunk auth (IP/Digest/Bearer/mTLS),
   UDP/TCP/TLS/WSS listeners, TCP/TLS/WSS framing audit under adverse input,
+  TLS/WSS handshake timeout (silent peers release their slot),
   RFC 4028 session timers, RFC 3262 PRACK/100rel — both on both B2BUA
-  legs, external audit triage (14+ findings fixed with regression tests:
-  remote-DoS panics, SRTP payload auth, G.729 postfilter output, ICE
-  IPv6/TURN, SBC/proxy response maps, dialer pacing, mixer, CDR). ✅
+  legs, external audit fully closed: every Critical + High finding fixed
+  with regression tests (remote-DoS panics, SRTP payload auth, G.729
+  postfilter output, ICE IPv6/TURN, SBC/proxy response maps, dialer pacing,
+  mixer, CDR, sink echo/Contact/leak, RTP padding/jitter-wrap/concealment).
+  ✅
 
 ## Roadmap (next)
 

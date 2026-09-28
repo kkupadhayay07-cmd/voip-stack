@@ -24,14 +24,14 @@ RUST_LOG="info,b2bua=debug" cargo test -p b2bua -- --nocapture
 Toolchain is pinned by `rust-toolchain.toml` (stable). System dependency:
 `pkg-config` + `libopus-dev` unless building `--no-default-features`.
 
-## 2. Suite inventory (last verified full run: 446 tests, 54 suites)
+## 2. Suite inventory (last verified full run: 455 tests, 54 suites)
 
 | Crate | Tests | Focus |
 |-------|-------|-------|
 | `sip-core` | 65 | URI/headers/message model incl. host-only URIs (§19.1), `Session-Expires`/`refresher` accessors (RFC 4028) and `RSeq`/`RAck` accessors (RFC 3262); datagram + stream framing (split reads, folding, limits, §18.3 trailing octets); canonical serializer round-trips; digest RFC 2617 vectors; fuzz-smoke corpus; builder defaults |
 | `sip-tx` | 16 | RFC 3261 §17 state machines with a fake clock: exact timer fire instants (0/500/1500/3500/7500/15500/31500 ms), T2 caps, 64·T1 timeouts, retransmission absorption, wrong-branch/wrong-CSeq rejection, 2xx-ACK-is-a-new-transaction, reliable-transport timer elision, Timer B/F armed on reliable transports and firing at exactly 64·T1 with UDP-parity terminal state, transport-error teardown |
 | `sdp` | 22 | parser grammar + positioned errors; canonical serialization (extras keep their `typ=` prefix); RFC 3264 offer/answer (codec/direction intersection, mux, ICE/DTLS carry); §6.1 answer-direction matrix validated for every offer/caps pair and clamped to the offer; rejected m-lines answered port 0 with a null `c=` line of the offer's address type; port-0 offers answered port 0; `StreamPlan` projection; fuzz-smoke corpus |
-| `rtp` | 41 | packet/RTCP parse+serialize round-trips; RFC 8285 extensions; RFC 4733 events; RFC 5761 demux; jitter buffer with virtual time (reorder, loss→PLC, duplicates, wrap, SSRC restart, adaptive depth); fuzz-smoke corpus |
+| `rtp` | 45 | packet/RTCP parse+serialize round-trips (padding byte-exact incl. bit-without-octets regression); RFC 8285 extensions; RFC 4733 events; RFC 5761 demux; jitter buffer with virtual time (reorder, loss→PLC, duplicates, wrap, 32-bit timestamp-wrap playout pacing, sequence-gap concealment guard, SSRC restart, adaptive depth); fuzz-smoke corpus |
 | `codecs` | 92 | G.711/G.722 bit-exactness; G.729 ITU tables + interop gates (§3) incl. postfilter output-path regression (80 samples/frame, postfilter presence); Opus binding; L16/CN/PLC; resampler; registry |
 | `b2bua` | 28 | RFC 4028 timer negotiation matrix + refresh/expiry clock math (unit); RFC 3262 rel100 rules (Timer-G backoff clock, PRACK decision matrix with §4 gates — 100 and non-100rel 1xx never PRACKed — stored-PRACK retransmit, RAck matching, `Supported` merge for 421) (unit); full-loopback integration call: 100/180/200/ACK ordering, PCMU→PCMA transcode with SNR gate, DTMF relay, BYE, CDR trail; session-timer integration flows: negotiation mirrored on the 200s, downstream half-interval refresh, leg-A refresher election, 422/Min-SE floor, 422 retry with the peer's Min-SE, UPDATE refresh, expiry teardown with BYEs on both legs; rel100 integration flows: reliable 180 with the parked 200 (§3), retransmission until PRACK with the STORED PRACK resent (same CSeq and branch), RAck verdicts (481/488), plain-180 + unsolicited PRACK, both-legs PRACK incl. lost-PRACK recovery, 421 dial retry with `Supported` merge, CANCEL-for-unknown-transaction 481; both legs driven by `sip-tx` transactions |
 | `srtp` | 41 | RFC 3711 B.2/B.3 + RFC 7714 §16 vectors; RFC 7714 §17.1/§17.3 SRTCP AEAD vectors (encrypted, tagging-only E=0, tamper) pinning the tag-before-index wire order; E=0 authenticate-only acceptance for AEAD and RFC 3711 profiles; round-trips; replay window/ROC semantics |
@@ -46,7 +46,7 @@ Toolchain is pinned by `rust-toolchain.toml` (stable). System dependency:
 | `proxy` | 9 | routing, forking, CANCEL matched on the upstream Via branch, shared request/response transaction keying, Via/Record-Route, 483, NAT response routing |
 | `registrar` | 9 | bindings, expiry, wildcard removal, digest challenge, CSeq/Call-ID consistency |
 | `observ` | 16 | pcap writers, per-call trace buffer, diag counters (rx/tx/lost/jitter/concealed), redaction of per-packet RTP from traces, obs-fold auth continuation-line redaction |
-| `zrtc` | 11 | daemon config parsing + assembly smoke; core response-path regressions (proxy Via pop + SBC processing, b2bua-Via relay, bindings key, client-map cleanup) |
+| `zrtc` | 16 | daemon config parsing + assembly smoke; core response-path regressions (proxy Via pop + SBC processing, b2bua-Via relay, bindings key, client-map cleanup); loopback sink end-to-end (Contact = own host, cached-200 retransmission, PT-filtered echo with negotiated-clock ts step, telephone-event never echoed, no-BYE idle reap); TLS/WSS handshake-budget regressions (silent peer released, slot reusable) |
 
 Counts move with the code; CI (§4) is the authoritative gate on every push.
 

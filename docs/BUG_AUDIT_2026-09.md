@@ -35,13 +35,13 @@ fix scheduled) · **Won't fix** (with reason).
 | 2.4 | Timer B/F never armed on reliable transports | Confirmed | **Fixed** — B/F armed on every transport, A/E stay UDP-only; test updated (`reliable_transport_has_no_retransmit_timers`) |
 | 2.5 | Responses to b2bua-originated in-dialog requests dropped (Via host mismatch) | Confirmed | **Fixed** — core relays b2bua-Via responses back to the b2bua socket |
 | 2.6 | `sync_bindings` keys bindings as `sip:<user>` (never matches proxy lookups) | Confirmed | **Fixed** — scheme stripped, bare user key |
-| 2.7 | `sink.rs` rtp_tap: hardcoded +160 ts step, echo before PT filter, Contact = remote src, sink-call leak on missing BYE | Confirmed | Open |
-| 2.8 | TLS/WSS handshakes await forever while holding connection permits | Confirmed (no timeout before `stream_loop`) | Open |
+| 2.7 | `sink.rs` rtp_tap: hardcoded +160 ts step, echo before PT filter, Contact = remote src, sink-call leak on missing BYE | Confirmed | **Fixed** — echo timestamp step follows the negotiated clock (160 @ 8 kHz, 960 @ 48 kHz Opus); PT filter runs BEFORE the echo so telephone-event/CN never corrupt the echo stream; Contact = the sink's own host; calls with no RTP and no BYE are reaped by a periodic sweep (entry + media task released); end-to-end sink test |
+| 2.8 | TLS/WSS handshakes await forever while holding connection permits | Confirmed (no timeout before `stream_loop`) | **Fixed** — one handshake budget (default 10 s) covers TLS and, for WSS, the WebSocket upgrade on top; silent/stalled peers release their slot; regression tests prove the EOF and that the slot is reusable |
 | 2.9 | G.729 decoder discards postfilter output / double-samples when postfilter off | Confirmed | **Fixed** — exactly one output path per config (postfiltered synthesis when on, plain once when off); unbounded history leak fixed; regression test pins 80 samples/frame and postfilter presence; SNR/ffmpeg gates recalibrated to the now-correct output (bcg729 oracle test unchanged at ±5 dB) |
 | 2.10 | STUN ERROR-CODE 3-byte header; CHANNEL-NUMBER `0x0006` collides with USERNAME | Confirmed | **Fixed** — 4-byte `[0,0,class,number]` layout + `CHANNEL_NUMBER = 0x000C` (RFC 5389 §15.6, RFC 5766 §14.1); wire-layout test added |
 | 2.11 | IPv6 ICE candidate parse; unauthenticated TURN allocate flow self-deadlocks | Confirmed | **Fixed** — bracket-aware address parse for `c=`/`raddr` (RFC 8839 §5.1) with IPv6 regression tests; Allocate probe accepts immediate success (authenticate-only path) and re-Allocate answers the existing relay per RFC 5766 §6.2; MD5 long-term key + MESSAGE-INTEGRITY pinned by independent known vectors |
 | 2.12 | SRTCP AES-GCM E=0 always fails; per-SSRC state allocated before auth | Confirmed | **Fixed** — E=0 passes the tag as the GCM "ciphertext" input; recv-stream state committed only after tag verification (both RTP and RTCP paths). Deepened afterwards: AEAD profiles also accept unencrypted SRTCP (E=0, RFC 7714 §9.3) authenticate-only, both wire orders handled (RFC 3711 §3.4 tag-after-index vs RFC 7714 §9 tag-before-index), pinned by RFC 7714 §17.1/§17.3 official vectors incl. tamper |
-| 2.13 | RTP padding bit re-encoded without padding bytes; jitter buffer 32-bit ts wrap; `pop_ready` skips concealment for gaps | Confirmed | Open |
+| 2.13 | RTP padding bit re-encoded without padding bytes; jitter buffer 32-bit ts wrap; `pop_ready` skips concealment for gaps | Confirmed | **Fixed** — encoder appends the padding octets (count octet last) and a padded packet round-trips byte-exactly; jitter buffer extends the 32-bit timestamp to 64 bits (wrap-aware, like the sequence space) so playout stays paced across the ≈6.2-day wrap; `pop_ready` refuses to jump sequence gaps — hole slots go through concealment with proper loss accounting |
 | 2.14 | SBC topology hiding looks up `call_map` instead of `call_map_rev` on responses; proxy tx keys never match | Confirmed (SBC half verified; proxy half consistent with the code) | **Fixed** — SBC keeps an explicit reverse map (hidden → peer) populated on the request path and restores the peer's Call-ID on core responses; proxy funnels request/CANCEL/response keying through ONE `tx_key` builder (call-id + top-Via branch + method, RFC 3261 §17.1.3) and CANCEL matches against the upstream Via branch, not our own |
 | 2.15 | Dialer predictive pacing ignores `lines_ringing`; answered leads re-dialed; DNC skipped on queued leads | Confirmed | **Fixed** — LiveStats counts dialing+ringing+active, predictive paces on the deficit vs all in-flight calls; answered leads parked at answer time; DNC re-checked at every candidacy decision and permanently parks the lead |
 | 2.16 | `Mixer::mix` includes inactive inputs and replays stale frames (50 Hz buzz) | Confirmed | **Fixed** — VAD-inactive inputs skipped in accumulation and contributor scaling; inputs un-refreshed for 3 packet periods stop contributing (no stale replay, frame width preserved) |
@@ -71,10 +71,8 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **446 passing** (401 at the first fix commit + 45
-regression/vector tests from the follow-up fix wave), `clippy -D warnings`
-clean, `cargo fmt --check` clean.
+`cargo test --workspace` → **455 passing** across 54 suites, `clippy -D warnings`
+clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
-Remaining open findings after the fix waves: **2.7** (sink.rs rtp_tap),
-**2.8** (TLS/WSS handshake timeout), **2.13** (RTP padding / jitter wrap /
-concealment skip) and the P2s listed above. No silent gaps.
+All Critical and High findings are now **Fixed** (with regression tests).
+Remaining open: the P2 list below. No silent gaps.

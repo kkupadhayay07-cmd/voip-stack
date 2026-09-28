@@ -133,6 +133,7 @@ pub async fn run(mut cfg: Config) -> Result<(), String> {
         core: core_tx.clone(),
         registry: registry.clone(),
         idle: transport::STREAM_IDLE,
+        handshake: transport::HANDSHAKE,
     };
 
     // ---- core pump -------------------------------------------------------

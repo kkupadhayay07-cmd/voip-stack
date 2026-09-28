@@ -121,6 +121,7 @@ const MIN_SEQUENTIAL: u32 = 2;
 const MAX_ENTRIES: usize = 4096;
 /// Sequence jumps beyond this are treated as a stream restart.
 const MAX_SEQ_JUMP: i64 = 1000;
+const TWO_POW_32: i64 = 1i64 << 32;
 
 /// The adaptive jitter buffer.
 pub struct JitterBuffer {
@@ -131,6 +132,8 @@ pub struct JitterBuffer {
     probation_count: u32,
     probation_last_seq: u16,
     highest_ext_seq: i64,
+    /// Highest extended (64-bit) RTP timestamp seen for the stream.
+    highest_ext_ts: i64,
     /// Next expected extended sequence number (playout cursor).
     next_seq: i64,
     /// RTP timestamp of the next expected slot (playout cursor).
@@ -156,6 +159,21 @@ fn wrap_diff(new: u16, old: u16) -> i64 {
     }
 }
 
+/// Extends a 32-bit RTP timestamp to 64 bits relative to `prev` (the
+/// previous extended timestamp of the stream): the candidate among
+/// `ts`, `ts + 2³²`, `ts − 2³²` closest to `prev` wins, so a sender-side
+/// wrap of the 32-bit field keeps playout math monotonic (audit 2.13b).
+fn extend_ts(prev: i64, ts: u32) -> i64 {
+    let t = ts as i64;
+    let mut best = t;
+    for cand in [t + TWO_POW_32, t - TWO_POW_32] {
+        if (cand - prev).abs() < (best - prev).abs() {
+            best = cand;
+        }
+    }
+    best
+}
+
 impl JitterBuffer {
     pub fn new(cfg: JitterConfig) -> JitterBuffer {
         JitterBuffer {
@@ -167,6 +185,7 @@ impl JitterBuffer {
             probation_count: 0,
             probation_last_seq: 0,
             highest_ext_seq: 0,
+            highest_ext_ts: 0,
             next_seq: 0,
             next_ts: 0,
             last_pt: 0,
@@ -238,6 +257,7 @@ impl JitterBuffer {
         self.entries.clear();
         self.ssrc = ssrc;
         self.highest_ext_seq = seq as i64;
+        self.highest_ext_ts = ts as i64;
         self.next_seq = seq as i64;
         self.next_ts = ts as i64;
         self.last_pt = 0;
@@ -306,9 +326,13 @@ impl JitterBuffer {
             return PushResult::Duplicate;
         }
 
+        // ---- timestamp extension (32-bit field wraps, RFC 3550 §5.1) ----
+        let ext_ts = extend_ts(self.highest_ext_ts, ts);
+        self.highest_ext_ts = self.highest_ext_ts.max(ext_ts);
+
         // RFC 3550 §A.8 interarrival jitter (accepted packets only)
         let arrival_samples = now_ms as f64 * self.cfg.clock_hz as f64 / 1000.0;
-        let transit = arrival_samples - ts as f64;
+        let transit = arrival_samples - ext_ts as f64;
         if let Some(prev) = self.transit_prev {
             let delta = (transit - prev).abs();
             self.jitter_samples += (delta - self.jitter_samples) / 16.0;
@@ -339,7 +363,7 @@ impl JitterBuffer {
                     payload: Bytes::from(payload),
                     concealed: false,
                 },
-                ext_ts: ts as i64,
+                ext_ts,
             },
         );
         self.stats.frames_in += 1;
@@ -373,10 +397,19 @@ impl JitterBuffer {
     }
 
     /// Pop the next frame if it is due for playout at `now_ms`.
+    ///
+    /// A frame is only popped when its sequence number IS the playout
+    /// cursor: if the buffered head sits beyond a sequence gap, this
+    /// returns `None` and the missing slots must be covered by
+    /// [`Self::conceal`] first (audit 2.13c — popping across the gap used
+    /// to swallow the PLC slots and their loss accounting).
     pub fn pop_ready(&mut self, now_ms: u64) -> Option<RtpFrame> {
         let a = self.anchor.as_ref()?;
         let (&seq, entry) = self.entries.iter().next()?;
         if self.due_ms(a, entry.ext_ts) > now_ms as f64 {
+            return None;
+        }
+        if seq > self.next_seq {
             return None;
         }
         let entry = self.entries.remove(&seq).expect("just checked");
@@ -721,5 +754,68 @@ mod tests {
         // head due at 30: depth = 30 at t=0
         assert!((b.depth_ms(0) - 30.0).abs() < 0.001);
         assert_eq!(b.depth_ms(100), 0.0);
+    }
+
+    /// Regression (audit 2.13b): the 32-bit RTP timestamp wraps mid-stream
+    /// (≈6.2 days @ 8 kHz). Playout pacing used to collapse because
+    /// timestamps were stored raw — after the wrap every due time landed
+    /// ~2³² samples in the past and frames burst out unpaced.
+    #[test]
+    fn timestamp_wraparound_keeps_playout_paced() {
+        let mut b = jb();
+        // start 3 frames before the 2³² boundary; the field wraps between
+        // frames 102 (ts = u32::MAX) and 103 (ts = 159)
+        let start_ts = u32::MAX - 2 * 160;
+        push(&mut b, 100, start_ts, 0);
+        push(&mut b, 101, start_ts.wrapping_add(160), 20);
+        push(&mut b, 102, start_ts.wrapping_add(320), 40);
+        push(&mut b, 103, start_ts.wrapping_add(480), 60);
+        assert_eq!(b.stats.resets, 1, "wrap must not reset the stream");
+        assert_eq!(b.stats.late, 0, "wrapped frames are not late");
+        // playout continues at the normal 20 ms cadence (min target 30 ms)
+        let mut seqs = Vec::new();
+        let mut gaps = Vec::new();
+        let mut t = 29;
+        let mut last_out: Option<u64> = None;
+        for _ in 0..61 {
+            t += 1;
+            let now = t as u64;
+            while let Some(f) = b.pop_ready(now) {
+                if let Some(l) = last_out {
+                    gaps.push(now - l);
+                }
+                last_out = Some(now);
+                seqs.push(f.seq);
+            }
+        }
+        assert_eq!(seqs, vec![100, 101, 102, 103]);
+        assert!(
+            gaps.iter().all(|g| (10..=25).contains(g)),
+            "wrap must not burst playout: {:?}",
+            gaps
+        );
+    }
+
+    /// Regression (audit 2.13c): with a sequence gap ahead of the head,
+    /// pop_ready used to jump the gap and emit the real frame, swallowing
+    /// the missing slots' concealment and loss accounting.
+    #[test]
+    fn pop_ready_does_not_jump_sequence_gaps() {
+        let mut b = jb();
+        push(&mut b, 0, 0, 0);
+        push(&mut b, 1, 160, 20);
+        // seq 2 lost; frame 3 arrives and is buffered
+        push(&mut b, 3, 480, 60);
+        assert_eq!(b.pop_ready(30).unwrap().seq, 0);
+        assert_eq!(b.pop_ready(50).unwrap().seq, 1);
+        // slot 3's deadline: the cursor (seq 2) must be concealed first,
+        // even though frame 3 is due at the same instant
+        let c = b.conceal(90).unwrap();
+        assert_eq!(c.seq, 2);
+        assert!(c.concealed);
+        assert_eq!(b.stats.packets_lost, 1);
+        // now the real frame pops
+        assert_eq!(b.pop_ready(90).unwrap().seq, 3);
+        assert_eq!(b.stats.concealed, 1);
     }
 }

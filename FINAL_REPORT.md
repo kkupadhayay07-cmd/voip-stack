@@ -153,9 +153,12 @@ addendum records what landed since, so the document stays honest.
 | `97a4f05` | Workspace rustfmt normalization (style only, no behavior change) |
 | `909dc6a` | External audit triage (42 findings vs `c0d793a`) — every claim verified before fixing; 14 fixes with regression tests: remote-DoS parser panics (`percent_decode`, `parse_name_addr`, Cidr prefix), SRTP authenticated portion covers header+payload (RFC 3711 §3.1/§4.2), DTLS-SRTP null export context (RFC 5764 §4.2), STUN ERROR-CODE/CHANNEL-NUMBER wire layout, TURN relay concrete IP, DTMF bridged (not echoed), CANCEL per §9.1/§9.2, dialog-level Timer H, zrtc response-path/SBC/proxy-Via fixes; full triage table in `docs/BUG_AUDIT_2026-09.md` |
 | Audit fix wave 2 | Confirmed open findings closed with regression tests: G.729 postfilter output path (oracle gates unchanged/recalibrated), ICE IPv6 SDP candidates (RFC 8839 §5.1) + unauthenticated TURN Allocate idempotency (RFC 5766 §6.2) + MD5/MESSAGE-INTEGRITY known vectors, SRTCP E=0 authenticate-only + RFC 7714 §17.1/§17.3 wire-order vectors, SBC reverse Call-ID map + proxy unified transaction keying (RFC 3261 §17.1.3), dialer predictive deficit/answered-lead/DNC fixes, mixer inactive/stale input exclusion, CDR capacity-0 panic + obs-fold auth redaction, sip-tx Timer B/F reliable-transport regressions, b2bua PRACK §4 gates + stored-PRACK retransmission (RFC 3261 §17.1.2) + 421 `Supported` merge + CANCEL-481, SDP §6.1 direction matrix/rejected m-lines/port-0/extras `typ=` |
+| Audit fix wave 3 | The last three confirmed High findings closed: **2.13** RTP padding re-encoded byte-exactly (bit never emitted without its octets), jitter buffer 32-bit timestamp wrap extension (playout stays paced past the ≈6.2-day wrap), `pop_ready` sequence-gap guard (hole slots concealed with proper loss accounting); **2.7** loopback sink — echo ts step follows the negotiated clock (Opus 960/20 ms), PT filter before the echo (telephone-event/CN never corrupt the echo stream), Contact = own host, no-BYE calls reaped by an idle sweep; **2.8** TLS/WSS handshake budget (10 s default) — silent peers release their connection slot, regression-tested for release + reuse |
 
-**Current baseline (supersedes the header numbers):** 19 crates, **446 tests
-across 54 suites**, `clippy -D warnings` clean, `cargo audit` clean.
+**Current baseline (supersedes the header numbers):** 19 crates, **455 tests
+across 54 suites**, `clippy -D warnings` clean, `cargo audit` clean. The
+external audit is fully closed at Critical/High level — only the P2 list
+remains (tracked in `docs/BUG_AUDIT_2026-09.md`).
 
 **§6 next-steps status:** item 1 (transaction layer) ✅ done as `sip-tx`;
 item 2 (service assembly binary) ✅ done as `zrtc`; item 6 PRACK/100rel ✅
