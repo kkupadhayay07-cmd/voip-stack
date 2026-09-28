@@ -118,6 +118,10 @@ pub enum CdrEvent {
         frames_b_to_a: u64,
         /// PLC/concealment frames across both legs (same total diag reports).
         concealed: u64,
+        /// The final SIP code that ended a never-answered call (404/486/
+        /// 603/...). `None` for timers/cancel paths; the CDR layer maps it
+        /// to a real disposition instead of hardcoding 487=Failed.
+        final_code: Option<u16>,
         at: Instant,
     },
 }

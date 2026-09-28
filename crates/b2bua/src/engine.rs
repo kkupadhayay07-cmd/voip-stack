@@ -497,7 +497,7 @@ impl B2bua {
                         }
                     }
                 }
-                teardown(calls, b_to_a, &id, "Timer B");
+                teardown(calls, b_to_a, &id, "Timer B", None);
             }
             if d.refresh_a_failed || d.refresh_b_failed {
                 tracing::warn!(call_id = %id, "session refresh timed out (Timer B)");
@@ -512,7 +512,7 @@ impl B2bua {
                         Self::send_bye(sock, b).await;
                     }
                 }
-                teardown(calls, b_to_a, &id, "session refresh failed");
+                teardown(calls, b_to_a, &id, "session refresh failed", None);
             }
             if d.expired {
                 tracing::info!(call_id = %id, "session timer expired (RFC 4028 §10)");
@@ -524,7 +524,7 @@ impl B2bua {
                         Self::send_bye(sock, b).await;
                     }
                 }
-                teardown(calls, b_to_a, &id, "session timer expired");
+                teardown(calls, b_to_a, &id, "session timer expired", None);
             }
             if d.prack_gave_up {
                 tracing::warn!(
@@ -572,7 +572,7 @@ impl B2bua {
                         }
                     }
                 }
-                teardown(calls, b_to_a, &id, "PRACK never arrived");
+                teardown(calls, b_to_a, &id, "PRACK never arrived", None);
             }
             if d.ack_timeout {
                 tracing::warn!(call_id = %id, "no ACK after 200 (Timer H, dialog level)");
@@ -581,7 +581,7 @@ impl B2bua {
                         Self::send_bye(sock, b).await;
                     }
                 }
-                teardown(calls, b_to_a, &id, "no ACK after 200");
+                teardown(calls, b_to_a, &id, "no ACK after 200", None);
             }
         }
     }
@@ -771,7 +771,7 @@ impl B2bua {
                                         }
                                     }
                                 }
-                                teardown(calls, b_to_a, &a_id, "leg B rejected");
+                                teardown(calls, b_to_a, &a_id, "leg B rejected", Some(r.code));
                             }
                             BInviteKind::Refresh => {
                                 // Refresh refused: the session is over
@@ -786,7 +786,13 @@ impl B2bua {
                                         Self::send_bye(sock, a).await;
                                     }
                                 }
-                                teardown(calls, b_to_a, &a_id, "leg B session refresh failed");
+                                teardown(
+                                    calls,
+                                    b_to_a,
+                                    &a_id,
+                                    "leg B session refresh failed",
+                                    Some(r.code),
+                                );
                             }
                         }
                     }
@@ -1217,7 +1223,7 @@ impl B2bua {
                             .await;
                     }
                 }
-                teardown(calls, b_to_a, a_id, "bad SDP from leg B");
+                teardown(calls, b_to_a, a_id, "bad SDP from leg B", Some(503));
                 return;
             }
         }
@@ -1499,7 +1505,7 @@ impl B2bua {
                 })
                 .ok();
         }
-        teardown(calls, b_to_a, &a_id, "BYE");
+        teardown(calls, b_to_a, &a_id, "BYE", None);
     }
 
     async fn on_cancel(
@@ -1581,7 +1587,7 @@ impl B2bua {
                     .await;
             }
         }
-        teardown(calls, b_to_a, &call_id, "CANCEL");
+        teardown(calls, b_to_a, &call_id, "CANCEL", None);
     }
 
     fn send_ack(&self, sock: &Arc<UdpSocket>, b: &Leg, cseq: u32) {
@@ -1748,7 +1754,7 @@ impl B2bua {
                 if let Some(b) = calls.get_mut(call_id).and_then(|c| c.leg_b.as_mut()) {
                     Self::send_bye(sock, b).await;
                 }
-                teardown(calls, b_to_a, call_id, "leg A session refresh failed");
+                teardown(calls, b_to_a, call_id, "leg A session refresh failed", None);
             }
         }
     }
@@ -2577,6 +2583,7 @@ fn teardown(
     b_to_a: &mut HashMap<String, String>,
     id: &str,
     reason: &str,
+    code: Option<u16>,
 ) {
     b_to_a.retain(|_, v| v != id);
     if let Some(mut c) = calls.remove(id) {
@@ -2641,6 +2648,7 @@ fn teardown(
             a2b,
             b2a,
             concealed,
+            code,
         );
     }
 }
@@ -2650,7 +2658,15 @@ fn teardown(
 static CDR_SINK: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<CdrEvent>> =
     std::sync::OnceLock::new();
 
-fn cdr_log(_answer: String, call_id: String, duration_ms: u64, a2b: u64, b2a: u64, concealed: u64) {
+fn cdr_log(
+    _answer: String,
+    call_id: String,
+    duration_ms: u64,
+    a2b: u64,
+    b2a: u64,
+    concealed: u64,
+    final_code: Option<u16>,
+) {
     if let Some(sink) = CDR_SINK.get() {
         let _ = sink.send(CdrEvent::CallEnded {
             call_id,
@@ -2658,6 +2674,7 @@ fn cdr_log(_answer: String, call_id: String, duration_ms: u64, a2b: u64, b2a: u6
             frames_a_to_b: a2b,
             frames_b_to_a: b2a,
             concealed,
+            final_code,
             at: Instant::now(),
         });
     }

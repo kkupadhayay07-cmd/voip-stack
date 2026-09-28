@@ -139,13 +139,16 @@ impl ComfortNoiseDecoder {
 
 impl Decoder for ComfortNoiseDecoder {
     fn decode(&mut self, data: &[u8], out: &mut Vec<i16>) -> Result<usize> {
-        if data.len() != 1 {
-            return Err(CodecError::InvalidData(format!(
-                "CN payload must be 1 byte, got {}",
-                data.len()
-            )));
-        }
-        self.last_level = data[0];
+        // RFC 3389 §2.2: the CN payload is one octet, but receivers MUST
+        // tolerate longer payloads and use only the first octet (the extra
+        // octets are reserved for future extensions). Only an EMPTY payload
+        // is malformed.
+        let Some(&level) = data.first() else {
+            return Err(CodecError::InvalidData(
+                "CN payload must not be empty".into(),
+            ));
+        };
+        self.last_level = level;
         self.conceal(out)
     }
 
@@ -259,12 +262,27 @@ mod tests {
     }
 
     #[test]
-    fn cn_bad_payload() {
+    fn cn_payload_length_tolerance() {
+        // RFC 3389 §2.2: an empty payload is malformed, but multi-byte
+        // payloads must be tolerated with only the first octet used.
         let mut d = ComfortNoiseDecoder::new(1);
         let mut out = Vec::new();
         assert!(matches!(
-            d.decode(&[1, 2], &mut out),
+            d.decode(&[], &mut out),
             Err(CodecError::InvalidData(_))
         ));
+        assert!(out.is_empty());
+
+        // Multi-byte payload: first octet wins, no error.
+        let mut out = Vec::new();
+        let level = encode_cn_payload(2_000);
+        d.decode(&[level, 0xAA, 0xBB], &mut out).unwrap();
+        assert_eq!(out.len(), 160);
+        let rms = ComfortNoiseEncoder::frame_rms(&out);
+        let err_db = 20.0 * (rms as f64 / 2_000.0).log10();
+        assert!(
+            err_db.abs() <= 3.0,
+            "synthetic RMS {rms} off level ({err_db} dB)"
+        );
     }
 }

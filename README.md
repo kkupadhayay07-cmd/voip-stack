@@ -13,11 +13,11 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 455 tests passing across 54 suites in 19 crates;
+**Current state: 468 tests passing across 54 suites in 19 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
-audit (42 findings) is fully triaged — every Critical and High finding is
-fixed with regression tests; the remaining P2 list is tracked in
-[`docs/BUG_AUDIT_2026-09.md`](docs/BUG_AUDIT_2026-09.md).**
+audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
+finding is fixed with regression tests
+([`docs/BUG_AUDIT_2026-09.md`](docs/BUG_AUDIT_2026-09.md)).**
 
 ## Workspace layout
 
@@ -49,7 +49,7 @@ fixed with regression tests; the remaining P2 list is tracked in
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 455 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 468 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -84,7 +84,10 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
   null `c=` line (offer's address type), port-0 offers answered port 0,
   SDP extras (`u=/e=/p=/k=/z=`) serialize with their `typ=` prefix.
 * **Codecs**: every codec round-trips; G.729 additionally validated against
-  ITU reference (bcg729) oracle vectors; Opus via system libopus FFI.
+  ITU reference (bcg729) oracle vectors; Opus via system libopus FFI —
+  including frames longer than 20 ms (RFC 6716 allows up to 120 ms) and
+  PLC that always emits exactly one frame; G.722 reset returns the decoder
+  to fresh state; CN tolerates multi-byte payloads (RFC 3389 §2.2).
 * **WebRTC path**: DTLS-SRTP handshake (self-signed P-256 certs, fingerprint
   pinning, `use_srtp`) → RFC 5764 key export → SRTP sessions protect real
   media; ICE agents complete checks over UDP loopback; TURN relays through
@@ -102,6 +105,15 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
 * **Consistency**: per-leg diag counters, per-call traces and CDRs
   (`concealed_events`, `packets_lost`) come from the same pump counters —
   verified equal in the demo.
+* **P2 audit sweep**: RTP/RTCP demux survives SRTCP auth trailers (no %4
+  misroute), `push_via` prepends to the stack top, non-2xx ACK mirrors a
+  single top Via and keeps the Route set (§17.1.1.2), non-INVITE server tx
+  enters Proceeding and matches by method (§17.2.2), registrar answers 423
+  + `Min-Expires` below the configured minimum and prunes its nonce table,
+  trunk TLS with a configured CA actually chain-verifies the server cert,
+  CDRs carry the real final code (486 → Busy, not everything = Failed 487),
+  `--since ""` parses safely, and the Prometheus call counters are wired
+  with `ws_clients` exposed as a gauge.
 
 ## Phase status
 
@@ -117,10 +129,13 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
   UDP/TCP/TLS/WSS listeners, TCP/TLS/WSS framing audit under adverse input,
   TLS/WSS handshake timeout (silent peers release their slot),
   RFC 4028 session timers, RFC 3262 PRACK/100rel — both on both B2BUA
-  legs, external audit fully closed: every Critical + High finding fixed
-  with regression tests (remote-DoS panics, SRTP payload auth, G.729
-  postfilter output, ICE IPv6/TURN, SBC/proxy response maps, dialer pacing,
-  mixer, CDR, sink echo/Contact/leak, RTP padding/jitter-wrap/concealment).
+  legs, external audit fully closed: every finding (Critical, High and
+  the complete P2 backlog) fixed with regression tests (remote-DoS panics,
+  SRTP payload auth, G.729 postfilter output, ICE IPv6/TURN, SBC/proxy
+  response maps, dialer pacing, mixer, CDR, sink echo/Contact/leak,
+  RTP padding/jitter-wrap/concealment, Via/ACK/transaction edge rules,
+  registrar 423 + nonce hygiene, TLS CA verification, CDR final codes,
+  metrics wiring).
   ✅
 
 ## Roadmap (next)

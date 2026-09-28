@@ -54,25 +54,44 @@ All verified as plausible-to-real during triage; ordered by impact.
 now serialize with their `typ=` prefix (sdp) · `answer_direction` validated
 as an explicit RFC 3264 §6.1 matrix clamped to the offer (sdp) · port-0
 offers answered port 0 and rejected m-lines keep their m-line with a null
-connection line of the offer's address type (sdp). **Still open**:
-`looks_like_rtcp` `%4` rejection breaks AES-CM SRTCP (rtp) · `push_via`
-appends to the bottom of the Via stack
-(sip-core) · non-2xx ACK copies all Via headers, omits Route (sip-tx) ·
-`ServerNonInviteTx` never Proceeding / matches foreign methods (sip-tx) ·
-registrar 423 `min_expires` unchecked, nonce table unbounded (registrar) ·
-Opus >20 ms decode buffers, G.722 `reset` keeps state, CN multi-byte payload
-(codecs) ·
-TLS client verify NONE despite `tls_ca_path` (zrtc) · CDR disposition hardcodes
-487=Failed (zrtc) · `--since ""` panic (zrtc) · pace_campaign hardcoded recent
-counters, gauge-vs-counter, call counters never incremented (api).
+connection line of the offer's address type (sdp) · `looks_like_rtcp` no
+longer requires %4 alignment — RFC 3711 §3.4 SRTCP appends E/index + auth
+tag so encrypted compounds are intentionally misaligned, and version 2 +
+PT range alone identify RTCP (rtp) · `push_via` PREPENDS to the top of the
+Via stack (RFC 3261 §8.1.1/§16.6) instead of appending at the bottom, with
+wire-order proof (sip-core) · non-2xx ACK mirrors a SINGLE top Via and
+carries the original Route set (RFC 3261 §17.1.1.2) (sip-tx) ·
+`ServerNonInviteTx` moves Trying → Proceeding on a provisional and matches
+retransmissions by branch+sent-by+CSeq AND method — foreign methods are
+absorbed (RFC 3261 §17.2.2) (sip-tx) · registrar refuses sub-minimum
+registrations with 423 `Interval Too Brief` + `Min-Expires` (RFC 3261
+§10.2.8) and prunes expired nonces on every issue so the table stays
+bounded (registrar) · Opus decode buffers sized for the RFC 6716 maximum
+120 ms frame (PLC still emits exactly one 20 ms frame), G.722 `reset`
+discards predictor history (`last_codes`) so a reset decoder matches a
+fresh one, CN decoder tolerates multi-byte payloads per RFC 3389 §2.2 and
+rejects only empty ones (codecs) · zrtc TLS client connector with a
+configured `tls_ca_path` now chain-verifies the server certificate
+(`SslVerifyMode::PEER`) — the generated self-signed cert is a proper
+mini-CA (basicConstraints + SKID/AKID + SAN) so pinning actually works,
+demo topologies without a CA stay relaxed (zrtc) · CDR disposition uses
+the real final code threaded from the engine (`CallEnded.final_code`:
+486 → Busy, 603 → Rejected, …; 487 remains only the cancel/timer
+fallback) (zrtc/b2bua) · `--since ""` and other malformed windows parse to
+`None` instead of underflowing (zrtc) · `pace_campaign` accepts
+`dialed_recent`/`answered_recent` from the request body (were hardcoded 0),
+`ws_clients_connected` renders as TYPE gauge, and the four call counters
+are actually incremented via `Metrics::record_cdr` from the CDR finalizer
+(api). No P2 items remain open.
 
 Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 **Fixed** in this commit (it was a prerequisite for correct engine Via sent-by).
 
 ## Verification
 
-`cargo test --workspace` → **455 passing** across 54 suites, `clippy -D warnings`
+`cargo test --workspace` → **468 passing** across 54 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
-All Critical and High findings are now **Fixed** (with regression tests).
-Remaining open: the P2 list below. No silent gaps.
+**The external audit is fully closed**: every finding at every severity —
+Critical, High, and the complete Medium/Low (P2) list — is **Fixed** with
+regression tests. No open items. No silent gaps.

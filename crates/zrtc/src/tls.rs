@@ -7,6 +7,9 @@ use openssl::hash::MessageDigest;
 use openssl::pkey::{PKey, Private};
 use openssl::rsa::Rsa;
 use openssl::ssl::{SslAcceptor, SslConnector, SslMethod, SslVerifyMode};
+use openssl::x509::extension::{
+    AuthorityKeyIdentifier, BasicConstraints, SubjectAlternativeName, SubjectKeyIdentifier,
+};
 use openssl::x509::{X509NameBuilder, X509};
 use std::pin::Pin;
 use tokio::net::TcpStream;
@@ -42,6 +45,45 @@ impl TlsIdentity {
         builder
             .set_not_after(&not_after)
             .map_err(|e| e.to_string())?;
+        // Mark the cert as its own (mini-)CA: OpenSSL 3 refuses to treat a
+        // bare self-signed end-entity cert as a trust anchor, so pinning
+        // this cert via `ca_path` would never verify without these
+        // extensions.
+        let bc = BasicConstraints::new()
+            .critical()
+            .ca()
+            .build()
+            .map_err(|e| e.to_string())?;
+        builder.append_extension(bc).map_err(|e| e.to_string())?;
+        let skid = {
+            let ctx = builder.x509v3_context(None, None);
+            SubjectKeyIdentifier::new()
+                .build(&ctx)
+                .map_err(|e| e.to_string())?
+        };
+        builder.append_extension(skid).map_err(|e| e.to_string())?;
+        let akid = {
+            let ctx = builder.x509v3_context(None, None);
+            AuthorityKeyIdentifier::new()
+                .keyid(true)
+                .build(&ctx)
+                .map_err(|e| e.to_string())?
+        };
+        builder.append_extension(akid).map_err(|e| e.to_string())?;
+        // Subject Alt Name matching the CN (IP or DNS): clients that verify
+        // the server certificate also check the hostname they connected to,
+        // and modern verifiers ignore CN entirely.
+        let san = {
+            let ctx = builder.x509v3_context(None, None);
+            let mut san = SubjectAlternativeName::new();
+            if cn.parse::<std::net::IpAddr>().is_ok() {
+                san.ip(cn);
+            } else {
+                san.dns(cn);
+            }
+            san.build(&ctx).map_err(|e| e.to_string())?
+        };
+        builder.append_extension(san).map_err(|e| e.to_string())?;
         builder
             .sign(&key, MessageDigest::sha256())
             .map_err(|e| e.to_string())?;
@@ -92,9 +134,11 @@ pub fn client_connector() -> Result<SslConnector, String> {
     Ok(b.build())
 }
 
-/// Client connector presenting a client certificate (mTLS). Server cert
-/// verification stays relaxed to match the demo topology the plain
-/// connector serves; the optional CA bundle is loaded into the store.
+/// Client connector presenting a client certificate (mTLS). When a CA
+/// bundle is configured the server certificate is chain-VERIFIED against
+/// it (previously the bundle was loaded into the store but verification
+/// stayed off, silently ignoring the operator's trust anchor — audit
+/// 2026-09 P2); demo topologies without a CA keep the relaxed mode.
 pub fn client_connector_with_identity(id: &TlsClientIdentity) -> Result<SslConnector, String> {
     let cert_pem = std::fs::read(&id.cert_path)
         .map_err(|e| format!("tls client cert {}: {e}", id.cert_path))?;
@@ -106,15 +150,21 @@ pub fn client_connector_with_identity(id: &TlsClientIdentity) -> Result<SslConne
     b.set_certificate(&cert).map_err(|e| e.to_string())?;
     b.set_private_key(&key).map_err(|e| e.to_string())?;
     b.check_private_key().map_err(|e| e.to_string())?;
+    let mut have_ca = false;
     if let Some(ca) = &id.ca_path {
         let ca_pem = std::fs::read(ca).map_err(|e| format!("tls ca {ca}: {e}"))?;
         for ca_cert in X509::stack_from_pem(&ca_pem).map_err(|e| format!("parse ca bundle: {e}"))? {
             b.cert_store_mut()
                 .add_cert(ca_cert)
                 .map_err(|e| format!("load ca cert: {e}"))?;
+            have_ca = true;
         }
     }
-    b.set_verify(SslVerifyMode::NONE);
+    if have_ca {
+        b.set_verify(SslVerifyMode::PEER);
+    } else {
+        b.set_verify(SslVerifyMode::NONE);
+    }
     Ok(b.build())
 }
 
@@ -134,4 +184,83 @@ pub async fn connect_tls(
         .await
         .map_err(|e| format!("tls connect: {e}"))?;
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes a generated identity's PEMs to a temp dir; returns the cert,
+    /// key, CA-bundle paths and the identity itself (for the server side).
+    /// `cn` doubles as the file stem and the certificate name.
+    fn write_identity(
+        dir: &std::path::Path,
+        name: &str,
+        cn: &str,
+    ) -> (String, String, String, TlsIdentity) {
+        std::fs::create_dir_all(dir).unwrap();
+        let id = TlsIdentity::generate(cn).unwrap();
+        let cert = dir.join(format!("{name}.crt"));
+        let key = dir.join(format!("{name}.key"));
+        let ca = dir.join(format!("{name}-ca.pem"));
+        std::fs::write(&cert, id.cert.to_pem().unwrap()).unwrap();
+        std::fs::write(&key, id.key.private_key_to_pem_pkcs8().unwrap()).unwrap();
+        std::fs::write(&ca, id.cert.to_pem().unwrap()).unwrap();
+        (
+            cert.to_string_lossy().into_owned(),
+            key.to_string_lossy().into_owned(),
+            ca.to_string_lossy().into_owned(),
+            id,
+        )
+    }
+
+    /// Regression (audit 2026-09 P2): a configured CA bundle must actually
+    /// verify the server certificate — a server presenting a cert outside
+    /// the trust anchor must fail the handshake, one presenting the CA's
+    /// own cert must succeed.
+    #[tokio::test]
+    async fn identity_connector_with_ca_verifies_server_cert() {
+        let tmp = std::env::temp_dir().join(format!("zrtc-tls-test-{}", std::process::id()));
+        // The server identity's name must match the host the client dials
+        // (SAN check), so the "server-a" files carry CN 127.0.0.1.
+        let (cert, key, ca, server_id) = write_identity(&tmp, "server-a", "127.0.0.1");
+        let (_c2, _k2, ca_other, _id2) = write_identity(&tmp, "server-b", "other.example");
+
+        // Server presents exactly the cert the CA bundle pins.
+        let acceptor = server_id.acceptor().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let _ = accept_tls(&acceptor, tcp).await;
+            }
+        });
+
+        // Verified against the matching CA: handshake succeeds.
+        let good = client_connector_with_identity(&TlsClientIdentity {
+            cert_path: cert.clone(),
+            key_path: key.clone(),
+            ca_path: Some(ca.clone()),
+        })
+        .unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        connect_tls(&good, "127.0.0.1", tcp)
+            .await
+            .expect("server cert must verify against its own CA");
+
+        // Verified against a DIFFERENT CA: handshake must fail.
+        let bad = client_connector_with_identity(&TlsClientIdentity {
+            cert_path: cert,
+            key_path: key,
+            ca_path: Some(ca_other),
+        })
+        .unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert!(
+            connect_tls(&bad, "127.0.0.1", tcp).await.is_err(),
+            "foreign CA must not verify the server cert"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

@@ -150,6 +150,14 @@ pub struct OpusDecoder {
     rate: u32,
     channels: u8,
     frame_samples: usize,
+    /// Reusable output scratch sized for the RFC 6716 maximum frame
+    /// (120 ms = 6 × 20 ms per channel) — peers are free to send frames
+    /// longer than our 20 ms default and the decode buffer must hold them.
+    scratch: Vec<i16>,
+    /// libopus PLC generates as much audio as the output buffer holds, so
+    /// concealment uses a dedicated buffer sized to exactly one 20 ms frame
+    /// to keep playout pacing stable.
+    plc_scratch: Vec<i16>,
 }
 
 impl OpusDecoder {
@@ -163,7 +171,24 @@ impl OpusDecoder {
             rate,
             channels,
             frame_samples: frame_samples_for(rate),
+            scratch: Vec::new(),
+            plc_scratch: Vec::new(),
         })
+    }
+
+    /// Decodes (or PLCs for empty input) into `out`, using the 120 ms
+    /// scratch so any legal frame duration fits.
+    fn decode_impl(&mut self, data: &[u8], out: &mut Vec<i16>) -> Result<usize> {
+        let need = self.frame_samples * 6 * self.channels as usize;
+        if self.scratch.len() < need {
+            self.scratch.resize(need, 0);
+        }
+        let n = self
+            .inner
+            .decode(data, &mut self.scratch, false)
+            .map_err(to_err)?;
+        out.extend_from_slice(&self.scratch[..n * self.channels as usize]);
+        Ok(n)
     }
 }
 
@@ -172,17 +197,23 @@ impl Decoder for OpusDecoder {
         if data.is_empty() {
             return self.conceal(out);
         }
-        let mut buf = vec![0i16; self.frame_samples * self.channels as usize];
-        let n = self.inner.decode(data, &mut buf, false).map_err(to_err)?;
-        out.extend_from_slice(&buf[..n * self.channels as usize]);
-        Ok(n)
+        self.decode_impl(data, out)
     }
 
     fn conceal(&mut self, out: &mut Vec<i16>) -> Result<usize> {
-        // Empty input triggers libopus packet-loss concealment.
-        let mut buf = vec![0i16; self.frame_samples * self.channels as usize];
-        let n = self.inner.decode(&[], &mut buf, false).map_err(to_err)?;
-        out.extend_from_slice(&buf[..n * self.channels as usize]);
+        // Empty input triggers libopus packet-loss concealment. PLC emits
+        // exactly what the output buffer holds, so concealment must pass a
+        // buffer sized to ONE frame — a longer buffer (e.g. the packet
+        // scratch) would synthesize 120 ms in one call and break pacing.
+        let need = self.frame_samples * self.channels as usize;
+        if self.plc_scratch.len() < need {
+            self.plc_scratch.resize(need, 0);
+        }
+        let n = self
+            .inner
+            .decode(&[], &mut self.plc_scratch, false)
+            .map_err(to_err)?;
+        out.extend_from_slice(&self.plc_scratch[..n * self.channels as usize]);
         Ok(n)
     }
 
@@ -300,6 +331,31 @@ mod tests {
             err += d * d;
         }
         (10.0 * (sig / err.max(1.0)).log10(), best_lag)
+    }
+
+    #[test]
+    fn decodes_frames_longer_than_20ms() {
+        // RFC 6716 allows frame durations up to 120 ms; a peer encoder
+        // configured for e.g. 60 ms must not overflow our decode buffer
+        // (audit 2026-09 P2: the decoder previously sized a 20 ms buffer
+        // and failed the whole packet).
+        let pcm = speechish(48000, 2880); // 60 ms @ 48 kHz
+        let mut enc =
+            opus::Encoder::new(48000, opus::Channels::Mono, opus::Application::Voip).unwrap();
+        let mut pkt = vec![0u8; 4000];
+        let n = enc.encode(&pcm, &mut pkt).unwrap();
+        assert!(n > 0);
+
+        let mut dec = OpusDecoder::new(48000, 1).unwrap();
+        let mut out = Vec::new();
+        let got = dec.decode(&pkt[..n], &mut out).unwrap();
+        assert!(got >= 2_800, "60 ms frame must decode whole: {got}");
+        assert_eq!(out.len(), got);
+
+        // PLC after a long frame must also fit the same scratch buffer.
+        let mut plc = Vec::new();
+        let n2 = dec.conceal(&mut plc).unwrap();
+        assert!(n2 > 0 && n2 <= 5760);
     }
 
     #[test]

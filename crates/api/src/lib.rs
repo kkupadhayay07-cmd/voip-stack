@@ -50,9 +50,31 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// Updates the per-call counters from a finished CDR record. The call
+    /// counters were previously declared but never incremented anywhere
+    /// (audit 2026-09 P2); the daemon's CDR finalizer calls this per record.
+    pub fn record_cdr(&self, direction: Direction, disposition: Disposition) {
+        match direction {
+            Direction::Inbound => {
+                self.calls_inbound_total.fetch_add(1, Ordering::Relaxed);
+            }
+            Direction::Outbound => {
+                self.calls_outbound_total.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        match disposition {
+            Disposition::Answered => {
+                self.calls_answered_total.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                self.calls_failed_total.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     fn render(&self) -> String {
         let mut s = String::with_capacity(1024);
-        let counters: [(&str, &str, &AtomicU64); 6] = [
+        let counters: [(&str, &str, &AtomicU64); 5] = [
             (
                 "voip_calls_inbound_total",
                 "Inbound calls received",
@@ -74,11 +96,6 @@ impl Metrics {
                 &self.calls_failed_total,
             ),
             (
-                "voip_ws_clients_connected",
-                "WebSocket control clients",
-                &self.ws_clients_connected,
-            ),
-            (
                 "voip_http_requests_total",
                 "HTTP requests served",
                 &self.http_requests_total,
@@ -88,6 +105,19 @@ impl Metrics {
             s.push_str(&format!("# HELP {name} {help}\n"));
             s.push_str(&format!("# TYPE {name} counter\n"));
             s.push_str(&format!("{name} {}\n", counter.load(Ordering::Relaxed)));
+        }
+        // A gauge, not a counter: it goes DOWN when clients disconnect, so
+        // rendering it as `counter` produced monotonically-lies for
+        // Prometheus (audit 2026-09 P2 gauge-vs-counter).
+        let gauges: [(&str, &str, &AtomicU64); 1] = [(
+            "voip_ws_clients_connected",
+            "WebSocket control clients",
+            &self.ws_clients_connected,
+        )];
+        for (name, help, gauge) in gauges {
+            s.push_str(&format!("# HELP {name} {help}\n"));
+            s.push_str(&format!("# TYPE {name} gauge\n"));
+            s.push_str(&format!("{name} {}\n", gauge.load(Ordering::Relaxed)));
         }
         s
     }
@@ -203,6 +233,11 @@ pub struct PaceRequest {
     pub lines_ringing: Option<usize>,
     pub lines_dialing: Option<usize>,
     pub lines_active: Option<usize>,
+    /// Recent dial/answer counts actually observed by the caller — these
+    /// were previously hardcoded to 0, so predictive pacing always saw a
+    /// zero denominator (audit 2026-09 P2).
+    pub dialed_recent: Option<u64>,
+    pub answered_recent: Option<u64>,
     pub avg_talk_secs: Option<f64>,
     pub avg_ring_secs: Option<f64>,
     pub utc_hour: Option<u8>,
@@ -219,8 +254,8 @@ async fn pace_campaign(
         lines_ringing: req.lines_ringing.unwrap_or(0),
         lines_dialing: req.lines_dialing.unwrap_or(0),
         lines_active: req.lines_active.unwrap_or(0),
-        dialed_recent: 0,
-        answered_recent: 0,
+        dialed_recent: req.dialed_recent.unwrap_or(0),
+        answered_recent: req.answered_recent.unwrap_or(0),
         avg_talk_secs: req.avg_talk_secs.unwrap_or(0.0),
         avg_ring_secs: req.avg_ring_secs.unwrap_or(0.0),
     };
@@ -348,6 +383,31 @@ mod tests {
         let text = m.render();
         assert!(text.contains("# HELP voip_calls_answered_total"));
         assert!(text.contains("voip_calls_answered_total 3"));
+    }
+
+    #[test]
+    fn record_cdr_increments_call_counters() {
+        let m = Metrics::default();
+        m.record_cdr(Direction::Inbound, Disposition::Answered);
+        m.record_cdr(Direction::Outbound, Disposition::Busy);
+        let text = m.render();
+        assert!(text.contains("voip_calls_inbound_total 1"), "{text}");
+        assert!(text.contains("voip_calls_outbound_total 1"), "{text}");
+        assert!(text.contains("voip_calls_answered_total 1"), "{text}");
+        assert!(text.contains("voip_calls_failed_total 1"), "{text}");
+    }
+
+    #[test]
+    fn ws_clients_rendered_as_gauge() {
+        let m = Metrics::default();
+        m.ws_clients_connected.store(2, Ordering::Relaxed);
+        let text = m.render();
+        assert!(
+            text.contains("# TYPE voip_ws_clients_connected gauge"),
+            "ws clients must be a gauge, not a counter"
+        );
+        assert!(text.contains("voip_ws_clients_connected 2"));
+        assert!(text.contains("# TYPE voip_calls_answered_total counter"));
     }
 
     #[test]

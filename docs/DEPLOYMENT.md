@@ -197,9 +197,9 @@ configured bounds. Guidance:
 6. **SDP hardening** (IPv6, BUNDLE — rejected m-lines, port-0 answers and
    the RFC 3264 §6.1 direction clamp are done), GRUU/Outbound,
    NAPTR/SRV for carrier-grade signaling. (PRACK/100rel shipped — see
-   `COMPLIANCE.md`. The external audit is closed at Critical/High level —
-   every confirmed finding fixed with regression tests; the P2 remainder is
-   tracked in `docs/BUG_AUDIT_2026-09.md`.)
+   `COMPLIANCE.md`. The external audit is fully closed at every severity —
+   Critical, High and the complete P2 backlog — with regression tests;
+   see `docs/BUG_AUDIT_2026-09.md`.)
 
 See `docs/DESIGN.md` for the full architecture contract and
 `docs/COMPLIANCE.md` for the per-RFC status matrix.

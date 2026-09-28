@@ -288,6 +288,83 @@ fn server_non_invite_timer_j_fires() {
     assert_eq!(tx.next_deadline(), None);
 }
 
+// 6a. Server non-INVITE: a provisional moves Trying → Proceeding and is
+//     re-sent to retransmissions; a foreign method with the same branch,
+//     sent-by and CSeq is NOT answered from this transaction (§17.2.2).
+#[test]
+fn server_non_invite_proceeding_and_foreign_method_ignored() {
+    let c = Clock::new();
+    let req = base_req(Method::Options);
+    let mut tx = ServerNonInviteTx::new(req.clone(), Transport::Udp);
+
+    tx.stage(resp_for(&req, 100, BRANCH, None));
+    let actions = tx.on_event(TxEvent::Send, c.at(0));
+    assert!(matches!(&actions[0], TxAction::SendResponse(r) if r.code == 100));
+    assert_eq!(tx.state(), TxState::Proceeding, "1xx must leave Trying");
+
+    // Retransmitted OPTIONS in Proceeding → last provisional re-sent.
+    let actions = tx.on_event(TxEvent::ReceivedRequest(req.clone()), c.at(1_000));
+    assert!(matches!(&actions[0], TxAction::SendResponse(r) if r.code == 100));
+
+    // Same branch + sent-by + CSeq seq but a different method: belongs to a
+    // foreign transaction, must be absorbed silently.
+    let foreign = base_req(Method::Bye);
+    let actions = tx.on_event(TxEvent::ReceivedRequest(foreign), c.at(1_100));
+    assert!(
+        actions.is_empty(),
+        "foreign method must be ignored: {actions:?}"
+    );
+
+    // Final 200 still completes the transaction normally.
+    tx.stage(resp_for(&req, 200, BRANCH, None));
+    let actions = tx.on_event(TxEvent::Send, c.at(2_000));
+    assert!(matches!(&actions[0], TxAction::SendResponse(r) if r.code == 200));
+    assert_eq!(tx.state(), TxState::Completed);
+}
+
+// 6b. The non-2xx ACK mirrors only the TOP Via and keeps the Route set
+//     (RFC 3261 §17.1.1.2).
+#[test]
+fn non2xx_ack_single_via_and_route() {
+    let req = RequestBuilder::new(
+        Method::Invite,
+        SipUri::parse("sip:callee@atlanta.com").unwrap(),
+    )
+    // Builder vias stack bottom-up (push_via prepends): caller added
+    // last ends up the TOP Via, as on a real forwarded request.
+    .via(TransportKind::Udp, "proxy.example:5060", Some(OTHER_BRANCH))
+    .via(TransportKind::Udp, "caller.example:5060", Some(BRANCH))
+    .from("<sip:caller@atlanta.com>;tag=ctag1")
+    .to("<sip:callee@atlanta.com>")
+    .call_id(Some("ack-route-test@caller.example"))
+    .cseq(1)
+    .build();
+    let mut req = req;
+    req.headers.add("Route", "<sip:p1.atlanta.com;lr>");
+    req.headers.add("Route", "<sip:p2.atlanta.com;lr>");
+
+    let resp = resp_for(&req, 486, BRANCH, Some("t486"));
+    let ack = crate::build_non2xx_ack(&req, &resp).expect("ack");
+
+    // Exactly ONE Via, equal to the original TOP Via (branch preserved).
+    let vias = ack.headers.get_all("Via");
+    assert_eq!(vias.len(), 1, "ACK must carry a single Via: {vias:?}");
+    assert_eq!(
+        ack.headers.first_via().unwrap().branch.as_deref(),
+        Some(BRANCH),
+        "the Via must be the top Via of the original request"
+    );
+    // The Route set of the original request is carried over, in order.
+    let routes = ack.headers.get_all("Route");
+    assert_eq!(routes.len(), 2, "ACK must keep the original Route set");
+    assert!(routes[0].contains("p1.atlanta.com"));
+    assert!(routes[1].contains("p2.atlanta.com"));
+    assert_eq!(
+        ack.headers.cseq().map(|c| (c.seq, c.method)),
+        Some((1, Method::Ack))
+    );
+}
+
 // 7. A response with the wrong top-Via branch is ignored.
 #[test]
 fn wrong_branch_response_ignored() {

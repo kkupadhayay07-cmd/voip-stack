@@ -59,19 +59,29 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
-/// `--since 5m` → unix millis cutoff.
+/// `--since 5m` → unix millis cutoff. Malformed values (empty string,
+/// missing unit, non-numeric) yield `None` instead of panicking — the
+/// previous `split_at(v.len() - 1)` underflowed on `--since ""` (audit
+/// 2026-09 P2).
 fn since_ms(args: &[String]) -> Option<i64> {
     let v = flag_value(args, "--since")?;
+    if v.len() < 2 {
+        return None;
+    }
     let (num, unit) = v.split_at(v.len() - 1);
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let n: i64 = num.parse().ok()?;
     let secs = match unit {
         "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
-        "d" => n * 86400,
+        "m" => n.checked_mul(60)?,
+        "h" => n.checked_mul(3600)?,
+        "d" => n.checked_mul(86400)?,
         _ => return None,
     };
-    Some(observ::event::now_ms() - secs * 1000)
+    secs.checked_mul(1000)
+        .map(|ms| observ::event::now_ms() - ms)
 }
 
 /// All jsonl event files, oldest first.
@@ -726,4 +736,45 @@ fn metrics_cmd(args: &[String], log_dir: &Path) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod since_tests {
+    use super::*;
+
+    fn args(v: Option<&str>) -> Vec<String> {
+        let mut a = vec!["trace".to_string()];
+        if let Some(v) = v {
+            a.push("--since".to_string());
+            a.push(v.to_string());
+        }
+        a
+    }
+
+    #[test]
+    fn since_ms_accepts_valid_windows() {
+        let base = observ::event::now_ms();
+        let got = since_ms(&args(Some("5m"))).unwrap();
+        assert!((base - 300_000 - got).abs() < 5_000, "5m → now − 300 s");
+        assert!(since_ms(&args(Some("2h"))).is_some());
+        assert!(since_ms(&args(Some("7d"))).is_some());
+        assert!(since_ms(&args(Some("90s"))).is_some());
+        // Absent flag → no cutoff.
+        assert!(since_ms(&args(None)).is_none());
+    }
+
+    #[test]
+    fn since_ms_rejects_malformed_without_panic() {
+        // The empty string previously underflowed `len() - 1`.
+        assert!(since_ms(&args(Some(""))).is_none());
+        assert!(since_ms(&args(Some("5"))).is_none(), "missing unit");
+        assert!(since_ms(&args(Some("m"))).is_none(), "missing number");
+        assert!(since_ms(&args(Some("5x"))).is_none(), "unknown unit");
+        assert!(since_ms(&args(Some("5min"))).is_none(), "multi-char unit");
+        assert!(since_ms(&args(Some("-5m"))).is_none(), "signed input");
+        assert!(
+            since_ms(&args(Some("9999999999999999d"))).is_none(),
+            "overflow"
+        );
+    }
 }

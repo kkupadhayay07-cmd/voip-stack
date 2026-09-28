@@ -80,6 +80,114 @@ fn basic_registration_and_lookup() {
     assert!(contacts[0].contains("expires="));
 }
 
+// RFC 3261 §10.2.8: an expiry below the configured minimum is refused with
+// 423 carrying Min-Expires, and no binding is created or touched.
+#[test]
+fn below_min_expires_gets_423_with_min_expires_header() {
+    let mut reg = Registrar::new(RegistrarConfig {
+        min_expires: 60,
+        max_expires: 3600,
+        ..RegistrarConfig::default()
+    });
+    let req = register_req(
+        "min@example.com",
+        "sip:min@10.0.0.9:5060",
+        Some(30),
+        "cid-min-1",
+        1,
+    );
+    let resp = reg.process(&req, "10.0.0.9:5060").unwrap();
+    assert_eq!(resp.code, 423);
+    assert_eq!(resp.reason, "Interval Too Brief");
+    assert_eq!(
+        resp.headers.get("Min-Expires"),
+        Some("60"),
+        "423 must carry the configured minimum"
+    );
+    assert!(
+        reg.bindings("sip:min@example.com").is_empty(),
+        "a refused REGISTER must not create a binding"
+    );
+
+    // Contact-level expires param below the minimum is refused too.
+    let uri = "sip:min2@example.com";
+    let req = RequestBuilder::new(Method::Register, SipUri::parse(uri).unwrap())
+        .via(TransportKind::Udp, "10.0.0.9:5060", Some("z9hG4bKreg"))
+        .from(&format!("<{uri}>;tag=r2"))
+        .to(&format!("<{uri}>"))
+        .call_id(Some("cid-min-2"))
+        .cseq(1)
+        .contact("<sip:min2@10.0.0.9:5060>;expires=10")
+        .build();
+    let resp = reg.process(&req, "10.0.0.9:5060").unwrap();
+    assert_eq!(resp.code, 423);
+
+    // Expiry at the minimum is accepted.
+    let req = register_req(
+        "min@example.com",
+        "sip:min@10.0.0.9:5060",
+        Some(60),
+        "cid-min-3",
+        2,
+    );
+    assert_eq!(reg.process(&req, "10.0.0.9:5060").unwrap().code, 200);
+    assert_eq!(reg.bindings("sip:min@example.com").len(), 1);
+
+    // De-registration (Expires: 0) is never 423.
+    let req = register_req(
+        "min@example.com",
+        "sip:min@10.0.0.9:5060",
+        Some(0),
+        "cid-min-3",
+        3,
+    );
+    assert_eq!(reg.process(&req, "10.0.0.9:5060").unwrap().code, 200);
+    assert!(reg.bindings("sip:min@example.com").is_empty());
+}
+
+// The nonce table is pruned when a new nonce is issued: stale challenges
+// cannot accumulate without bound (audit 2026-09 P2).
+#[test]
+fn nonce_table_pruned_on_issue() {
+    use std::time::Duration;
+    let mut reg = Registrar::new(RegistrarConfig {
+        require_auth: true,
+        ..RegistrarConfig::default()
+    });
+    let mut auth = AuthStore::new("test");
+    auth.add_user("nonce", "pw");
+    auth.nonce_ttl = Duration::from_millis(80);
+    reg = reg.with_auth(auth);
+
+    let req = register_req(
+        "nonce@example.com",
+        "sip:nonce@10.0.0.9:5060",
+        Some(300),
+        "cid-nonce-1",
+        1,
+    );
+    assert_eq!(reg.process(&req, "10.0.0.9:5060").unwrap().code, 401);
+    let auth = reg.auth.as_ref().unwrap();
+    assert_eq!(auth.nonces.len(), 1, "first challenge installs one nonce");
+
+    // After the TTL lapses, the next challenge evicts the expired nonce.
+    std::thread::sleep(Duration::from_millis(120));
+    let req = register_req(
+        "nonce@example.com",
+        "sip:nonce@10.0.0.9:5060",
+        Some(300),
+        "cid-nonce-2",
+        2,
+    );
+    assert_eq!(reg.process(&req, "10.0.0.9:5060").unwrap().code, 401);
+    let auth = reg.auth.as_ref().unwrap();
+    assert_eq!(
+        auth.nonces.len(),
+        1,
+        "expired nonces must be evicted, not accumulated"
+    );
+}
+
 #[test]
 fn refresh_updates_expiry_and_prunes_with_zero() {
     let mut reg = Registrar::new(RegistrarConfig::default());

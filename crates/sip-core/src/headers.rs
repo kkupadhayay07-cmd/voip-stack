@@ -236,10 +236,23 @@ impl HeaderMap {
         self.get("Via").and_then(|v| Via::parse(v).ok())
     }
 
-    /// Adds a `Via` header on top (pushes to the end of the map; the map
-    /// keeps insertion order and Via values are consumed top-down).
+    /// Pushes a `Via` onto the TOP of the stack (RFC 3261 §8.1.1, §16.6
+    /// step 4): the most recently added hop must be the first `Via` on the
+    /// wire, so the new header is inserted before every existing `Via`
+    /// (appending at the end of the map would silently demote it to the
+    /// stack bottom and break top-Via branch matching upstream).
     pub fn push_via(&mut self, via: &Via) {
-        self.add("Via", via.to_string());
+        let needle = canonical_name("Via");
+        match self.headers.iter().position(|h| h.name == needle) {
+            Some(i) => self.headers.insert(
+                i,
+                Header {
+                    name: needle,
+                    value: via.to_string(),
+                },
+            ),
+            None => self.add("Via", via.to_string()),
+        }
     }
 
     /// `From` header.
@@ -1039,6 +1052,45 @@ mod tests {
         assert!(Via::parse("SIP/1.0/UDP h").is_err());
         assert!(Via::parse("SIP/2.0/SMTP h").is_err());
         assert!(Via::parse("SIP/2.0/UDP").is_err());
+    }
+
+    #[test]
+    fn push_via_prepends_to_stack_top() {
+        let mut h = HeaderMap::new();
+        let bottom = Via::parse("SIP/2.0/UDP bottom.example:5060;branch=z9hG4bKbottom").unwrap();
+        h.push_via(&bottom);
+        let top = Via::parse("SIP/2.0/TLS top.example:5061;branch=z9hG4bKtop").unwrap();
+        h.push_via(&top);
+
+        let all = h.via_all();
+        assert_eq!(all.len(), 2);
+        // The newest hop must be FIRST (top of the stack, wire order).
+        assert_eq!(all[0].branch.as_deref(), Some("z9hG4bKtop"));
+        assert_eq!(all[1].branch.as_deref(), Some("z9hG4bKbottom"));
+        assert_eq!(h.first_via().unwrap().branch.as_deref(), Some("z9hG4bKtop"));
+        // Raw map order mirrors the wire: the inserted header sits before
+        // every pre-existing Via.
+        let pos_top = h
+            .iter()
+            .position(|x| x.value.contains("z9hG4bKtop"))
+            .unwrap();
+        let pos_bottom = h
+            .iter()
+            .position(|x| x.value.contains("z9hG4bKbottom"))
+            .unwrap();
+        assert!(pos_top < pos_bottom);
+        // Serialized message keeps the same order.
+        let req = crate::message::Request {
+            method: crate::message::Method::Invite,
+            uri: crate::uri::SipUri::parse("sip:bob@example.com").unwrap(),
+            headers: h,
+            body: Vec::new(),
+        };
+        let wire =
+            String::from_utf8(crate::serialize(&crate::message::SipMessage::Request(req))).unwrap();
+        let t = wire.find("z9hG4bKtop").unwrap();
+        let b = wire.find("z9hG4bKbottom").unwrap();
+        assert!(t < b);
     }
 
     #[test]

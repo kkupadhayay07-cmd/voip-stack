@@ -358,14 +358,21 @@ impl ClientNonInviteTx {
 }
 
 /// Builds the ACK a client INVITE transaction sends for a non-2xx final
-/// response (RFC 3261 §17.1.1): same request-URI and Via (so the branch
-/// matches the server transaction), From/Call-ID mirrored, To taken from
-/// the response (carries its tag), CSeq number kept with method ACK.
+/// response (RFC 3261 §17.1.1): same request-URI, From/Call-ID mirrored,
+/// To taken from the response (carries its tag), CSeq number kept with
+/// method ACK. Per §17.1.1.2 the ACK carries a SINGLE Via — equal to the
+/// top Via of the original request, so the branch matches the server
+/// transaction — and the same Route set as the original request so it
+/// traverses the same proxies (copying the whole Via stack pointed the
+/// server transaction at a branch that is not the top).
 pub fn build_non2xx_ack(req: &Request, resp: &Response) -> Option<Request> {
     let cseq = resp.headers.cseq()?;
     let mut headers = HeaderMap::new();
-    for via in req.headers.get_all("Via") {
-        headers.add("Via", via);
+    if let Some(top) = req.headers.get("Via") {
+        headers.add("Via", top);
+    }
+    for route in req.headers.get_all("Route") {
+        headers.add("Route", route);
     }
     if let Some(f) = resp.headers.get("From") {
         headers.add("From", f);

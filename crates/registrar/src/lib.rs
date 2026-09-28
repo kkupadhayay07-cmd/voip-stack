@@ -192,8 +192,7 @@ impl Registrar {
                         .unwrap_or(false);
                     if !nonce_fresh {
                         // Stale/unknown nonce: challenge with a fresh nonce.
-                        let nonce = new_nonce();
-                        auth.nonces.insert(nonce.clone(), Instant::now());
+                        let nonce = issue_nonce(auth);
                         let mut resp = respond_to(req, 401, "Unauthorized", Vec::new(), None);
                         add_challenge(&mut resp, &auth.realm, &nonce);
                         return Ok(resp);
@@ -235,8 +234,7 @@ impl Registrar {
                         .remove(&auth_resp.nonce.clone().unwrap_or_default());
                 }
                 None => {
-                    let nonce = new_nonce();
-                    auth.nonces.insert(nonce.clone(), Instant::now());
+                    let nonce = issue_nonce(auth);
                     let mut resp = respond_to(req, 401, "Unauthorized", Vec::new(), None);
                     add_challenge(&mut resp, &auth.realm, &nonce);
                     return Ok(resp);
@@ -261,19 +259,11 @@ impl Registrar {
         let now = Instant::now();
         let default_expires = self.config.max_expires;
 
-        let existed = self.aors.contains_key(&aor);
-        let entry = self.aors.entry(aor.clone()).or_default();
-        let mut updates: Vec<(String, u32)> = Vec::new();
-        // AoR lookup tap (after lookup, before response)
-        observ::session::emit_for(
-            &call_id,
-            observ::EventKind::RegistrarLookup {
-                aor: aor.clone(),
-                found: existed,
-                bindings: contacts.addresses.len(),
-            },
-        );
-
+        // Compute every contact's effective expiry FIRST: an expiry below
+        // the configured minimum (RFC 3261 §10.2.8) is refused with
+        // 423 (Interval Too Brief) carrying Min-Expires BEFORE any binding
+        // is created or updated. Expiry 0 is de-registration, never 423.
+        let mut computed: Vec<(String, u32, f32)> = Vec::with_capacity(contacts.addresses.len());
         for c in &contacts.addresses {
             let contact_str = c.addr.to_string();
             let param_expires = c
@@ -293,28 +283,50 @@ impl Registrar {
                 .and_then(|p| p.value.as_deref())
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(1.0);
+            if expires != 0 && expires < self.config.min_expires {
+                let mut resp = respond_to(req, 423, "Interval Too Brief", Vec::new(), None);
+                resp.headers
+                    .add("Min-Expires", self.config.min_expires.to_string());
+                return Ok(resp);
+            }
+            computed.push((contact_str, expires, q));
+        }
 
-            updates.push((contact_str.clone(), expires));
+        let existed = self.aors.contains_key(&aor);
+        let entry = self.aors.entry(aor.clone()).or_default();
+        let mut updates: Vec<(String, u32)> = Vec::new();
+        // AoR lookup tap (after lookup, before response)
+        observ::session::emit_for(
+            &call_id,
+            observ::EventKind::RegistrarLookup {
+                aor: aor.clone(),
+                found: existed,
+                bindings: contacts.addresses.len(),
+            },
+        );
+
+        for (contact_str, expires, q) in &computed {
+            updates.push((contact_str.clone(), *expires));
             if let Some(existing) = entry
                 .bindings
                 .iter_mut()
-                .find(|b| b.contact == contact_str && b.call_id == call_id)
+                .find(|b| b.contact == *contact_str && b.call_id == call_id)
             {
-                if expires == 0 {
+                if *expires == 0 {
                     continue; // removal handled below
                 }
                 if cseq >= existing.cseq {
                     existing.cseq = cseq;
                     existing.source = source.to_string();
-                    existing.q = q;
-                    existing.expires_at = now + Duration::from_secs(expires as u64);
+                    existing.q = *q;
+                    existing.expires_at = now + Duration::from_secs(*expires as u64);
                 }
-            } else if expires > 0 {
+            } else if *expires > 0 {
                 entry.bindings.push(Binding {
                     contact: contact_str.clone(),
                     source: source.to_string(),
-                    q,
-                    expires_at: now + Duration::from_secs(expires as u64),
+                    q: *q,
+                    expires_at: now + Duration::from_secs(*expires as u64),
                     call_id: call_id.clone(),
                     cseq,
                 });
@@ -364,6 +376,17 @@ fn add_challenge(resp: &mut Response, realm: &str, nonce: &str) {
         "WWW-Authenticate",
         format!("Digest realm=\"{realm}\", nonce=\"{nonce}\", algorithm=MD5, qop=\"auth\""),
     );
+}
+
+/// Issues a fresh nonce, first evicting expired entries so the table cannot
+/// grow without bound under challenge floods (audit 2026-09 P2: the table
+/// previously only ever shrank on successful auth).
+fn issue_nonce(auth: &mut AuthStore) -> String {
+    auth.nonces
+        .retain(|_, issued| issued.elapsed() < auth.nonce_ttl);
+    let nonce = new_nonce();
+    auth.nonces.insert(nonce.clone(), Instant::now());
+    nonce
 }
 
 fn new_nonce() -> String {

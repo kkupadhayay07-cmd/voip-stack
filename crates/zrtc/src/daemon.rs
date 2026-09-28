@@ -95,6 +95,9 @@ pub async fn run(mut cfg: Config) -> Result<(), String> {
     let cdr_store = CdrStore::new(10_000);
     let dialer = Dialer::new(cdr_store.clone());
     let api_state = api::new_state(cdr_store.clone(), dialer);
+    // Cloned before api_state is moved into the server task: the CDR
+    // finalizer increments the Prometheus call counters through it.
+    let api_metrics = api_state.metrics.clone();
     {
         let addr = api_addr;
         tokio::spawn(async move {
@@ -236,8 +239,9 @@ pub async fn run(mut cfg: Config) -> Result<(), String> {
     {
         let store = cdr_store.clone();
         let outbound = outbound_ids.clone();
+        let metrics = api_metrics;
         tokio::spawn(async move {
-            cdr_task::run(cdr_rx, store, outbound).await;
+            cdr_task::run(cdr_rx, store, outbound, metrics).await;
         });
     }
 

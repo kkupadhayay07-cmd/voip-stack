@@ -16,9 +16,16 @@ struct CallState {
     to: String,
     answered: bool,
     codec: Option<String>,
+    /// Final SIP code for a call that never answered (404/486/603/...).
+    final_code: Option<u16>,
 }
 
-pub async fn run(mut rx: UnboundedReceiver<CdrEvent>, store: CdrStore, outbound: OutboundIds) {
+pub async fn run(
+    mut rx: UnboundedReceiver<CdrEvent>,
+    store: CdrStore,
+    outbound: OutboundIds,
+    metrics: std::sync::Arc<api::Metrics>,
+) {
     let mut open: HashMap<String, CallState> = HashMap::new();
     while let Some(ev) = rx.recv().await {
         match ev {
@@ -30,6 +37,7 @@ pub async fn run(mut rx: UnboundedReceiver<CdrEvent>, store: CdrStore, outbound:
                     to,
                     answered: false,
                     codec: None,
+                    final_code: None,
                 });
             }
             CdrEvent::LegAnswered {
@@ -51,6 +59,7 @@ pub async fn run(mut rx: UnboundedReceiver<CdrEvent>, store: CdrStore, outbound:
                 frames_a_to_b,
                 frames_b_to_a,
                 concealed,
+                final_code,
                 ..
             } => {
                 let direction = if outbound.lock().expect("outbound ids").contains(&call_id) {
@@ -63,6 +72,7 @@ pub async fn run(mut rx: UnboundedReceiver<CdrEvent>, store: CdrStore, outbound:
                     to: String::new(),
                     answered: false,
                     codec: None,
+                    final_code,
                 });
                 let record = build_record(
                     direction,
@@ -81,6 +91,7 @@ pub async fn run(mut rx: UnboundedReceiver<CdrEvent>, store: CdrStore, outbound:
                     talk_secs = record.talk_secs,
                     "cdr written"
                 );
+                metrics.record_cdr(direction, record.disposition);
                 store.insert(record).await;
             }
             _ => {}
@@ -98,16 +109,19 @@ fn build_record(
     concealed: u64,
 ) -> CallRecord {
     let talk_secs = duration_ms / 1000;
-    let (code, canceled) = if st.answered {
-        (200u16, false)
+    // The real final code drives the disposition (486 → Busy, 603 →
+    // Rejected, ...); 487/Canceled remains the fallback only when the
+    // engine could not attribute a concrete code (timer/cancel teardown).
+    let code = if st.answered {
+        200u16
     } else {
-        (487, false)
+        st.final_code.unwrap_or(487)
     };
     let mut rec = CallRecordBuilder::new(direction, &st.from, &st.to)
         .a_call_id(call_id)
         .correlate("frames_a_to_b", &frames_a_to_b.to_string())
         .correlate("frames_b_to_a", &frames_b_to_a.to_string())
-        .finish(code, canceled, talk_secs);
+        .finish(code, false, talk_secs);
     rec.media = MediaStats {
         packets_rx: frames_a_to_b,
         packets_tx: frames_b_to_a,

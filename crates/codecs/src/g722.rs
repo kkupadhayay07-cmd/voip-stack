@@ -540,9 +540,11 @@ impl Decoder for G722Decoder {
     }
 
     fn reset(&mut self) {
-        let last = std::mem::take(&mut self.last_codes);
+        // A reset must return the decoder to freshly-constructed state:
+        // re-importing the old `last_codes` predictor history here kept the
+        // previous stream's state alive across resets, so the post-reset
+        // output diverged from a fresh decoder (audit 2026-09 P2).
         *self = G722Decoder::new(self.mode);
-        self.last_codes = last;
     }
 }
 
@@ -687,6 +689,34 @@ mod tests {
         e.reset();
         let b = e.encode_frame(&pcm).unwrap();
         assert_eq!(a, b, "encoder must be deterministic after reset");
+    }
+
+    #[test]
+    fn decoder_reset_returns_to_fresh_state() {
+        // A reset decoder must behave exactly like a newly constructed one:
+        // predictor history (last_codes) must NOT survive the reset.
+        let pcm = speechish(320 * 8);
+        let mut e = G722Encoder::new(G722Mode::Mode64k);
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        for chunk in pcm.chunks(320) {
+            frames.push(e.encode_frame(chunk).unwrap());
+        }
+
+        let mut warmed = G722Decoder::new(G722Mode::Mode64k);
+        let mut sink = Vec::new();
+        for f in &frames {
+            warmed.decode(f, &mut sink).unwrap();
+        }
+        warmed.reset();
+
+        let mut fresh = G722Decoder::new(G722Mode::Mode64k);
+        let mut expect = Vec::new();
+        let mut got = Vec::new();
+        for f in &frames {
+            fresh.decode(f, &mut expect).unwrap();
+            warmed.decode(f, &mut got).unwrap();
+        }
+        assert_eq!(got, expect, "post-reset decode must match a fresh decoder");
     }
 
     #[test]

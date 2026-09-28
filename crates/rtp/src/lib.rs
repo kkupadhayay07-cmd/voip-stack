@@ -27,17 +27,22 @@ pub use rtcp::{parse_compound, ReportBlock, RtcpPacket, SdesChunk, SdesType, Sen
 
 /// RFC 5761 §4: does this datagram look like RTCP rather than RTP?
 ///
-/// Applies the reduced-size (mux) rules: payload types 64–95 identify RTCP
-/// when muxing is negotiated; the classic 192–223 range is also matched so
-/// non-muxed sockets can demux safely.
+/// The classic 192–223 payload-type range with version 2 identifies RTCP so
+/// non-muxed sockets can demux safely. Deliberately NO 4-byte length
+/// alignment check: RFC 3711 §3.4 SRTCP appends the E flag / SRTCP index
+/// (4 bytes) plus a 10- or 16-byte authentication tag after the RTCP
+/// compound, so an encrypted packet's total length is generally NOT a
+/// multiple of 4 — requiring alignment here misrouted every AES-CM SRTCP
+/// datagram into the RTP path.
 pub fn looks_like_rtcp(buf: &[u8]) -> bool {
     if buf.len() < 2 {
         return false;
     }
     let pt = buf[1];
     if (192..=223).contains(&pt) {
-        // Classic RTCP range; also verify version 2 and 4-byte alignment.
-        return buf[0] >> 6 == 2 && buf.len().is_multiple_of(4);
+        // Classic RTCP range; verify version 2 only (see above for why the
+        // historic %4 alignment probe must not reject).
+        return buf[0] >> 6 == 2;
     }
     false
 }
@@ -58,5 +63,23 @@ mod tests {
         assert!(!looks_like_rtcp(&rtp));
         assert!(!looks_like_rtcp(&[0x80]));
         assert!(!looks_like_rtcp(&[]));
+    }
+
+    #[test]
+    fn srtcp_with_auth_trailer_still_detected() {
+        // RFC 3711 §3.4: SRTCP = RTCP compound + 4-byte E/index + auth tag.
+        // With a 10-byte tag the total is not a multiple of 4 — the old %4
+        // probe misrouted this into the RTP path.
+        let mut srtcp = vec![0x81u8, 200, 0, 6];
+        srtcp.extend_from_slice(&[0u8; 28]); // SR body
+        srtcp.extend_from_slice(&[0u8; 4]); // E flag + SRTCP index
+        srtcp.extend_from_slice(&[0u8; 10]); // HMAC-SHA1 auth tag
+        assert_eq!(srtcp.len() % 4, 2, "encrypted trailer breaks alignment");
+        assert!(looks_like_rtcp(&srtcp));
+        // Version must still be checked: a v0/v1 packet in the PT range is
+        // not RTCP.
+        let mut v1 = srtcp.clone();
+        v1[0] = 0x41;
+        assert!(!looks_like_rtcp(&v1));
     }
 }

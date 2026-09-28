@@ -326,6 +326,12 @@ impl ServerNonInviteTx {
         }
         if resp.is_provisional() {
             self.last_provisional = Some(resp.clone());
+            // RFC 3261 §17.2.2: sending a provisional moves the transaction
+            // Trying → Proceeding (retransmissions are then answered with
+            // the last provisional).
+            if self.state == TxState::Trying {
+                self.state = TxState::Proceeding;
+            }
             return vec![TxAction::SendResponse(resp)];
         }
         self.final_resp = Some(resp.clone());
@@ -350,6 +356,12 @@ impl ServerNonInviteTx {
         if self.state == TxState::Terminated {
             return Vec::new();
         }
+        // RFC 3261 §17.2.2 transaction matching: branch, sent-by, CSeq AND
+        // method — a different method with the same branch/seq belongs to a
+        // foreign transaction and must not be answered from this one.
+        if req.method != self.req.method {
+            return Vec::new();
+        }
         // Original-request retransmission? Same branch, sent-by, CSeq seq.
         let Some(via) = req.headers.first_via() else {
             return Vec::new();
@@ -361,7 +373,7 @@ impl ServerNonInviteTx {
             return Vec::new();
         }
         match self.state {
-            TxState::Trying => self
+            TxState::Proceeding => self
                 .last_provisional
                 .clone()
                 .map(|r| vec![TxAction::SendResponse(r)])

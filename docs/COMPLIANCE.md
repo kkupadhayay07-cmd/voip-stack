@@ -9,10 +9,15 @@ session timers and RFC 3262 PRACK/100rel on both B2BUA legs, plus the
 external security/interop audit triage with its follow-up fix waves
 (Remote-DoS parser panics, SRTP payload authentication, G.729 postfilter
 output, ICE IPv6/TURN, SBC/proxy response maps, dialer/mixer/CDR data
-integrity), and the final Critical/High wave (TLS/WSS handshake budget,
+integrity), the final Critical/High wave (TLS/WSS handshake budget,
 loopback sink echo/Contact/reaper, RTP padding round-trip, jitter-buffer
-timestamp wrap and sequence-gap concealment); 455 tests green across
-54 suites — **every confirmed Critical + High audit finding is fixed**).
+timestamp wrap and sequence-gap concealment), and the full P2 sweep
+(SRTCP-aware RTP/RTCP demux, top-of-stack Via push, single-Via + Route
+non-2xx ACK, non-INVITE Proceeding + method matching, registrar 423
+`Min-Expires` + nonce pruning, CA-verified trunk TLS with real
+mini-CA/SAN certs, real CDR final codes, safe `--since` parsing, wired
+Prometheus call counters + gauge semantics); 468 tests green across
+54 suites — **every audit finding at every severity is fixed**).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
@@ -21,9 +26,9 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC | Feature | Status | Notes |
 |-----|---------|--------|-------|
 | RFC 3261 | SIP: message layer | **Done** | `sip-core`: strict panic-free byte parser (UDP datagram + TCP/TLS/WS stream framing, §18.3), canonical serializer, URI/header model, branch/tag/Call-ID generators. Parser limits enforced (64 KiB msg, 128 headers, 8 KiB/line). |
-| RFC 3261 | SIP: registrar (§10) | **Done** | `registrar` crate: AoR binding DB (q-ordering, expiry, CSeq/Call-ID consistency, wildcard removal), Digest auth challenge/verify with one-time nonces, domain check. |
+| RFC 3261 | SIP: registrar (§10) | **Done** | `registrar` crate: AoR binding DB (q-ordering, expiry, CSeq/Call-ID consistency, wildcard removal), Digest auth challenge/verify with one-time nonces, domain check. §10.2.8: registrations below the configured minimum expiry are refused with 423 `Interval Too Brief` carrying `Min-Expires`; the nonce table is pruned of expired entries on every challenge so it stays bounded under floods. |
 | RFC 3261 | SIP: stateful proxy (§16) | **Done** (core) | `proxy` crate: request validation (483), Route-set processing, Via prepend/pop, Record-Route, parallel forking, 100 Trying, CANCEL matching (§9.1), response routing (received/rport → sent-by). Fork state is in-memory only (no failover); adopting the `sip-tx` timer state machines in the proxy is a planned hardening step. |
-| RFC 3261 | SIP: transactions (§17) | **Done** (core) | `sip-tx` crate: client INVITE (Timers A/B/D), client non-INVITE (E/F/K), server INVITE (G/H/I), server non-INVITE (J); §17.1.3 response matching + §17.2.3 ACK matching; pure state machines, fake-clock tests at exact fire instants. The B2BUA drives both call legs through it. Failover (RFC 3263) remains open. |
+| RFC 3261 | SIP: transactions (§17) | **Done** (core) | `sip-tx` crate: client INVITE (Timers A/B/D), client non-INVITE (E/F/K), server INVITE (G/H/I), server non-INVITE (J); §17.1.3 response matching + §17.2.3 ACK matching; the non-2xx ACK carries a single top Via plus the original Route set (§17.1.1.2); the non-INVITE server transaction enters Proceeding on a provisional and matches retransmissions by branch+sent-by+CSeq AND method (§17.2.2); pure state machines, fake-clock tests at exact fire instants. The B2BUA drives both call legs through it. Failover (RFC 3263) remains open. |
 | RFC 3261 | SIP: transports (§18) | **Done** (core) | UDP/TCP/TLS/WSS listeners wired in the `zrtc` daemon (TLS via whitelisted OpenSSL, self-signed identity at startup, mTLS client certs for trunks); message layer covers datagram + stream framing incl. §18.3 robustness. |
 | RFC 3261 | SIP: dialogs (§12) | **Partial** | B2BUA tracks per-leg dialog state (tags/Call-ID/CSeq); generic dialog package not extracted. |
 | RFC 3262 | PRACK / 100rel | **Done** (core) | B2BUA, both legs. UAS: reliable 180 (`Require: 100rel` + `RSeq` from [1, 2³¹−1], To-tagged early dialog) when the caller advertises 100rel, Timer-G-style retransmission (T1 doubling to T2) until `PRACK`, 64·T1 give-up with 503 + BYE, the final 200 parked until the PRACK arrives (§3), RAck matching with 481/400 verdicts and idempotent 200 for retransmitted PRACKs. UAC: only a 101–199 carrying BOTH `Require: 100rel` and `RSeq` is PRACKed (§4 — never a 100, never an unmarked 1xx), answered with PRACK carrying `RAck` (own dialog CSeq); a retransmitted 1xx (same `RSeq`) is answered by resending the STORED PRACK byte-identically (same CSeq number and branch, RFC 3261 §17.1.2); 421 Extension-Required dial retry once with the demanded extensions merged into `Supported` (§3); non-INVITE responses excluded from the INVITE transaction slot. |
@@ -67,11 +72,11 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | Codec | Status | Notes |
 |-------|--------|-------|
 | G.711 PCMU/PCMA | **Done** | ITU tables; frame API (`codecs::g711`) + packet path (`rtp::g711`); round-trip + midstream-loss tests. |
-| G.722 | **Done** | Bit-exact ITU structure: two-polyphase QMF, 6-bit embedded low-band ADPCM with bit stealing (64/56/48 kb/s), 2-bit high band; ≥20 dB round-trip, 28 dB post-loss recovery. |
+| G.722 | **Done** | Bit-exact ITU structure: two-polyphase QMF, 6-bit embedded low-band ADPCM with bit stealing (64/56/48 kb/s), 2-bit high band; ≥20 dB round-trip, 28 dB post-loss recovery. `reset()` returns the decoder to fresh-constructed state (predictor history discarded, verified against a fresh decoder). |
 | G.729 | **Done** (wire-conformant; quality caveats documented) | ITU codebooks, 4-pulse/13-bit algebraic CB, ITU pitch-delay mappings + parity. Decoder verified against **bcg729 golden vectors** (±3 dB); bitstreams **cross-decoded by ffmpeg in CI**. Fidelity deviations documented in `codecs/src/g729.rs`. |
-| Opus | **Done** | Safe binding to system libopus 1.5.2 (8–48 kHz, mono/stereo, DTX/FEC/bitrate control), feature-gated. |
+| Opus | **Done** | Safe binding to system libopus 1.5.2 (8–48 kHz, mono/stereo, DTX/FEC/bitrate control), feature-gated. Decodes any RFC 6716 frame duration up to 120 ms; PLC always emits exactly one 20 ms frame so playout pacing is stable. |
 | L16 | **Done** | RFC 3551 §5.1. |
-| CN (silence) | **Done** | RFC 3389 comfort-noise payload + noise generation. |
+| CN (silence) | **Done** | RFC 3389 comfort-noise payload + noise generation; multi-byte payloads tolerated with the first octet used (§2.2), empty payload rejected. |
 | PLC | **Done** (engineering feature) | `PitchPlc`/`EnergyDecayPlc`/`SilencePlc` + per-codec `Decoder::conceal()` wired into the jitter buffer. |
 | RFC 4733 DTMF | **Done** | Event payload encode/decode + relay; audio-band DTMF detection not implemented. |
 | Transcoding | **Done** | B2BUA 16 kHz bridge converts any negotiated codec pair (e.g. PCMU↔PCMA verified end-to-end with SNR-checked audio). |
@@ -117,7 +122,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **455 passing across 54 suites**.
+  `cargo test --workspace` → **468 passing across 54 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16 + §17.1/§17.3
   SRTCP AEAD), STUN (RFC 5769 §2.1/§2.2; MD5 long-term keys + MESSAGE-INTEGRITY
   against independent vectors), G.729 (bcg729 oracle), cross-decode by ffmpeg.
