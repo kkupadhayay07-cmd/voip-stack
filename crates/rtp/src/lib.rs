@@ -4,26 +4,42 @@
 //! - [RFC 3550]/[RFC 3551] packet parse/serialize (RTP + RTCP SR/RR/SDES/BYE/APP, generic feedback)
 //! - Adaptive jitter buffer with virtual-time API, RFC 3550 jitter estimation,
 //!   SSRC probation, sequence wrap handling and pluggable PLC
+//! - Loss recovery: [RFC 4585] Generic NACK generation/parsing and
+//!   [RFC 4588] RTX retransmission streams (pool, packetizer, depacketizer)
+//! - transport-cc congestion feedback (RTPFB FMT 15, draft-holmerberg:
+//!   receiver monitor + sender tracker, libwebrtc-compatible wire form)
 //! - [RFC 4733] telephone-event (DTMF)
 //! - Native G.711 μ-law / A-law codecs
 //! - [RFC 5761] RTP/RTCP demultiplexing helper
 //!
 //! [RFC 3550]: https://datatracker.ietf.org/doc/html/rfc3550
 //! [RFC 3551]: https://datatracker.ietf.org/doc/html/rfc3551
+//! [RFC 4585]: https://datatracker.ietf.org/doc/html/rfc4585
+//! [RFC 4588]: https://datatracker.ietf.org/doc/html/rfc4588
 //! [RFC 4733]: https://datatracker.ietf.org/doc/html/rfc4733
 //! [RFC 5761]: https://datatracker.ietf.org/doc/html/rfc5761
 
 pub mod dtmf;
 pub mod g711;
 pub mod jitter;
+pub mod nack;
 pub mod packet;
 pub mod rtcp;
+pub mod twcc;
 
 pub use dtmf::{decode_digit, encode_digit, DtmfEvent};
 pub use g711::{pcma_decode, pcma_encode, pcmu_decode, pcmu_encode};
 pub use jitter::{JbStats, JitterBuffer, JitterConfig, PushResult, RtpFrame};
+pub use nack::{
+    nack_fci, nack_packet, nack_seqs, osn_of, parse_nack_fci, GenericNack, NackConfig, NackTracker,
+    RtxDepacketizer, RtxPool, RtxStream,
+};
 pub use packet::{RtpError, RtpExtension, RtpHeader, RtpPacket};
 pub use rtcp::{parse_compound, ReportBlock, RtcpPacket, SdesChunk, SdesType, SenderInfo};
+pub use twcc::{
+    parse_twcc, twcc_fci, twcc_packet, TwccEntry, TwccFeedback, TwccPacketResult, TwccReport,
+    TwccRxMonitor, TwccSendTracker, DELTA_SCALE_US, FMT_TWCC, REF_SCALE_MS,
+};
 
 /// RFC 5761 §4: does this datagram look like RTCP rather than RTP?
 ///

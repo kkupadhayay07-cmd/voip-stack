@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 480 tests passing across 54 suites in 19 crates;
+**Current state: 503 tests passing across 54 suites in 19 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
@@ -26,7 +26,7 @@ finding is fixed with regression tests
 | `crates/sip-core` | RFC 3261 message layer: parser, serializer, URI/headers, Digest helpers (RFC 2617/7616) | **Done** |
 | `crates/sip-tx` | RFC 3261 §17 transaction state machines: client/server INVITE + non-INVITE (Timers A/B/D, E/F/K, G/H/I, J), §17.1.3/§17.2.3 matching, ACK rules; pure state machines — no I/O, fake-clock tested | **Done** |
 | `crates/sdp` | RFC 4566/8866 SDP parser/serializer + RFC 3264 offer/answer engine (`StreamPlan` projection) | **Done** |
-| `crates/rtp` | RTP/RTCP (RFC 3550/3551), adaptive jitter buffer + PLC, RFC 4733 DTMF, RFC 5761 demux, RFC 8285 extensions, RTCP feedback (NACK/PLI/FIR/TWCC) | **Done** |
+| `crates/rtp` | RTP/RTCP (RFC 3550/3551), adaptive jitter buffer + PLC, loss recovery (RFC 4585 Generic NACK + RFC 4588 RTX), transport-cc congestion feedback, RFC 4733 DTMF, RFC 5761 demux, RFC 8285 extensions, RTCP feedback (PLI/FIR) | **Done** |
 | `crates/codecs` | Full codec suite: **Opus, PCMU, PCMA, G.722, G.729, telephone-event**, L16, CN (RFC 3389), PLC, resampler; G.729 validated against bcg729 oracle vectors | **Done** |
 | `crates/b2bua` | B2BUA call engine: dual-leg SIP driven by `sip-tx` transactions, SDP offer/answer both legs, cross-connected media pumps with 16 kHz transcode bridge (any codec pair), DTMF relay, RFC 4028 session timers, RFC 3262 reliable 1xx + PRACK both legs, CDR events, `b2bua-demo` binary, full-loopback integration test | **Done** |
 | `crates/srtp` | RFC 3711 (AES-CM + HMAC-SHA1, KDF, replay window, ROC estimation) + RFC 7714 AES-GCM AEAD; validated against RFC 3711 B.2/B.3 and RFC 7714 §16 vectors | **Done** |
@@ -49,7 +49,7 @@ finding is fixed with regression tests
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 480 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 503 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -127,6 +127,15 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
   for machines); `demo/soak.sh` wraps it with a CDR cross-check and a
   panic gate. Sandbox baseline (2 vCPU, debug build): 200 calls at
   concurrency 20 → 200/200 answered, setup p50 116 ms / p95 305 ms.
+* **Loss recovery + congestion feedback** (`rtp`): RTCP Generic NACK
+  (RFC 4585 §6.2.1 — `PID`/`BLP` FCI with wraparound-aware extended
+  sequences, repeat throttling and give-up limits), RFC 4588 RTX
+  retransmission (sender pool + OSN packetizer + receiver depacketizer for
+  `apt`-linked streams), and transport-cc feedback (RTPFB FMT 15,
+  libwebrtc-compatible chunk/delta encoding with run-length loss
+  compression, receiver monitor + sender delay/loss tracker) — the
+  building blocks for talking to browser media stacks; the B2BUA's RTCP
+  channel plumbing is the follow-up.
 
 ## Phase status
 
@@ -160,8 +169,9 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
    concurrency 20, 100% answered, setup p95 305 ms) are shipped; publish
    the optimized-build numbers next.
 3. Postgres CDR persistence (sqlx) + retention policies.
-4. WebRTC hardening — RTX/NACK resend path, TWCC-driven bandwidth estimation,
-   data channels (SCTP).
+4. WebRTC hardening — library layer ✅ (RFC 4585 NACK, RFC 4588 RTX,
+   transport-cc feedback in `crates/rtp`); remaining: wire NACK/TWCC into
+   the B2BUA's RTCP channels, data channels (SCTP).
 5. SDP hardening — rejected m-lines, port-0 offers, RFC 3264 §6.1 direction
    clamp, extras serialization, **IPv6 answer address types and RFC 8843
    BUNDLE group echo done**; remaining: GRUU/Outbound, NAPTR/SRV for

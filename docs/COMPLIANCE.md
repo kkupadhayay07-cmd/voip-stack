@@ -18,8 +18,10 @@ non-2xx ACK, non-INVITE Proceeding + method matching, registrar 423
 mini-CA/SAN certs, real CDR final codes, safe `--since` parsing, wired
 Prometheus call counters + gauge semantics), and the SDP IPv6/BUNDLE answer
 hardening (IP4/IP6 `o=`/`c=` address types picked from the local host
-literal, RFC 8843 BUNDLE group echo with the accepted mids), and a
-concurrent-call load harness with percentile reporting; 480 tests green
+literal, RFC 8843 BUNDLE group echo with the accepted mids), a
+concurrent-call load harness with percentile reporting, and RTP loss
+recovery + congestion feedback (RFC 4585 Generic NACK, RFC 4588 RTX,
+transport-cc); 503 tests green
 across 54 suites — **every audit finding at every severity is fixed**).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
@@ -56,7 +58,9 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC 3550 | RTP/RTCP | **Done** | `rtp` crate: fixed-header parse/serialize; RTCP SR/RR/SDES/BYE/APP compound parse/encode; interarrival jitter estimator; SSRC probation. Padding round-trips byte-exactly (the padding bit is never emitted without its octets); the playout buffer is wrap-safe for both the 16-bit sequence and 32-bit timestamp spaces. |
 | RFC 3551 | RTP/AVP profile | **Done** | Static payload types (0 PCMU, 8 PCMA, 9 G722, 18 G729, 13 CN, 100 telephone-event) + L16 (BE). |
 | RFC 3556 | SDP bandwidth modifiers | **Partial** | `b=` lines parsed/modelled; `TIAS` pacing semantics not applied. |
-| RFC 4585 | RTCP-based feedback | **Partial** | NACK/TWCC/PLI/FIR packets modelled; REMB not implemented; RTX retransmission logic not yet. |
+| RFC 4585 | RTCP-based feedback | **Done (core)** | `rtp::nack`: Generic NACK `PID`/`BLP` FCI encode/parse (§6.2.1) + receiver-side gap tracker (extended sequences, repeat throttle, give-up limits, stream-restart guards); PLI/FIR still modelled as typed Psfb; REMB not implemented. |
+| RFC 4588 | RTX retransmission | **Done (core)** | `rtp::nack`: sender `RtxPool` (bounded retransmission window), `RtxStream` packetizer (separate SSRC/PT + OSN payload prefix, CSRCs dropped per §4), receiver `RtxDepacketizer` restoring `apt` PT + original sequence; SSRC learning until pinned from SDP. |
+| transport-cc (draft-holmerberg-avt-01) | RTPFB FMT 15 congestion feedback | **Done (core)** | `rtp::twcc`: libwebrtc-compatible FCI encode/parse (run/vector chunks, small u8 + large i16 recv deltas at 250 µs, 64 ms reference time, feedback counter), receiver `TwccRxMonitor` (gap-marked arrival windows) and sender `TwccSendTracker` (per-packet delay + window loss correlation). |
 | RFC 4733 | RTP DTMF (telephone-event) | **Done** | Events 0–15 with start/end semantics + tests; relayed end-to-end by the B2BUA. |
 | RFC 5761 | RTP/RTCP demultiplexing | **Done** | §4 heuristic, unit-tested. |
 | RFC 8285 | RTP header extensions | **Done** | One-byte and two-byte blocks parse/serialize. |
@@ -119,14 +123,18 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 * **Postgres CDR persistence**: CDRs are in-memory (bounded) + JSON; sqlx
   storage backend planned.
 * **Load verification**: the 8-core/1000-call target is an architecture goal;
-  a load harness has not been run in this environment.
-* REMB, RTX retransmission, audio-band DTMF detection,
+  the harness is shipped and a debug-build soak ran in this 2-vCPU sandbox
+  (200 calls @ concurrency 20 → 100% answered, setup p95 305 ms; knee
+  between 20–50 under CPU saturation); the release-build 8-core soak
+  remains.
+* REMB, B2BUA RTCP channel plumbing (sending NACKs / answering TWCC on live
+  legs), audio-band DTMF detection,
   NAPTR/SRV, GRUU/Outbound, WebRTC data channels.
 
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **480 passing across 54 suites**.
+  `cargo test --workspace` → **503 passing across 54 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16 + §17.1/§17.3
   SRTCP AEAD), STUN (RFC 5769 §2.1/§2.2; MD5 long-term keys + MESSAGE-INTEGRITY
   against independent vectors), G.729 (bcg729 oracle), cross-decode by ffmpeg.

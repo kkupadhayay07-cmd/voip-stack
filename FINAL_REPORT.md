@@ -85,7 +85,7 @@ verified by SNR on real audio).
 
 | # | Criterion | Status |
 |---|-----------|--------|
-| 1 | 8-core 1000-concurrent-calls | ⚠️ Architecture supports it (lock-free per-call state, O(1) jitter buffer ops); a load harness has **not** been run in this 2-vCPU sandbox — honest gap, documented in COMPLIANCE §5 |
+| 1 | 8-core 1000-concurrent-calls | ⚠️ Architecture supports it (lock-free per-call state, O(1) jitter buffer ops); the load harness is shipped and a debug-build soak ran in the 2-vCPU sandbox (200 calls @ concurrency 20 → 100% answered, setup p95 305 ms — CPU-saturated knee between 20–50); the release-build 8-core soak remains the honest gap |
 | 2 | WebRTC ↔ PSTN interop | ✅ In-stack: DTLS-SRTP+ICE+Opus legs ↔ B2BUA ↔ G.711/G.729 legs with transcoding; external-browser interop matrix documented |
 | 3 | SRTP/DTLS-SRTP Chrome-compatible | ✅ Protocol-level: DTLS 1.2, ECDHE-ECDSA-AES128GCM-SHA256, use_srtp (GCM + SHA1-80), RFC 5764 export — the exact Chrome parameter set |
 | 4 | Dialer on 100 leads predictive | ✅ `dialer` pacing engine + lead queue (attempts/cooldown/DNC) unit-tested; harness entry point ready |
@@ -123,8 +123,9 @@ verified by SNR on real audio).
 3. **Load harness** — 1000-concurrent-call soak with per-leg SRTP + transcoding
    on 8-core hardware; publish numbers in DEPLOYMENT.
 4. **Postgres CDR backend** (sqlx) + retention/archival policies.
-5. **WebRTC hardening** — RTX/NACK resend path, TWCC-driven bandwidth
-   estimation, data channels (SCTP).
+5. **WebRTC hardening** — library layer ✅ done in `crates/rtp` (RFC 4585
+   Generic NACK, RFC 4588 RTX, transport-cc feedback); remaining: B2BUA
+   RTCP channel plumbing, data channels (SCTP).
 6. **PRACK/100rel** ✅ done (see addendum); **GRUU/Outbound, NAPTR/SRV**
    still open for carrier-grade signaling.
 
@@ -157,8 +158,9 @@ addendum records what landed since, so the document stays honest.
 | Audit fix wave 4 (P2 sweep) | The complete Medium/Low backlog closed: RTP/RTCP demux no longer rejects SRTCP on %4 alignment (RFC 3711 §3.4 auth trailer); `push_via` prepends to the stack top with wire-order proof; non-2xx ACK = single top Via + original Route set (§17.1.1.2); `ServerNonInviteTx` Proceeding transition + method-inclusive retransmission matching (§17.2.2); registrar 423 `Min-Expires` enforcement + bounded nonce table; codecs — Opus decodes RFC 6716 frames up to 120 ms (PLC always one 20 ms frame), G.722 reset matches a fresh decoder, CN tolerates multi-byte payloads (RFC 3389 §2.2); zrtc trunk TLS chain-verifies the server cert against a configured CA (generated certs are proper mini-CAs with SKID/AKID/SAN), CDRs carry the engine's real final code (486 → Busy instead of blanket Failed/487), `--since ""` parses safely; api — pacing accepts real recent dial/answer counts, `ws_clients_connected` is a gauge, the four call counters are wired via `Metrics::record_cdr` |
 | SDP IPv6 + BUNDLE | Answer hardening in `sdp::negotiate`: the answer's `o=`/`c=` lines pick `IN IP4`/`IN IP6` from the local host literal (RFC 8866 §4.4 — a v6 address is never mislabeled IP4, hostnames stay IP4, the offer's family never dictates the answer's); RFC 8843 §6.2/§7.1.1 BUNDLE group echo — an answer to a bundled offer carries `a=group:BUNDLE` with exactly the accepted mids in the offer group's order, rejected (port 0) m-lines and mid-less m-lines never join the group, answers to unbundled offers stay group-free; 6 new tests |
 | Load harness | `zrtc load` — concurrent UAC call generator driving the full pipeline (listener → SBC → proxy → B2BUA → sink → paced RTP): `--calls`/`--concurrency`/`--pace-ms`, per-call INVITE→200 setup metric (`uac::run_call` → `PlacedCall`), summary report (mean/p50/p95/p99/max, calls-per-second, mean call hold, deduplicated failure breakdown), `--json` single-line output; `demo/soak.sh` wraps it with a port pre-flight, daemon CDR cross-check and panic gate. Unit tests cover the stats math; the loop is exercised by the soak. Sandbox baseline (2 vCPU, debug build): 200 calls at concurrency 20 → 200/200 answered, setup p50 116 ms / p95 305 ms; release/8-core soak is the documented follow-up |
+| Loss recovery + congestion feedback | `rtp::nack` — RTCP Generic NACK (RFC 4585 §6.2.1): typed `PID`/`BLP` FCI encode/parse with expansion, receiver `NackTracker` (wraparound-safe extended sequences, gap detection, repeat throttling, give-up by age/count, stream-restart + jump guards, ≤16-packet BLP batching); RFC 4588 RTX: sender `RtxPool` (bounded window) + `RtxStream` packetizer (own SSRC/PT/seq, OSN payload prefix, CSRCs dropped) + receiver `RtxDepacketizer` (apt PT + OSN restore, SSRC learning until pinned). `rtp::twcc` — transport-cc feedback (RTPFB FMT 15, draft-holmerberg / libwebrtc wire form): run/vector chunk encode + parse (250 µs recv deltas small/large, 64 ms reference time, feedback counter), receiver `TwccRxMonitor` (gap-marked windows, 64 ms reference floor, bounded memory) and sender `TwccSendTracker` (per-packet delay, window loss, max/mean delay); 23 new tests |
 
-**Current baseline (supersedes the header numbers):** 19 crates, **480 tests
+**Current baseline (supersedes the header numbers):** 19 crates, **503 tests
 across 54 suites**, `clippy -D warnings` clean, `cargo audit` clean. The
 external audit is fully closed at every severity — Critical, High and the
 complete P2 backlog — with regression tests
@@ -167,9 +169,10 @@ complete P2 backlog — with regression tests
 **§6 next-steps status:** item 1 (transaction layer) ✅ done as `sip-tx`;
 item 2 (service assembly binary) ✅ done as `zrtc`; item 6 PRACK/100rel ✅
 done; the load harness ✅ shipped (`zrtc load` + `demo/soak.sh`, debug-build
-sandbox baseline published). Remaining: release-mode soak on 8-core
-hardware, Postgres CDR backend, WebRTC hardening
-(RTX/NACK, TWCC, data channels), SDP hardening (rejected m-lines, port-0
+sandbox baseline published); WebRTC hardening library layer ✅ done (RFC 4585
+NACK, RFC 4588 RTX, transport-cc in `rtp`). Remaining: release-mode soak on 8-core
+hardware, Postgres CDR backend, B2BUA RTCP plumbing +
+data channels, SDP hardening (rejected m-lines, port-0
 answers, the §6.1 direction clamp, IPv6 answer address types and RFC 8843
 BUNDLE group echo ✅ done), GRUU/Outbound,
 NAPTR/SRV — see README "Roadmap (next)".

@@ -196,8 +196,10 @@ configured bounds. Guidance:
    release-build 1000-concurrent soak on 8-core hardware remains the
    published follow-up.
 3. **Postgres CDR backend** (sqlx) + retention/archival policies.
-4. **WebRTC hardening** — RTX/NACK resend path, TWCC-driven bandwidth
-   estimation, data channels (SCTP).
+4. **WebRTC hardening** — library layer ✅ shipped in `crates/rtp`
+   (RFC 4585 Generic NACK, RFC 4588 RTX retransmission, transport-cc
+   feedback); remaining: wire NACK/TWCC into the B2BUA's RTCP channels,
+   data channels (SCTP).
 5. **Container entrypoint** — wire `zrtc` as the image entrypoint with a
    mounted config + real healthcheck.
 6. **SDP hardening** (rejected m-lines, port-0 answers, the RFC 3264 §6.1
