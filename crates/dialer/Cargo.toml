@@ -7,8 +7,6 @@ description = "Outbound dialer: predictive/progressive/preview pacing (Erlang-C 
 
 [dependencies]
 thiserror = { workspace = true }
-tracing = { workspace = true }
-rand = { workspace = true }
 cdr = { workspace = true }
 tokio = { workspace = true }
 

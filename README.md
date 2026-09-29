@@ -136,6 +136,12 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
   compression, receiver monitor + sender delay/loss tracker) — the
   building blocks for talking to browser media stacks; the B2BUA's RTCP
   channel plumbing is the follow-up.
+* **Dependency hygiene sweep**: 36 unused `[dependencies]`/`[dev-dependencies]`
+  entries removed across 14 crates (e.g. the pure-std `proxy` state machine
+  carried `tokio`/`rand` for nothing), the never-referenced workspace
+  `async-trait` entry dropped, `cdr` unified onto the workspace `uuid` entry,
+  and two dead test-only `snr_db` helpers (superseded by `aligned_snr_db`)
+  deleted; 503/54 gates + demo unchanged.
 
 ## Phase status
 

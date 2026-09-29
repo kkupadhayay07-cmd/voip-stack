@@ -42,7 +42,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 hex = "0.4"
 md-5 = "0.10"
 sha2 = "0.10"
-async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 axum = { version = "0.8", features = ["ws"] }
 opus = "0.3"

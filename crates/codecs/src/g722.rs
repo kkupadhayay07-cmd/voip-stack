@@ -584,18 +584,6 @@ mod tests {
             .collect()
     }
 
-    #[allow(dead_code)]
-    fn snr_db(a: &[i16], b: &[i16], skip: usize) -> f64 {
-        let mut sig = 0.0;
-        let mut err = 0.0;
-        for i in skip..a.len().min(b.len()) {
-            let d = a[i] as f64 - b[i] as f64;
-            sig += a[i] as f64 * a[i] as f64;
-            err += d * d;
-        }
-        10.0 * (sig / err.max(1.0)).log10()
-    }
-
     /// SNR with best-lag alignment (the QMF contributes ~22 samples of delay).
     fn aligned_snr_db(a: &[i16], b: &[i16], max_lag: isize) -> (f64, isize) {
         let mut best_lag = 0isize;

@@ -9,6 +9,8 @@ Three ways to run:
 2. **Load-harness soak** — `CALLS=200 CONCURRENCY=20 ./demo/soak.sh` (N concurrent
    calls + latency report; see below).
 3. **B2BUA loopback call** — `./demo/run_loopback_demo.sh` (in-repo integration test).
+4. **Vendor trunk smoke** — `ZRTC_TRUNK_AUTH=digest ./demo/trunk_smoke.sh` (outbound
+   trunk auth modes against the local daemon; see below).
 
 ## Full-stack daemon demo (`./demo/run.sh`)
 
@@ -162,6 +164,7 @@ end-to-end scenario:
 | Full-stack daemon | `./demo/run.sh` | REGISTER + TCP/TLS/WSS listener probes + inbound & outbound calls + CDRs + pcap/traces |
 | Load-harness soak | `CALLS=200 CONCURRENCY=20 ./demo/soak.sh` | N concurrent calls through the full pipeline, setup-latency percentiles, CDR cross-check, panic gate |
 | B2BUA loopback call | `./demo/run_loopback_demo.sh` | Full SIP call + PCMU→PCMA transcoding + CDR trail |
+| Vendor trunk smoke | `ZRTC_TRUNK_AUTH=digest ./demo/trunk_smoke.sh` | Outbound call through the vendor trunk layer (`ip`/`digest`/`bearer`/`tls_client_cert`), optional REGISTER challenge path, CDR printed |
 | DTLS-SRTP handshake | `cargo test -p dtls --test handshake` | Real DTLS 1.2 over UDP, fingerprint pinning, key export, loss recovery, SRTP media roundtrip on the exported keys |
 | ICE agent pair | `cargo test -p ice --test integration` | Host-candidate gathering, connectivity checks, nomination, keepalives |
 | STUN server | `cargo test -p ice --lib server` | Binding request → XOR-MAPPED-ADDRESS oracle |

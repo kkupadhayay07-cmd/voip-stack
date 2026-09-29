@@ -10,10 +10,7 @@ criterion = { workspace = true }
 
 [dependencies]
 thiserror = { workspace = true }
-tracing = { workspace = true }
 opus = { workspace = true, optional = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 
 [features]
 default = ["opus"]

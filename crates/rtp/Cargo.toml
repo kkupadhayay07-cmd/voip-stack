@@ -7,8 +7,6 @@ description = "Native RTP/RTCP stack: RFC 3550/3551 packets, adaptive jitter buf
 
 [dependencies]
 bytes = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

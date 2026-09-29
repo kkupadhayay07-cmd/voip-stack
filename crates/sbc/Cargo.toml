@@ -8,9 +8,5 @@ description = "Session border controller: topology hiding, ACL, rate limiting, N
 [dependencies]
 observ = { workspace = true }
 sip-core = { workspace = true }
-tokio = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
-rand = { workspace = true }
 
 [dev-dependencies]

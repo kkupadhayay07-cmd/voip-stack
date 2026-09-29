@@ -6,9 +6,6 @@ license.workspace = true
 description = "Media pipeline: polyphase resampler, N-way conference mixer, WAV recorder, energy+zero-crossing VAD, DTMF gate"
 
 [dependencies]
-thiserror = { workspace = true }
-tracing = { workspace = true }
 codecs = { workspace = true }
 
 [dev-dependencies]
-rand = { workspace = true }

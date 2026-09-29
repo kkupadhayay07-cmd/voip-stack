@@ -51,16 +51,13 @@ name = "ai-bridge"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "futures-util",
  "media",
  "observ",
- "rand 0.8.8",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite 0.24.0",
- "tracing",
 ]
 
 [[package]]
@@ -91,15 +88,11 @@ dependencies = [
  "axum",
  "cdr",
  "dialer",
- "futures-util",
  "http-body-util",
- "mime",
  "serde",
  "serde_json",
- "thiserror 2.0.21",
  "tokio",
  "tower",
- "tracing",
 ]
 
 [[package]]
@@ -191,10 +184,8 @@ dependencies = [
  "rtp",
  "sdp",
  "serde",
- "serde_json",
  "sip-core",
  "sip-tx",
- "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -262,9 +253,7 @@ dependencies = [
  "observ",
  "serde",
  "serde_json",
- "thiserror 2.0.21",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -362,10 +351,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "opus",
- "serde",
- "serde_json",
  "thiserror 2.0.21",
- "tracing",
 ]
 
 [[package]]
@@ -481,10 +467,8 @@ name = "dialer"
 version = "0.1.0"
 dependencies = [
  "cdr",
- "rand 0.8.8",
  "thiserror 2.0.21",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -509,7 +493,6 @@ dependencies = [
  "srtp",
  "thiserror 2.0.21",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -821,10 +804,8 @@ dependencies = [
  "md-5",
  "rand 0.8.8",
  "sha1",
- "srtp",
  "thiserror 2.0.21",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -940,9 +921,6 @@ name = "media"
 version = "0.1.0"
 dependencies = [
  "codecs",
- "rand 0.8.8",
- "thiserror 2.0.21",
- "tracing",
 ]
 
 [[package]]
@@ -1165,11 +1143,7 @@ name = "proxy"
 version = "0.1.0"
 dependencies = [
  "observ",
- "rand 0.8.8",
  "sip-core",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1318,8 +1292,6 @@ dependencies = [
  "rand 0.8.8",
  "sip-core",
  "thiserror 2.0.21",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1328,8 +1300,6 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "criterion",
- "thiserror 2.0.21",
- "tracing",
 ]
 
 [[package]]
@@ -1358,11 +1328,7 @@ name = "sbc"
 version = "0.1.0"
 dependencies = [
  "observ",
- "rand 0.8.8",
  "sip-core",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
 ]
 
 [[package]]
