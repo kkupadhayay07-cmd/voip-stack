@@ -89,7 +89,7 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **503 passing** across 54 suites, `clippy -D warnings`
+`cargo test --workspace` → **512 passing** across 54 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
 **The external audit is fully closed**: every finding at every severity —

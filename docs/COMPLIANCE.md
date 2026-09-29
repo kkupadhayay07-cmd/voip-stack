@@ -21,7 +21,7 @@ hardening (IP4/IP6 `o=`/`c=` address types picked from the local host
 literal, RFC 8843 BUNDLE group echo with the accepted mids), a
 concurrent-call load harness with percentile reporting, and RTP loss
 recovery + congestion feedback (RFC 4585 Generic NACK, RFC 4588 RTX,
-transport-cc); 503 tests green
+transport-cc); 512 tests green
 across 54 suites — **every audit finding at every severity is fixed**).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
@@ -55,12 +55,12 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
 | RFC | Feature | Status | Notes |
 |-----|---------|--------|-------|
-| RFC 3550 | RTP/RTCP | **Done** | `rtp` crate: fixed-header parse/serialize; RTCP SR/RR/SDES/BYE/APP compound parse/encode; interarrival jitter estimator; SSRC probation. Padding round-trips byte-exactly (the padding bit is never emitted without its octets); the playout buffer is wrap-safe for both the 16-bit sequence and 32-bit timestamp spaces. |
+| RFC 3550 | RTP/RTCP | **Done** | `rtp` crate: fixed-header parse/serialize; RTCP SR/RR/SDES/BYE/APP compound parse/encode; interarrival jitter estimator; SSRC probation. Padding round-trips byte-exactly (the padding bit is never emitted without its octets); the playout buffer is wrap-safe for both the 16-bit sequence and 32-bit timestamp spaces. The B2BUA media pumps send periodic SRs (NTP 1900-epoch timestamps, TX packet/octet counts) carrying a reception report about the peer (fraction/cumulative loss, highest extended sequence, jitter, last-SR/DLSR). |
 | RFC 3551 | RTP/AVP profile | **Done** | Static payload types (0 PCMU, 8 PCMA, 9 G722, 18 G729, 13 CN, 100 telephone-event) + L16 (BE). |
 | RFC 3556 | SDP bandwidth modifiers | **Partial** | `b=` lines parsed/modelled; `TIAS` pacing semantics not applied. |
-| RFC 4585 | RTCP-based feedback | **Done (core)** | `rtp::nack`: Generic NACK `PID`/`BLP` FCI encode/parse (§6.2.1) + receiver-side gap tracker (extended sequences, repeat throttle, give-up limits, stream-restart guards); PLI/FIR still modelled as typed Psfb; REMB not implemented. |
+| RFC 4585 | RTCP-based feedback | **Done (core)** | `rtp::nack`: Generic NACK `PID`/`BLP` FCI encode/parse (§6.2.1) + receiver-side gap tracker (extended sequences, repeat throttle, give-up limits, stream-restart guards); **wired into the B2BUA**: legs that negotiate `a=rtcp-fb:<pt> nack` answer inbound NACKs verbatim from a 512-packet retransmission window (20 ms per-seq flood guard) and NACK the peer's gaps; PLI/FIR still modelled as typed Psfb (no B2BUA path); REMB not implemented. |
 | RFC 4588 | RTX retransmission | **Done (core)** | `rtp::nack`: sender `RtxPool` (bounded retransmission window), `RtxStream` packetizer (separate SSRC/PT + OSN payload prefix, CSRCs dropped per §4), receiver `RtxDepacketizer` restoring `apt` PT + original sequence; SSRC learning until pinned from SDP. |
-| transport-cc (draft-holmerberg-avt-01) | RTPFB FMT 15 congestion feedback | **Done (core)** | `rtp::twcc`: libwebrtc-compatible FCI encode/parse (run/vector chunks, small u8 + large i16 recv deltas at 250 µs, 64 ms reference time, feedback counter), receiver `TwccRxMonitor` (gap-marked arrival windows) and sender `TwccSendTracker` (per-packet delay + window loss correlation). |
+| transport-cc (draft-holmerberg-avt-01) | RTPFB FMT 15 congestion feedback | **Done (core)** | `rtp::twcc`: libwebrtc-compatible FCI encode/parse (run/vector chunks, small u8 + large i16 recv deltas at 250 µs, 64 ms reference time, feedback counter), receiver `TwccRxMonitor` (gap-marked arrival windows) and sender `TwccSendTracker` (per-packet delay + window loss correlation). **B2BUA receive side wired**: offers advertise the extmap (`id 1`, draft URI), answers echo it, and negotiated legs feed arrival times into `TwccRxMonitor` (1-byte seq unwrapped to u16) emitting RTPFB FMT 15 every 200 ms; sender-side extension attach on outbound RTP is the follow-up. |
 | RFC 4733 | RTP DTMF (telephone-event) | **Done** | Events 0–15 with start/end semantics + tests; relayed end-to-end by the B2BUA. |
 | RFC 5761 | RTP/RTCP demultiplexing | **Done** | §4 heuristic, unit-tested. |
 | RFC 8285 | RTP header extensions | **Done** | One-byte and two-byte blocks parse/serialize. |
@@ -134,7 +134,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **503 passing across 54 suites**.
+  `cargo test --workspace` → **512 passing across 54 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16 + §17.1/§17.3
   SRTCP AEAD), STUN (RFC 5769 §2.1/§2.2; MD5 long-term keys + MESSAGE-INTEGRITY
   against independent vectors), G.729 (bcg729 oracle), cross-decode by ffmpeg.

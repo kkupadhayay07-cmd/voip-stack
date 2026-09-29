@@ -1365,6 +1365,11 @@ impl B2bua {
                             te_pt_rx: pa.telephone_event_pt,
                             te_pt_tx: pa.telephone_event_pt,
                             tx_pt: pa.local_pt,
+                            // RTCP feedback channels negotiated on this leg
+                            // (the remote's offer/answer rtcp-fb + extmap).
+                            nack: pa.rtcp_fb_nack,
+                            twcc_ext: pa.twcc_ext_id,
+                            rtcp_interval_ms: 5_000,
                         };
                         let cfg_b = PumpConfig {
                             rx_codec: cb,
@@ -1373,6 +1378,9 @@ impl B2bua {
                             te_pt_rx: pb.telephone_event_pt,
                             te_pt_tx: pb.telephone_event_pt,
                             tx_pt: pb.local_pt,
+                            nack: pb.rtcp_fb_nack,
+                            twcc_ext: pb.twcc_ext_id,
+                            rtcp_interval_ms: 5_000,
                         };
                         // Cross-connect the pumps: A's decoded bridge PCM feeds
                         // B's encoder and vice versa.

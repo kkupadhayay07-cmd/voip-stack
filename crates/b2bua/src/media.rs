@@ -9,7 +9,11 @@ use bytes::Bytes;
 use codecs::{CodecId, Decoder, Encoder, Registry, Resampler};
 use rand::Rng;
 use rtp::jitter::{JitterBuffer, JitterConfig, PushResult};
+use rtp::nack::{nack_packet, nack_seqs, parse_nack_fci, NackTracker, RtxPool, RTX_POOL_DEFAULT};
 use rtp::packet::RtpPacket;
+use rtp::rtcp::{encode_compound, encode_packet, parse_compound, RtcpPacket, SenderInfo};
+use rtp::twcc::{twcc_packet, TwccRxMonitor};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
@@ -37,6 +41,15 @@ pub struct PumpConfig {
     pub te_pt_tx: Option<u8>,
     /// Payload type the remote expects for our TX codec.
     pub tx_pt: u8,
+    /// The peer advertised `a=rtcp-fb:<pt> nack` (RFC 4585): answer NACK
+    /// requests from the retransmission window and NACK the peer's gaps.
+    pub nack: bool,
+    /// Negotiated transport-cc header-extension id: track arrival times of
+    /// the extension's sequence numbers and emit RTCP transport-cc feedback
+    /// (draft-holmerberg wire form).
+    pub twcc_ext: Option<u8>,
+    /// Period of the RTCP sender report (ms; floored at 50 at use site).
+    pub rtcp_interval_ms: u64,
 }
 
 /// Handle for one running pump task.
@@ -55,6 +68,16 @@ pub struct MediaStats {
     pub packets_rx: std::sync::atomic::AtomicU64,
     pub packets_tx: std::sync::atomic::AtomicU64,
     pub packets_lost: std::sync::atomic::AtomicU64,
+    /// RTCP datagrams parsed (any packet type).
+    pub rtcp_rx: std::sync::atomic::AtomicU64,
+    /// Generic NACK requests received (RFC 4585 §6.2.1).
+    pub nacks_rx: std::sync::atomic::AtomicU64,
+    /// Generic NACK packets we sent (gap reports to the peer).
+    pub nacks_tx: std::sync::atomic::AtomicU64,
+    /// Media packets retransmitted to answer a NACK.
+    pub retransmits_tx: std::sync::atomic::AtomicU64,
+    /// NACKed sequences no longer in the retransmission window.
+    pub nack_misses: std::sync::atomic::AtomicU64,
 }
 
 impl MediaStats {
@@ -72,6 +95,21 @@ impl MediaStats {
     }
     pub fn packets_lost(&self) -> u64 {
         self.packets_lost.load(Relaxed)
+    }
+    pub fn rtcp_rx(&self) -> u64 {
+        self.rtcp_rx.load(Relaxed)
+    }
+    pub fn nacks_rx(&self) -> u64 {
+        self.nacks_rx.load(Relaxed)
+    }
+    pub fn nacks_tx(&self) -> u64 {
+        self.nacks_tx.load(Relaxed)
+    }
+    pub fn retransmits_tx(&self) -> u64 {
+        self.retransmits_tx.load(Relaxed)
+    }
+    pub fn nack_misses(&self) -> u64 {
+        self.nack_misses.load(Relaxed)
     }
 }
 
@@ -239,6 +277,32 @@ async fn run_pump(
     let ssrc: u32 = rand::thread_rng().gen();
     let ts_inc = (frame_pcm * u64::from(tx_clock) / u64::from(enc.sample_rate())).max(1) as u32;
 
+    // RTCP channel state (RFC 3550 SR/RR + RFC 4585 NACK + transport-cc).
+    let mut resend = RtxPool::new(RTX_POOL_DEFAULT);
+    let mut nack_tracker = NackTracker::default();
+    let mut twcc = TwccRxMonitor::new(1024);
+    let mut twcc_fb_count: u8 = 0;
+    // Unwrapped 16-bit view of the 1-byte transport-cc sequence numbers.
+    let mut twcc_ext_seq: Option<u16> = None;
+    let mut remote_ssrc: Option<u32> = None;
+    let mut tx_pkts: u64 = 0;
+    let mut tx_octets: u64 = 0;
+    let mut report_lost: u64 = 0;
+    let mut report_rx: u64 = 0;
+    // (NTP middle 32 bits of the peer's last SR, arrival instant)
+    let mut last_sr: Option<(u32, Instant)> = None;
+    let mut retransmit_guard: HashMap<u16, Instant> = HashMap::new();
+
+    let rtcp_period = Duration::from_millis(cfg.rtcp_interval_ms.max(50));
+    let mut rtcp_tick =
+        tokio::time::interval_at(tokio::time::Instant::now() + rtcp_period, rtcp_period);
+    rtcp_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut twcc_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_millis(200),
+        Duration::from_millis(200),
+    );
+    twcc_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             _ = stop.changed() => break,
@@ -254,12 +318,96 @@ async fn run_pump(
                     concealed: stats.frames_concealed(),
                 });
             }
+            _ = rtcp_tick.tick() => {
+                // RFC 3550 §6: periodic SR carrying our TX bookkeeping plus
+                // a reception report about the peer's stream (the RR blocks
+                // ride inside the SR). Sent only once a remote is learned.
+                let dst = *remote.lock().await;
+                let Some(dst) = dst else { continue };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let ntp_sec = (now.as_secs().wrapping_add(2_208_988_800)) as u32;
+                let ntp_frac = ((u64::from(now.subsec_nanos()) << 32) / 1_000_000_000) as u32;
+                let mut blocks = Vec::new();
+                if let Some(rssrc) = remote_ssrc {
+                    let lost_now = jb.stats.packets_lost;
+                    let rx_now = stats.packets_rx();
+                    let (d_lost, d_rx) = (lost_now.saturating_sub(report_lost), rx_now.saturating_sub(report_rx));
+                    let fraction = (d_lost * 256)
+                        .checked_div(d_lost + d_rx)
+                        .unwrap_or(0)
+                        .min(255) as u8;
+                    let (last_sr_mid, dlsr) = match last_sr {
+                        Some((mid, t)) => {
+                            let el = t.elapsed();
+                            (mid, (el.as_secs() * 65536 + u64::from(el.subsec_millis()) * 65 + 50) as u32)
+                        }
+                        None => (0, 0),
+                    };
+                    let highest = nack_tracker.highest_extended();
+                    blocks.push(rtp::rtcp::ReportBlock {
+                        ssrc: rssrc,
+                        fraction_lost: fraction,
+                        cumulative_lost: lost_now.min(0x00FF_FFFF) as u32,
+                        highest_sequence: if highest < 0 { 0 } else { (highest as u64 & 0xFFFF_FFFF) as u32 },
+                        interarrival_jitter: ((jb.jitter_ms() as u64 * u64::from(rx_clock)) / 1000).min(u64::from(u32::MAX)) as u32,
+                        last_sr: last_sr_mid,
+                        delay_since_last_sr: dlsr,
+                    });
+                    report_lost = lost_now;
+                    report_rx = rx_now;
+                }
+                let sr = RtcpPacket::SenderReport(
+                    SenderInfo {
+                        ssrc,
+                        ntp_sec,
+                        ntp_frac,
+                        rtp_timestamp: out_ts,
+                        packet_count: tx_pkts.min(u64::from(u32::MAX)) as u32,
+                        octet_count: tx_octets.min(u64::from(u32::MAX)) as u32,
+                    },
+                    blocks,
+                );
+                let wire = encode_compound(&[sr]);
+                let _ = rtp.send_to(&wire, dst).await;
+            }
+            _ = twcc_tick.tick() => {
+                // draft-holmerberg transport-cc: drain the arrival window
+                // into an RTPFB fmt 15 feedback packet every 200 ms.
+                if cfg.twcc_ext.is_some() {
+                    let dst = *remote.lock().await;
+                    if let (Some(dst), Some(rssrc)) = (dst, remote_ssrc) {
+                        if let Some(fb) = twcc.build_feedback(ssrc, rssrc, twcc_fb_count) {
+                            twcc_fb_count = twcc_fb_count.wrapping_add(1);
+                            if let Ok(p) = twcc_packet(&fb) {
+                                let _ = rtp.send_to(&encode_packet(&p), dst).await;
+                            }
+                        }
+                    }
+                }
+            }
             r = rtp.recv_from(&mut buf) => {
                 let (n, src) = match r {
                     Ok(x) => x,
                     Err(e) => { tracing::debug!("media recv err: {e}"); continue; }
                 };
-                if rtp::looks_like_rtcp(&buf[..n]) { continue; }
+                if rtp::looks_like_rtcp(&buf[..n]) {
+                    // RFC 3550 §7.1 + RFC 4585: NACK requests pull media
+                    // packets back out of the retransmission window; SRs
+                    // feed our DLSR/last_sr fields.
+                    handle_rtcp(
+                        &buf[..n],
+                        src,
+                        &rtp,
+                        &resend,
+                        &mut retransmit_guard,
+                        &mut last_sr,
+                        &stats,
+                    )
+                    .await;
+                    continue;
+                }
                 let Ok(pkt) = RtpPacket::parse(&buf[..n]) else { continue };
                 stats.packets_rx.fetch_add(1, Relaxed);
                 // media hook: RTP packet tap
@@ -268,6 +416,38 @@ async fn run_pump(
                     let mut r = remote.lock().await;
                     if r.is_none_or(|a| a != src) {
                         *r = Some(src);
+                    }
+                }
+                if remote_ssrc.is_none() {
+                    remote_ssrc = Some(pkt.ssrc());
+                }
+                // NACK tracking runs for every accepted media packet (DTMF
+                // included — same SSRC stream) so extended-sequence state and
+                // wrap cycles stay correct even when sends are disabled.
+                let now_ms = started.elapsed().as_millis() as u64;
+                nack_tracker.on_packet(pkt.ssrc(), pkt.header.sequence, now_ms);
+                if cfg.nack {
+                    let ready = nack_tracker.take_ready(now_ms);
+                    if !ready.is_empty() {
+                        stats.nacks_tx.fetch_add(ready.len() as u64, Relaxed);
+                        let p = nack_packet(ssrc, pkt.ssrc(), &ready);
+                        let _ = rtp.send_to(&encode_packet(&p), src).await;
+                    }
+                }
+                if let (Some(ext_id), Some(ext)) = (cfg.twcc_ext, pkt.extension.as_ref()) {
+                    if let Some(tseq) = onebyte_ext_value(ext, ext_id) {
+                        // The draft's sequence number is one byte wide (mod
+                        // 256); unwrap it into the u16 space the monitor and
+                        // the feedback encoding use.
+                        let unwrapped = match twcc_ext_seq {
+                            None => u16::from(tseq),
+                            Some(last) => {
+                                let d = tseq.wrapping_sub(last as u8) as i8;
+                                last.wrapping_add(d as u16)
+                            }
+                        };
+                        twcc_ext_seq = Some(unwrapped);
+                        twcc.on_packet(unwrapped, Some(started.elapsed().as_micros() as u64));
                     }
                 }
                 // RFC 4733 DTMF passthrough: the event crosses the bridge
@@ -364,6 +544,9 @@ async fn run_pump(
                             Bytes::from(payload),
                         );
                         out_seq = out_seq.wrapping_add(1);
+                        tx_pkts += 1;
+                        tx_octets += relay.payload.len() as u64;
+                        resend.store(&relay);
                         let dst = *remote.lock().await;
                         if let Some(dst) = dst {
                             // media hook: DTMF relay tap
@@ -390,6 +573,9 @@ async fn run_pump(
                                 out_seq = out_seq.wrapping_add(1);
                                 out_ts = out_ts.wrapping_add(ts_inc);
                                 stats.frames_encoded.fetch_add(1, Relaxed);
+                                tx_pkts += 1;
+                                tx_octets += pkt.payload.len() as u64;
+                                resend.store(&pkt);
                                 let dst = *remote.lock().await;
                                 if let Some(dst) = dst {
                                     // media hook: encoded frame tap
@@ -424,4 +610,351 @@ async fn run_pump(
         stats.frames_encoded(),
         stats.frames_concealed()
     );
+}
+
+/// Answer an incoming RTCP datagram: Generic NACK requests pull media
+/// packets back out of the retransmission window (verbatim — same seq, PT
+/// and SSRC as the original transmission; RFC 4585 §6.2.1 non-RTX form);
+/// the peer's SR feeds our `last_sr`/DLSR bookkeeping.
+async fn handle_rtcp(
+    wire: &[u8],
+    src: SocketAddr,
+    rtp: &UdpSocket,
+    resend: &RtxPool,
+    guard: &mut HashMap<u16, Instant>,
+    last_sr: &mut Option<(u32, Instant)>,
+    stats: &MediaStats,
+) {
+    let Ok(packets) = parse_compound(wire) else {
+        return;
+    };
+    for p in packets {
+        stats.rtcp_rx.fetch_add(1, Relaxed);
+        match p {
+            RtcpPacket::SenderReport(info, _) => {
+                let mid =
+                    ((u64::from(info.ntp_sec) & 0xFFFF) << 16) | u64::from(info.ntp_frac >> 16);
+                *last_sr = Some((mid as u32, Instant::now()));
+            }
+            RtcpPacket::Rtpfb {
+                fmt: 1, payload, ..
+            } => {
+                stats.nacks_rx.fetch_add(1, Relaxed);
+                let Ok(entries) = parse_nack_fci(&payload) else {
+                    continue;
+                };
+                for seq in nack_seqs(&entries) {
+                    // Throttle: at most one retransmission per sequence per
+                    // 20 ms so repeated NACKs cannot flood the leg.
+                    if guard
+                        .get(&seq)
+                        .is_some_and(|t| t.elapsed() < Duration::from_millis(20))
+                    {
+                        continue;
+                    }
+                    if guard.len() > 1024 {
+                        guard.clear();
+                    }
+                    guard.insert(seq, Instant::now());
+                    if let Some(orig) = resend.get(seq) {
+                        let wire = orig.encode();
+                        stats.retransmits_tx.fetch_add(1, Relaxed);
+                        let _ = rtp.send_to(&wire, src).await;
+                    } else {
+                        stats.nack_misses.fetch_add(1, Relaxed);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Extract a one-byte-header extension element value (RFC 8285 §4.2) by id.
+/// Transport-cc sequence numbers are 1-byte elements; returns their payload
+/// byte. `id == 0` starts padding, `id == 15` is reserved — both end the scan.
+fn onebyte_ext_value(ext: &rtp::packet::RtpExtension, want_id: u8) -> Option<u8> {
+    if ext.profile != 0xBEDE {
+        return None;
+    }
+    let d = &ext.data;
+    let mut off = 0usize;
+    while off < d.len() {
+        let b = d[off];
+        if b == 0 {
+            break; // padding to the 4-byte boundary
+        }
+        let id = b >> 4;
+        let data_len = usize::from(b & 0x0F) + 1;
+        if id == 15 {
+            break;
+        }
+        if id == want_id && data_len == 1 && off + 1 < d.len() {
+            return Some(d[off + 1]);
+        }
+        off += 1 + data_len;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtp::nack::{nack_packet, GenericNack};
+    use rtp::packet::RtpExtension;
+
+    fn pump_cfg() -> PumpConfig {
+        PumpConfig {
+            rx_codec: CodecId::Pcmu,
+            tx_codec: CodecId::Pcmu,
+            rx_pt: 0,
+            te_pt_rx: None,
+            te_pt_tx: None,
+            tx_pt: 0,
+            nack: false,
+            twcc_ext: None,
+            rtcp_interval_ms: 60_000,
+        }
+    }
+
+    fn media_pkt(seq: u16, ssrc: u32) -> RtpPacket {
+        RtpPacket::new(
+            0,
+            seq,
+            1000 * u32::from(seq),
+            ssrc,
+            false,
+            Bytes::from_static(b"audio-payload"),
+        )
+    }
+
+    fn ext_pkt(seq: u16, ssrc: u32, twcc_seq: u8) -> Vec<u8> {
+        let mut p = media_pkt(seq, ssrc);
+        p.extension = Some(RtpExtension {
+            profile: 0xBEDE,
+            // id 1, 1-byte data (transport-cc seq), zero-padded to a word.
+            data: Bytes::from(vec![0x10, twcc_seq, 0, 0]),
+        });
+        p.encode()
+    }
+
+    /// Next datagram that looks like media (RTCP filtered out).
+    async fn recv_media(sock: &UdpSocket) -> Vec<u8> {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+                .await
+                .expect("media packet within 5 s")
+                .expect("recv ok");
+            if !rtp::looks_like_rtcp(&buf[..n]) {
+                return buf[..n].to_vec();
+            }
+        }
+    }
+
+    /// Next datagram that parses as a compound RTCP packet set.
+    async fn recv_rtcp(sock: &UdpSocket) -> Vec<RtcpPacket> {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+                .await
+                .expect("rtcp packet within 5 s")
+                .expect("recv ok");
+            if rtp::looks_like_rtcp(&buf[..n]) {
+                return parse_compound(&buf[..n]).unwrap();
+            }
+        }
+    }
+
+    struct TestPump {
+        test: Arc<UdpSocket>,
+        pump_addr: SocketAddr,
+        in_tx: mpsc::Sender<BridgeMsg>,
+        handle: PumpHandle,
+    }
+
+    async fn start(cfg: PumpConfig) -> TestPump {
+        let test = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let pump_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let pump_addr = pump_sock.local_addr().unwrap();
+        let (out_tx, _out_rx) = mpsc::channel(64);
+        let (in_tx, in_rx) = mpsc::channel(64);
+        let handle = start_with_socket(cfg, pump_sock, out_tx, in_rx).unwrap();
+        *handle.remote.lock().await = Some(test.local_addr().unwrap());
+        TestPump {
+            test,
+            pump_addr,
+            in_tx,
+            handle,
+        }
+    }
+
+    #[test]
+    fn onebyte_ext_extraction_matches_id_and_profile() {
+        let ext = RtpExtension {
+            profile: 0xBEDE,
+            data: Bytes::from(vec![0x10, 0x7F, 0, 0]),
+        };
+        assert_eq!(onebyte_ext_value(&ext, 1), Some(0x7F));
+        assert_eq!(onebyte_ext_value(&ext, 2), None);
+        // Wrong profile (two-byte space) → never matches.
+        let wrong = RtpExtension {
+            profile: 0x1000,
+            data: ext.data.clone(),
+        };
+        assert_eq!(onebyte_ext_value(&wrong, 1), None);
+        // Padding terminates the scan.
+        let padded = RtpExtension {
+            profile: 0xBEDE,
+            data: Bytes::from(vec![0x00, 0x10, 0x33]),
+        };
+        assert_eq!(onebyte_ext_value(&padded, 1), None);
+    }
+
+    #[tokio::test]
+    async fn pump_answers_nack_from_retransmit_window() {
+        let mut cfg = pump_cfg();
+        cfg.nack = true;
+        let tp = start(cfg).await;
+
+        // Drive TX: the bridge domain is 16 kHz, resampled 16000→8000 for
+        // PCMU. One large chunk (100 ms) survives the polyphase resampler's
+        // group delay and yields several full 20 ms frames.
+        tp.in_tx
+            .send(BridgeMsg::Pcm(vec![0i16; 1600]))
+            .await
+            .unwrap();
+        let w1 = recv_media(&tp.test).await;
+        let w2 = recv_media(&tp.test).await;
+        let q1 = RtpPacket::parse(&w1).unwrap();
+        let q2 = RtpPacket::parse(&w2).unwrap();
+        assert_eq!(q2.header.sequence, q1.header.sequence.wrapping_add(1));
+        assert!(tp.handle.stats.frames_encoded() >= 2);
+
+        // Drain the remainder of the initial burst so the next datagram is
+        // guaranteed to be the NACK-triggered retransmission.
+        let mut drain = vec![0u8; 2048];
+        while tp.test.try_recv_from(&mut drain).is_ok() {}
+
+        // NACK the first packet; the pump must re-send it verbatim.
+        let nack = nack_packet(
+            0x999,
+            q1.ssrc(),
+            &[GenericNack {
+                pid: q1.header.sequence,
+                blp: 0,
+            }],
+        );
+        tp.test
+            .send_to(&encode_packet(&nack), tp.pump_addr)
+            .await
+            .unwrap();
+        let again = recv_media(&tp.test).await;
+        let rq = RtpPacket::parse(&again).unwrap();
+        assert_eq!(rq.header.sequence, q1.header.sequence);
+        assert_eq!(rq.payload, q1.payload);
+        assert_eq!(tp.handle.stats.retransmits_tx(), 1);
+        assert_eq!(tp.handle.stats.nacks_rx(), 1);
+        tp.handle.stop.send(true).ok();
+    }
+
+    #[tokio::test]
+    async fn pump_nacks_gaps_and_reports_periodically() {
+        let mut cfg = pump_cfg();
+        cfg.nack = true;
+        cfg.rtcp_interval_ms = 60;
+        let tp = start(cfg).await;
+
+        // A gap: 100 arrives, 101/102 are lost, 103 arrives.
+        for seq in [100u16, 103] {
+            let w = media_pkt(seq, 0x555).encode();
+            tp.test.send_to(&w, tp.pump_addr).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut saw_nack = false;
+        let mut saw_sr = false;
+        for _ in 0..12 {
+            for pkt in recv_rtcp(&tp.test).await {
+                match pkt {
+                    RtcpPacket::Rtpfb {
+                        fmt: 1,
+                        media_ssrc,
+                        payload,
+                        ..
+                    } => {
+                        assert_eq!(media_ssrc, 0x555);
+                        let seqs = nack_seqs(&parse_nack_fci(&payload).unwrap());
+                        assert!(
+                            seqs.contains(&101) && seqs.contains(&102),
+                            "gap not reported: {seqs:?}"
+                        );
+                        saw_nack = true;
+                    }
+                    RtcpPacket::SenderReport(info, blocks) => {
+                        assert_eq!(blocks.len(), 1, "RR block about the peer");
+                        assert_eq!(blocks[0].ssrc, 0x555);
+                        assert!(info.ntp_sec > 2_208_988_800, "NTP epoch 1900");
+                        saw_sr = true;
+                    }
+                    _ => {}
+                }
+            }
+            if saw_nack && saw_sr {
+                break;
+            }
+        }
+        assert!(saw_nack, "expected a Generic NACK for the gap");
+        assert!(saw_sr, "expected a periodic SenderReport");
+        assert!(tp.handle.stats.nacks_tx() >= 1);
+        tp.handle.stop.send(true).ok();
+    }
+
+    #[tokio::test]
+    async fn pump_sends_twcc_feedback_for_negotiated_ext() {
+        let mut cfg = pump_cfg();
+        cfg.twcc_ext = Some(1);
+        let tp = start(cfg).await;
+
+        for i in 0..4u8 {
+            let w = ext_pkt(200 + u16::from(i), 0x777, 10 + i);
+            tp.test.send_to(&w, tp.pump_addr).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut saw_twcc = false;
+        for _ in 0..12 {
+            for pkt in recv_rtcp(&tp.test).await {
+                if let RtcpPacket::Rtpfb {
+                    fmt, media_ssrc, ..
+                } = pkt
+                {
+                    if fmt == 15 {
+                        assert_eq!(media_ssrc, 0x777);
+                        saw_twcc = true;
+                    }
+                }
+            }
+            if saw_twcc {
+                break;
+            }
+        }
+        assert!(saw_twcc, "expected transport-cc feedback");
+        tp.handle.stop.send(true).ok();
+    }
+
+    #[tokio::test]
+    async fn pump_without_negotiation_stays_rtcp_silent() {
+        // No nack, no twcc, long SR period: media packets must NOT trigger
+        // any feedback toward the peer (gaps are handled by PLC alone).
+        let tp = start(pump_cfg()).await;
+        for seq in [50u16, 55] {
+            let w = media_pkt(seq, 0x333).encode();
+            tp.test.send_to(&w, tp.pump_addr).await.unwrap();
+        }
+        // The first SR fires only after a full period (60 s): a short wait
+        // confirms gap detection alone emits nothing.
+        let mut buf = vec![0u8; 2048];
+        let r = tokio::time::timeout(Duration::from_millis(300), tp.test.recv_from(&mut buf)).await;
+        assert!(r.is_err(), "unexpected packet on an unnegotiated leg");
+        tp.handle.stop.send(true).ok();
+    }
 }

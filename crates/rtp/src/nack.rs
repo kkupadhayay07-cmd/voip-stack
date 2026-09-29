@@ -140,6 +140,12 @@ pub struct NackTracker {
     missing: BTreeMap<i64, Missing>,
 }
 
+impl Default for NackTracker {
+    fn default() -> Self {
+        NackTracker::new(NackConfig::default())
+    }
+}
+
 impl NackTracker {
     pub fn new(cfg: NackConfig) -> NackTracker {
         NackTracker {
@@ -260,6 +266,13 @@ impl NackTracker {
     pub fn is_missing(&self, seq: u16) -> bool {
         let ext = self.extend(seq);
         self.missing.contains_key(&ext)
+    }
+
+    /// Highest extended sequence observed (−1 before the first packet) —
+    /// the value an RTCP receiver report's `highest_sequence` field carries
+    /// (cycles in the upper 16 bits, wire sequence in the lower 16).
+    pub fn highest_extended(&self) -> i64 {
+        self.highest_ext
     }
 }
 
@@ -646,6 +659,16 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].sequence(), 2);
         assert_eq!(got[1].sequence(), 3);
+    }
+
+    #[test]
+    fn highest_extended_tracks_wrap_cycles() {
+        let mut t = NackTracker::default();
+        assert_eq!(t.highest_extended(), -1, "nothing observed yet");
+        t.on_packet(0xAA, 65534, 0);
+        assert_eq!(t.highest_extended(), 65534);
+        t.on_packet(0xAA, 1, 1); // wrap: extended = 65537
+        assert_eq!(t.highest_extended(), 65537);
     }
 
     #[test]

@@ -159,9 +159,10 @@ addendum records what landed since, so the document stays honest.
 | SDP IPv6 + BUNDLE | Answer hardening in `sdp::negotiate`: the answer's `o=`/`c=` lines pick `IN IP4`/`IN IP6` from the local host literal (RFC 8866 §4.4 — a v6 address is never mislabeled IP4, hostnames stay IP4, the offer's family never dictates the answer's); RFC 8843 §6.2/§7.1.1 BUNDLE group echo — an answer to a bundled offer carries `a=group:BUNDLE` with exactly the accepted mids in the offer group's order, rejected (port 0) m-lines and mid-less m-lines never join the group, answers to unbundled offers stay group-free; 6 new tests |
 | Load harness | `zrtc load` — concurrent UAC call generator driving the full pipeline (listener → SBC → proxy → B2BUA → sink → paced RTP): `--calls`/`--concurrency`/`--pace-ms`, per-call INVITE→200 setup metric (`uac::run_call` → `PlacedCall`), summary report (mean/p50/p95/p99/max, calls-per-second, mean call hold, deduplicated failure breakdown), `--json` single-line output; `demo/soak.sh` wraps it with a port pre-flight, daemon CDR cross-check and panic gate. Unit tests cover the stats math; the loop is exercised by the soak. Sandbox baseline (2 vCPU, debug build): 200 calls at concurrency 20 → 200/200 answered, setup p50 116 ms / p95 305 ms; release/8-core soak is the documented follow-up |
 | Loss recovery + congestion feedback | `rtp::nack` — RTCP Generic NACK (RFC 4585 §6.2.1): typed `PID`/`BLP` FCI encode/parse with expansion, receiver `NackTracker` (wraparound-safe extended sequences, gap detection, repeat throttling, give-up by age/count, stream-restart + jump guards, ≤16-packet BLP batching); RFC 4588 RTX: sender `RtxPool` (bounded window) + `RtxStream` packetizer (own SSRC/PT/seq, OSN payload prefix, CSRCs dropped) + receiver `RtxDepacketizer` (apt PT + OSN restore, SSRC learning until pinned). `rtp::twcc` — transport-cc feedback (RTPFB FMT 15, draft-holmerberg / libwebrtc wire form): run/vector chunk encode + parse (250 µs recv deltas small/large, 64 ms reference time, feedback counter), receiver `TwccRxMonitor` (gap-marked windows, 64 ms reference floor, bounded memory) and sender `TwccSendTracker` (per-packet delay, window loss, max/mean delay); 23 new tests |
+| B2BUA RTCP plumbing + M1 verified | The media pump now speaks RTCP on every leg: periodic SR (NTP 1900-epoch timestamps, TX packet/octet counters) carrying an RR block about the peer (fraction/cumulative loss, highest extended sequence via the new `NackTracker::highest_extended`, jitter, last-SR/DLSR); RFC 4585 Generic NACK both directions — jitter-buffer gaps produce NACKs through the repeat-throttled tracker, inbound NACKs pull verbatim packets from a 512-packet `RtxPool` retransmission window guarded by a 20 ms per-seq flood limiter (counters: `nacks_rx/tx`, `retransmits_tx`, `nack_misses`, `rtcp_rx`); transport-cc arrival feedback every 200 ms on negotiated legs (1-byte ext seq unwrapped to u16); `sdp::negotiate` answers now echo the offer's `rtcp-fb` list per accepted payload (§4.2) and the transport-cc extmap (RFC 8285 §6), `StreamPlan` carries `rtcp_fb_nack`/`twcc_ext_id`, and offers advertise the channels; pumps enable only what the leg negotiated (unnegotiated legs stay RTCP-silent). 9 new tests (rtp 69→70, sdp 28→30, b2bua 28→33). **VISION M1 checkpoint verified in the same session**: `cargo test --workspace --release` → 503/0 (pre-sweep baseline, well above the 400+ gate) |
 | Dependency hygiene sweep | 36 unused `[dependencies]`/`[dev-dependencies]` entries removed across 14 crates (proxy/registrar/sbc carried `tokio` they never touched, slim crates held `thiserror`/`tracing`/`rand` with zero call sites, ai-bridge/api held `futures-util`, api a stray `mime` dev-dep, ice a stray `srtp` dev-dep); the never-referenced workspace `async-trait` entry dropped; `cdr` unified onto the workspace `uuid` entry (was a divergent direct version); two dead test-only `snr_db` helpers (superseded by `aligned_snr_db`) deleted from g722/opus; 503/54 gates + demo unchanged |
 
-**Current baseline (supersedes the header numbers):** 19 crates, **503 tests
+**Current baseline (supersedes the header numbers):** 19 crates, **512 tests
 across 54 suites**, `clippy -D warnings` clean, `cargo audit` clean. The
 external audit is fully closed at every severity — Critical, High and the
 complete P2 backlog — with regression tests
@@ -171,9 +172,12 @@ complete P2 backlog — with regression tests
 item 2 (service assembly binary) ✅ done as `zrtc`; item 6 PRACK/100rel ✅
 done; the load harness ✅ shipped (`zrtc load` + `demo/soak.sh`, debug-build
 sandbox baseline published); WebRTC hardening library layer ✅ done (RFC 4585
-NACK, RFC 4588 RTX, transport-cc in `rtp`). Remaining: release-mode soak on 8-core
-hardware, Postgres CDR backend, B2BUA RTCP plumbing +
-data channels, SDP hardening (rejected m-lines, port-0
+NACK, RFC 4588 RTX, transport-cc in `rtp`) and B2BUA RTCP plumbing ✅ done
+(SR/RR + NACK answer/ask + TWCC feedback live on every media leg);
+**VISION M1 checkpoint ✅ verified** (`cargo test --workspace --release`,
+503/0 pre-sweep). Remaining: release-mode soak on 8-core
+hardware, Postgres CDR backend, data channels (SCTP), sender-side
+transport-cc extension attach, SDP hardening (rejected m-lines, port-0
 answers, the §6.1 direction clamp, IPv6 answer address types and RFC 8843
 BUNDLE group echo ✅ done), GRUU/Outbound,
 NAPTR/SRV — see README "Roadmap (next)".

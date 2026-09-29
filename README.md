@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 503 tests passing across 54 suites in 19 crates;
+**Current state: 512 tests passing across 54 suites in 19 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
@@ -28,7 +28,7 @@ finding is fixed with regression tests
 | `crates/sdp` | RFC 4566/8866 SDP parser/serializer + RFC 3264 offer/answer engine (`StreamPlan` projection) | **Done** |
 | `crates/rtp` | RTP/RTCP (RFC 3550/3551), adaptive jitter buffer + PLC, loss recovery (RFC 4585 Generic NACK + RFC 4588 RTX), transport-cc congestion feedback, RFC 4733 DTMF, RFC 5761 demux, RFC 8285 extensions, RTCP feedback (PLI/FIR) | **Done** |
 | `crates/codecs` | Full codec suite: **Opus, PCMU, PCMA, G.722, G.729, telephone-event**, L16, CN (RFC 3389), PLC, resampler; G.729 validated against bcg729 oracle vectors | **Done** |
-| `crates/b2bua` | B2BUA call engine: dual-leg SIP driven by `sip-tx` transactions, SDP offer/answer both legs, cross-connected media pumps with 16 kHz transcode bridge (any codec pair), DTMF relay, RFC 4028 session timers, RFC 3262 reliable 1xx + PRACK both legs, CDR events, `b2bua-demo` binary, full-loopback integration test | **Done** |
+| `crates/b2bua` | B2BUA call engine: dual-leg SIP driven by `sip-tx` transactions, SDP offer/answer both legs, cross-connected media pumps with 16 kHz transcode bridge (any codec pair), DTMF relay, RTCP channel per leg (RFC 3550 SR/RR, RFC 4585 NACK answer + ask, transport-cc arrival feedback), RFC 4028 session timers, RFC 3262 reliable 1xx + PRACK both legs, CDR events, `b2bua-demo` binary, full-loopback integration test | **Done** |
 | `crates/srtp` | RFC 3711 (AES-CM + HMAC-SHA1, KDF, replay window, ROC estimation) + RFC 7714 AES-GCM AEAD; validated against RFC 3711 B.2/B.3 and RFC 7714 §16 vectors | **Done** |
 | `crates/dtls` | DTLS-SRTP (RFC 5764/6347) via whitelisted OpenSSL: runtime self-signed ECDSA P-256 certs, RFC 8122 fingerprint pinning, use_srtp negotiation, RFC 5764 §4.2 key export, flight retransmission | **Done** |
 | `crates/ice` | RFC 5389 STUN codec (RFC 5769 vectors), RFC 8445 ICE agent (host/srflx/relay gathering, connectivity checks, nomination), RFC 5766 TURN server (long-term auth, permissions, Send/Data, ChannelBind) | **Done** |
@@ -49,7 +49,7 @@ finding is fixed with regression tests
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 503 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 512 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -135,7 +135,18 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
   libwebrtc-compatible chunk/delta encoding with run-length loss
   compression, receiver monitor + sender delay/loss tracker) — the
   building blocks for talking to browser media stacks; the B2BUA's RTCP
-  channel plumbing is the follow-up.
+  channel; **now wired into the live B2BUA** (see below).
+* **B2BUA RTCP plumbing**: every media pump now speaks RTCP on its leg —
+  periodic SR (NTP- timestamped, TX packet/octet counters) carrying a
+  reception report about the peer (fraction/cumulative loss, highest
+  extended sequence, jitter, DLSR against the peer's last SR); RFC 4585
+  Generic NACK in both directions (gaps in the jitter buffer produce NACKs
+  via the repeat-throttled tracker; inbound NACKs pull verbatim packets out
+  of a 512-packet retransmission window with a 20 ms per-seq flood guard);
+  transport-cc arrival feedback every 200 ms when the draft-holmerberg
+  extension is negotiated; offers advertise `rtcp-fb nack`/`transport-cc`
+  + the extmap, answers echo the negotiation, and pumps enable only what
+  the leg negotiated.
 * **Dependency hygiene sweep**: 36 unused `[dependencies]`/`[dev-dependencies]`
   entries removed across 14 crates (e.g. the pure-std `proxy` state machine
   carried `tokio`/`rand` for nothing), the never-referenced workspace
@@ -176,8 +187,10 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
    the optimized-build numbers next.
 3. Postgres CDR persistence (sqlx) + retention policies.
 4. WebRTC hardening — library layer ✅ (RFC 4585 NACK, RFC 4588 RTX,
-   transport-cc feedback in `crates/rtp`); remaining: wire NACK/TWCC into
-   the B2BUA's RTCP channels, data channels (SCTP).
+   transport-cc feedback in `crates/rtp`) **and B2BUA RTCP plumbing ✅**
+   (SR/RR + NACK answer/ask + TWCC feedback live on every media leg);
+   remaining: data channels (SCTP), sender-side transport-cc extension
+   attach.
 5. SDP hardening — rejected m-lines, port-0 offers, RFC 3264 §6.1 direction
    clamp, extras serialization, **IPv6 answer address types and RFC 8843
    BUNDLE group echo done**; remaining: GRUU/Outbound, NAPTR/SRV for

@@ -2,11 +2,15 @@
 
 use codecs::{CodecId, FormatInfo, Registry};
 use sdp::negotiate::{answer_session, CodecCap, MediaCaps, NegotiateError, StreamPlan};
-use sdp::types::{Attribute, Connection, MediaDescription, Origin, Session, Timing};
+use sdp::types::{Attribute, Connection, ExtMap, MediaDescription, Origin, Session, Timing};
 
 /// Payload types we advertise for dynamic codecs.
 pub const PT_OPUS: u8 = 111;
 pub const PT_TELEPHONE_EVENT: u8 = 101;
+
+/// transport-cc header-extension wire id we offer (draft-holmerberg form).
+const TWCC_EXT_ID: u8 = 1;
+const TWCC_URI: &str = "http://www.ietf.org/id/draft-holmerberg-avt-01";
 
 /// Looks up the static `FormatInfo` for a codec (name/clock/channels).
 pub fn format(id: CodecId) -> FormatInfo {
@@ -95,6 +99,29 @@ pub fn build_offer(host: &str, port: u16, codecs: &[CodecId], sess_id: u32) -> S
     ));
     attrs.push(Attribute::new("sendrecv", None));
 
+    // RTCP feedback we implement, advertised per RFC 4585 §4.2 for every
+    // audio payload: Generic NACK (loss recovery) and transport-cc
+    // (congestion feedback), plus the transport-cc header extension the
+    // receiver-side feedback keys on (RFC 8285 one-byte element).
+    let mut rtcp_fb: std::collections::BTreeMap<u8, Vec<String>> = Default::default();
+    for pt in &pts {
+        if let Ok(pt) = pt.parse::<u8>() {
+            if pt == PT_TELEPHONE_EVENT {
+                continue;
+            }
+            rtcp_fb.insert(pt, vec!["nack".into(), "transport-cc".into()]);
+            attrs.push(Attribute::new("rtcp-fb", Some(format!("{pt} nack"))));
+            attrs.push(Attribute::new(
+                "rtcp-fb",
+                Some(format!("{pt} transport-cc")),
+            ));
+        }
+    }
+    attrs.push(Attribute::new(
+        "extmap",
+        Some(format!("{TWCC_EXT_ID} {TWCC_URI} transport-cc")),
+    ));
+
     Session {
         version: 0,
         origin: Origin {
@@ -140,7 +167,7 @@ pub fn build_offer(host: &str, port: u16, codecs: &[CodecId], sess_id: u32) -> S
             extras: Vec::new(),
             rtpmaps: Default::default(),
             fmtps: Default::default(),
-            rtcp_fb: Default::default(),
+            rtcp_fb,
             direction: None,
             rtcp_mux: false,
             mid: None,
@@ -153,7 +180,12 @@ pub fn build_offer(host: &str, port: u16, codecs: &[CodecId], sess_id: u32) -> S
             fingerprint: None,
             setup: None,
             rtcp_addr: None,
-            extmaps: Vec::new(),
+            extmaps: vec![ExtMap {
+                id: TWCC_EXT_ID,
+                direction: None,
+                uri: TWCC_URI.into(),
+                config: Some("transport-cc".into()),
+            }],
             ssrcs: Vec::new(),
         }],
     }
@@ -218,6 +250,30 @@ mod tests {
         assert!(plans[0].active);
         let (name, clock, _ch, _pt) = plan_codec(&plans[0]).expect("codec");
         assert!(codec_id_for(&name, clock).is_some());
+    }
+
+    #[test]
+    fn offer_advertises_rtcp_feedback_channels() {
+        let offer = build_offer("127.0.0.1", 30000, &[CodecId::Pcmu], 7);
+        let text = offer.serialize();
+        assert!(text.contains("a=rtcp-fb:0 nack\r\n"), "{text}");
+        assert!(text.contains("a=rtcp-fb:0 transport-cc\r\n"), "{text}");
+        assert!(
+            text.contains(
+                "a=extmap:1 http://www.ietf.org/id/draft-holmerberg-avt-01 transport-cc\r\n"
+            ),
+            "{text}"
+        );
+        // The parsed view carries the same capabilities...
+        let parsed = sdp::parse::parse(&text).unwrap();
+        let plans = sdp::negotiate::stream_plans(&parsed);
+        assert!(plans[0].rtcp_fb_nack);
+        assert_eq!(plans[0].twcc_ext_id, Some(1));
+        // ...and the offer/answer loop preserves them end to end.
+        let ans = answer(&parsed, "127.0.0.1", 30001, &[CodecId::Pcmu]).unwrap();
+        let ans_plans = sdp::negotiate::stream_plans(&sdp::parse::parse(&ans.serialize()).unwrap());
+        assert!(ans_plans[0].rtcp_fb_nack);
+        assert_eq!(ans_plans[0].twcc_ext_id, Some(1));
     }
 
     #[test]

@@ -395,6 +395,31 @@ pub fn answer_session(offer: &Session, caps: &[MediaCaps]) -> Result<Session, Ne
             }
         }
 
+        // RFC 4585 §4.2: the answer carries, for each accepted payload, the
+        // feedback types the offerer declared for that payload (for a single
+        // shared payload the intersection is the offered list). The typed
+        // mirror stays in sync so `stream_plans()` sees the negotiation.
+        for r in &resolved {
+            if let Some(fb) = offer_m.rtcp_fb.get(&r.pt) {
+                m.rtcp_fb.insert(r.pt, fb.clone());
+                for v in fb {
+                    m.attributes
+                        .push(Attribute::new("rtcp-fb", Some(format!("{} {}", r.pt, v))));
+                }
+            }
+        }
+        // RFC 8285 §6: echo the transport-cc extension when offered — the one
+        // header extension the media stack consumes (arrival-time feedback).
+        if let Some(e) = offer_m.extmaps.iter().find(|e| is_twcc_uri(&e.uri)) {
+            m.extmaps.push(e.clone());
+            let mut v = format!("{} {}", e.id, e.uri);
+            if let Some(cfg) = &e.config {
+                v.push(' ');
+                v.push_str(cfg);
+            }
+            m.attributes.push(Attribute::new("extmap", Some(v)));
+        }
+
         // direction
         let offer_dir = offer_m.effective_direction(offer);
         let ans_dir = answer_direction(offer_dir, caps_m.direction);
@@ -514,6 +539,12 @@ pub struct StreamPlan {
     pub remote_port: u16,
     pub telephone_event_pt: Option<u8>,
     pub mid: Option<String>,
+    /// The remote advertised `a=rtcp-fb:<pt> nack` for the negotiated payload
+    /// (RFC 4585) — the RTCP Generic NACK channel is available on this leg.
+    pub rtcp_fb_nack: bool,
+    /// The remote offered the transport-cc header extension (RFC 8285 element
+    /// with the draft-holmerberg URI) — carry its wire id for TWCC feedback.
+    pub twcc_ext_id: Option<u8>,
 }
 
 /// Extract `StreamPlan`s (what the media engine should do) from a session
@@ -538,6 +569,10 @@ pub fn stream_plans(session: &Session) -> Vec<StreamPlan> {
             .values()
             .find(|rm| rm.encoding.eq_ignore_ascii_case("telephone-event"))
             .map(|rm| rm.payload);
+        let rtcp_fb_nack = first_pt
+            .and_then(|pt| m.rtcp_fb.get(&pt))
+            .is_some_and(|fb| fb.iter().any(|v| v.trim() == "nack"));
+        let twcc_ext_id = m.extmaps.iter().find(|e| is_twcc_uri(&e.uri)).map(|e| e.id);
         plans.push(StreamPlan {
             index: i,
             active: m.port != 0 && dir != Direction::Inactive && remote_addr.is_some(),
@@ -550,9 +585,17 @@ pub fn stream_plans(session: &Session) -> Vec<StreamPlan> {
             remote_port: m.port,
             telephone_event_pt: te_pt,
             mid: m.mid.clone(),
+            rtcp_fb_nack,
+            twcc_ext_id,
         });
     }
     plans
+}
+
+/// The transport-cc header-extension URI (draft-holmerberg wire form used by
+/// browser stacks; the suffix spelling covers the RFC-correct name).
+fn is_twcc_uri(uri: &str) -> bool {
+    uri.contains("holmerberg") || uri.contains("transport-cc")
 }
 
 #[cfg(test)]
@@ -1033,5 +1076,65 @@ a=ssrc:3520455752 cname:xyz\r\n";
         let answer = answer_session(&offer, &[caps_audio()]).unwrap();
         assert_eq!(answer.medias[0].formats[0], "111");
         assert_eq!(answer.medias[0].rtpmaps[&111].encoding, "opus");
+    }
+
+    #[test]
+    fn answer_echoes_rtcp_fb_and_twcc_extmap() {
+        let offer_text = "\
+v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 5004 RTP/AVP 0 101\r\n\
+c=IN IP4 127.0.0.1\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=rtcp-fb:0 nack\r\n\
+a=rtcp-fb:0 transport-cc\r\n\
+a=extmap:3 http://www.ietf.org/id/draft-holmerberg-avt-01 transport-cc\r\n\
+";
+        let offer = parse(offer_text).unwrap();
+        let offer_plans = stream_plans(&offer);
+        assert!(offer_plans[0].rtcp_fb_nack, "offer side sees nack");
+        assert_eq!(offer_plans[0].twcc_ext_id, Some(3));
+
+        let caps = MediaCaps::audio("127.0.0.1", 6000, vec![CodecCap::new("PCMU", 8000, 0)]);
+        let answer = answer_session(&offer, &[caps]).unwrap();
+        let text = answer.serialize();
+        assert!(text.contains("a=rtcp-fb:0 nack\r\n"), "{text}");
+        assert!(
+            text.contains("a=rtcp-fb:0 transport-cc\r\n"),
+            "twcc rtcp-fb echoed: {text}"
+        );
+        assert!(
+            text.contains("a=extmap:3 http://www.ietf.org/id/draft-holmerberg-avt-01"),
+            "extmap echoed: {text}"
+        );
+        // The answer re-parses into the same capability view.
+        let plans = stream_plans(&parse(&text).unwrap());
+        assert!(plans[0].rtcp_fb_nack);
+        assert_eq!(plans[0].twcc_ext_id, Some(3));
+    }
+
+    #[test]
+    fn answer_to_unfeedbacked_offer_stays_clean() {
+        let offer_text = "\
+v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 5004 RTP/AVP 0\r\n\
+c=IN IP4 127.0.0.1\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+";
+        let offer = parse(offer_text).unwrap();
+        let caps = MediaCaps::audio("127.0.0.1", 6000, vec![CodecCap::new("PCMU", 8000, 0)]);
+        let answer = answer_session(&offer, &[caps]).unwrap();
+        let text = answer.serialize();
+        assert!(!text.contains("rtcp-fb"), "{text}");
+        assert!(!text.contains("extmap"), "{text}");
+        let plans = stream_plans(&parse(&text).unwrap());
+        assert!(!plans[0].rtcp_fb_nack);
+        assert_eq!(plans[0].twcc_ext_id, None);
     }
 }

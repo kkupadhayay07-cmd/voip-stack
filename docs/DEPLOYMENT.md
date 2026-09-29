@@ -198,8 +198,11 @@ configured bounds. Guidance:
 3. **Postgres CDR backend** (sqlx) + retention/archival policies.
 4. **WebRTC hardening** — library layer ✅ shipped in `crates/rtp`
    (RFC 4585 Generic NACK, RFC 4588 RTX retransmission, transport-cc
-   feedback); remaining: wire NACK/TWCC into the B2BUA's RTCP channels,
-   data channels (SCTP).
+   feedback) **and B2BUA RTCP plumbing ✅ live on every media leg**
+   (periodic SR/RR, NACK answer from a 512-packet retransmission window +
+   NACK ask on jitter-buffer gaps, 200 ms transport-cc arrival feedback
+   when the extmap is negotiated); remaining: data channels (SCTP),
+   sender-side transport-cc extension attach.
 5. **Container entrypoint** — wire `zrtc` as the image entrypoint with a
    mounted config + real healthcheck.
 6. **SDP hardening** (rejected m-lines, port-0 answers, the RFC 3264 §6.1
