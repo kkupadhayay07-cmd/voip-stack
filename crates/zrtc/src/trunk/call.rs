@@ -24,8 +24,8 @@ use super::{recv_response, Endpoint};
 /// been torn down (BYE 200) or on the first failure.
 pub async fn run(cfg: &Config, e164: &str, rtp_ms: u64) -> Result<(), String> {
     let mut auth_boxed = crate::auth::build(&cfg.trunk)?;
-    let ep = Endpoint::from_config(cfg)?;
-    let mut sess = super::connect(&ep).await?;
+    let mut ep = Endpoint::from_config(cfg)?;
+    let mut sess = super::connect(&mut ep).await?;
 
     let ruri = format!("sip:{e164}@{}", ep.host());
     let call_id = new_call_id("zrtc-trunk-call");

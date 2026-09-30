@@ -10,9 +10,9 @@ use codecs::{CodecId, Decoder, Encoder, Registry, Resampler};
 use rand::Rng;
 use rtp::jitter::{JitterBuffer, JitterConfig, PushResult};
 use rtp::nack::{nack_packet, nack_seqs, parse_nack_fci, NackTracker, RtxPool, RTX_POOL_DEFAULT};
-use rtp::packet::RtpPacket;
+use rtp::packet::{RtpExtension, RtpPacket};
 use rtp::rtcp::{encode_compound, encode_packet, parse_compound, RtcpPacket, SenderInfo};
-use rtp::twcc::{twcc_packet, TwccRxMonitor};
+use rtp::twcc::{parse_twcc, twcc_packet, TwccRxMonitor, TwccSendTracker};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering::Relaxed;
@@ -44,9 +44,11 @@ pub struct PumpConfig {
     /// The peer advertised `a=rtcp-fb:<pt> nack` (RFC 4585): answer NACK
     /// requests from the retransmission window and NACK the peer's gaps.
     pub nack: bool,
-    /// Negotiated transport-cc header-extension id: track arrival times of
-    /// the extension's sequence numbers and emit RTCP transport-cc feedback
-    /// (draft-holmerberg wire form).
+    /// Negotiated transport-cc header-extension id: stamp the one-byte
+    /// sequence on every outbound packet (sender side), track arrival times
+    /// of the peer's extension sequence numbers, emit RTCP transport-cc
+    /// feedback (draft-holmerberg wire form) and correlate the peer's
+    /// feedback against our send times.
     pub twcc_ext: Option<u8>,
     /// Period of the RTCP sender report (ms; floored at 50 at use site).
     pub rtcp_interval_ms: u64,
@@ -78,6 +80,13 @@ pub struct MediaStats {
     pub retransmits_tx: std::sync::atomic::AtomicU64,
     /// NACKed sequences no longer in the retransmission window.
     pub nack_misses: std::sync::atomic::AtomicU64,
+    /// Transport-cc feedback reports received about our outbound stream
+    /// (RTPFB fmt 15, draft-holmerberg wire form).
+    pub twcc_feedbacks_rx: std::sync::atomic::AtomicU64,
+    /// Packets reported lost in the latest transport-cc feedback window.
+    pub twcc_window_lost: std::sync::atomic::AtomicU64,
+    /// Mean send→receive delay (µs) across the latest feedback window.
+    pub twcc_mean_delay_us: std::sync::atomic::AtomicI64,
 }
 
 impl MediaStats {
@@ -110,6 +119,15 @@ impl MediaStats {
     }
     pub fn nack_misses(&self) -> u64 {
         self.nack_misses.load(Relaxed)
+    }
+    pub fn twcc_feedbacks_rx(&self) -> u64 {
+        self.twcc_feedbacks_rx.load(Relaxed)
+    }
+    pub fn twcc_window_lost(&self) -> u64 {
+        self.twcc_window_lost.load(Relaxed)
+    }
+    pub fn twcc_mean_delay_us(&self) -> i64 {
+        self.twcc_mean_delay_us.load(Relaxed)
     }
 }
 
@@ -284,6 +302,11 @@ async fn run_pump(
     let mut twcc_fb_count: u8 = 0;
     // Unwrapped 16-bit view of the 1-byte transport-cc sequence numbers.
     let mut twcc_ext_seq: Option<u16> = None;
+    // Sender side: stamp the negotiated one-byte transport-cc sequence on
+    // every outbound packet and remember send times so the peer's feedback
+    // correlates into per-packet delays.
+    let mut twcc_tx_seq: u16 = 0;
+    let mut twcc_tx = cfg.twcc_ext.map(|_| TwccSendTracker::new(1024));
     let mut remote_ssrc: Option<u32> = None;
     let mut tx_pkts: u64 = 0;
     let mut tx_octets: u64 = 0;
@@ -403,6 +426,8 @@ async fn run_pump(
                         &resend,
                         &mut retransmit_guard,
                         &mut last_sr,
+                        &mut twcc_tx,
+                        ssrc,
                         &stats,
                     )
                     .await;
@@ -535,7 +560,7 @@ async fn run_pump(
                             );
                             continue;
                         };
-                        let relay = RtpPacket::new(
+                        let mut relay = RtpPacket::new(
                             te_pt,
                             out_seq,
                             timestamp,
@@ -544,6 +569,16 @@ async fn run_pump(
                             Bytes::from(payload),
                         );
                         out_seq = out_seq.wrapping_add(1);
+                        if let (Some(ext_id), Some(tracker)) = (cfg.twcc_ext, twcc_tx.as_mut()) {
+                            attach_twcc(
+                                ext_id,
+                                twcc_tx_seq,
+                                tracker,
+                                &mut relay,
+                                started.elapsed().as_micros() as u64,
+                            );
+                            twcc_tx_seq = twcc_tx_seq.wrapping_add(1);
+                        }
                         tx_pkts += 1;
                         tx_octets += relay.payload.len() as u64;
                         resend.store(&relay);
@@ -569,9 +604,19 @@ async fn run_pump(
                         while enc_in.len() >= frame_len {
                             let mut wire = Vec::with_capacity(256);
                             if enc.encode(&enc_in[..frame_len], &mut wire).is_ok() && !wire.is_empty() {
-                                let pkt = RtpPacket::new(cfg.tx_pt, out_seq, out_ts, ssrc, false, Bytes::from(wire));
+                                let mut pkt = RtpPacket::new(cfg.tx_pt, out_seq, out_ts, ssrc, false, Bytes::from(wire));
                                 out_seq = out_seq.wrapping_add(1);
                                 out_ts = out_ts.wrapping_add(ts_inc);
+                                if let (Some(ext_id), Some(tracker)) = (cfg.twcc_ext, twcc_tx.as_mut()) {
+                                    attach_twcc(
+                                        ext_id,
+                                        twcc_tx_seq,
+                                        tracker,
+                                        &mut pkt,
+                                        started.elapsed().as_micros() as u64,
+                                    );
+                                    twcc_tx_seq = twcc_tx_seq.wrapping_add(1);
+                                }
                                 stats.frames_encoded.fetch_add(1, Relaxed);
                                 tx_pkts += 1;
                                 tx_octets += pkt.payload.len() as u64;
@@ -615,7 +660,9 @@ async fn run_pump(
 /// Answer an incoming RTCP datagram: Generic NACK requests pull media
 /// packets back out of the retransmission window (verbatim — same seq, PT
 /// and SSRC as the original transmission; RFC 4585 §6.2.1 non-RTX form);
-/// the peer's SR feeds our `last_sr`/DLSR bookkeeping.
+/// the peer's SR feeds our `last_sr`/DLSR bookkeeping; transport-cc
+/// feedback about OUR stream correlates against recorded send times.
+#[allow(clippy::too_many_arguments)]
 async fn handle_rtcp(
     wire: &[u8],
     src: SocketAddr,
@@ -623,6 +670,8 @@ async fn handle_rtcp(
     resend: &RtxPool,
     guard: &mut HashMap<u16, Instant>,
     last_sr: &mut Option<(u32, Instant)>,
+    twcc_tx: &mut Option<TwccSendTracker>,
+    our_ssrc: u32,
     stats: &MediaStats,
 ) {
     let Ok(packets) = parse_compound(wire) else {
@@ -665,6 +714,33 @@ async fn handle_rtcp(
                     }
                 }
             }
+            fb_pkt @ RtcpPacket::Rtpfb { fmt: 15, .. } => {
+                // Transport-cc feedback about OUR outbound stream (the peer
+                // echoes our SSRC as media_ssrc): correlate against send
+                // times and surface the congestion window.
+                let Some(tracker) = twcc_tx.as_ref() else {
+                    continue;
+                };
+                let about_us = matches!(
+                    &fb_pkt,
+                    RtcpPacket::Rtpfb { media_ssrc, .. } if *media_ssrc == our_ssrc
+                );
+                if !about_us {
+                    tracing::debug!(
+                        ssrc = %our_ssrc,
+                        "ignoring transport-cc feedback for another media stream"
+                    );
+                    continue;
+                }
+                if let Ok(feedback) = parse_twcc(&fb_pkt) {
+                    let report = tracker.on_feedback(&feedback);
+                    stats.twcc_feedbacks_rx.fetch_add(1, Relaxed);
+                    stats.twcc_window_lost.store(report.lost as u64, Relaxed);
+                    stats
+                        .twcc_mean_delay_us
+                        .store(report.mean_delay_us, Relaxed);
+                }
+            }
             _ => {}
         }
     }
@@ -695,6 +771,22 @@ fn onebyte_ext_value(ext: &rtp::packet::RtpExtension, want_id: u8) -> Option<u8>
         off += 1 + data_len;
     }
     None
+}
+
+/// Stamp `pkt` with the one-byte transport-cc sequence element (RFC 8285
+/// §4.2, draft-holmerberg wire form) and record the send time so the peer's
+/// feedback correlates into per-packet delays. Called before the packet
+/// enters the retransmission window so NACKed resends carry the same
+/// sequence number as the original transmission.
+fn attach_twcc(
+    ext_id: u8,
+    seq: u16,
+    tracker: &mut TwccSendTracker,
+    pkt: &mut RtpPacket,
+    now_us: u64,
+) {
+    pkt.extension = Some(RtpExtension::onebyte(ext_id, &[(seq & 0xFF) as u8]));
+    tracker.record_send(seq, now_us);
 }
 
 #[cfg(test)]
@@ -955,6 +1047,134 @@ mod tests {
         let mut buf = vec![0u8; 2048];
         let r = tokio::time::timeout(Duration::from_millis(300), tp.test.recv_from(&mut buf)).await;
         assert!(r.is_err(), "unexpected packet on an unnegotiated leg");
+        tp.handle.stop.send(true).ok();
+    }
+
+    #[tokio::test]
+    async fn pump_attaches_twcc_ext_on_outbound_media_and_retransmits() {
+        let mut cfg = pump_cfg();
+        cfg.twcc_ext = Some(1);
+        let tp = start(cfg).await;
+
+        tp.in_tx
+            .send(BridgeMsg::Pcm(vec![0i16; 1600]))
+            .await
+            .unwrap();
+        let w1 = recv_media(&tp.test).await;
+        let w2 = recv_media(&tp.test).await;
+        let q1 = RtpPacket::parse(&w1).unwrap();
+        let q2 = RtpPacket::parse(&w2).unwrap();
+        let ext1 = q1
+            .extension
+            .as_ref()
+            .expect("tx packet carries an extension");
+        let ext2 = q2
+            .extension
+            .as_ref()
+            .expect("tx packet carries an extension");
+        assert_eq!(ext1.profile, 0xBEDE);
+        let s1 = onebyte_ext_value(ext1, 1).expect("one-byte transport-cc element");
+        let s2 = onebyte_ext_value(ext2, 1).expect("one-byte transport-cc element");
+        assert_eq!(
+            s1.wrapping_add(1),
+            s2,
+            "transport-cc sequence increments per packet"
+        );
+
+        // Drain, then NACK packet 1: the verbatim retransmission must carry
+        // the same transport-cc sequence number as the original.
+        let mut drain = vec![0u8; 2048];
+        while tp.test.try_recv_from(&mut drain).is_ok() {}
+        let nack = nack_packet(
+            0x999,
+            q1.ssrc(),
+            &[GenericNack {
+                pid: q1.header.sequence,
+                blp: 0,
+            }],
+        );
+        tp.test
+            .send_to(&encode_packet(&nack), tp.pump_addr)
+            .await
+            .unwrap();
+        let again = recv_media(&tp.test).await;
+        let rq = RtpPacket::parse(&again).unwrap();
+        assert_eq!(
+            rq.extension.as_ref().and_then(|e| onebyte_ext_value(e, 1)),
+            Some(s1),
+            "retransmission carries the original transport-cc sequence"
+        );
+        tp.handle.stop.send(true).ok();
+    }
+
+    #[tokio::test]
+    async fn pump_without_twcc_negotiation_sends_bare_media() {
+        let tp = start(pump_cfg()).await;
+        tp.in_tx
+            .send(BridgeMsg::Pcm(vec![0i16; 1600]))
+            .await
+            .unwrap();
+        let w = recv_media(&tp.test).await;
+        let q = RtpPacket::parse(&w).unwrap();
+        assert!(
+            q.extension.is_none(),
+            "no header extension without negotiation"
+        );
+        tp.handle.stop.send(true).ok();
+    }
+
+    #[tokio::test]
+    async fn pump_correlates_twcc_feedback_into_stats() {
+        let mut cfg = pump_cfg();
+        cfg.twcc_ext = Some(1);
+        let tp = start(cfg).await;
+
+        // Drive two outbound media packets (transport-cc seq 0 then 1).
+        tp.in_tx
+            .send(BridgeMsg::Pcm(vec![0i16; 1600]))
+            .await
+            .unwrap();
+        let w1 = recv_media(&tp.test).await;
+        let _w2 = recv_media(&tp.test).await;
+        let q1 = RtpPacket::parse(&w1).unwrap();
+        let ssrc = q1.ssrc();
+
+        // Feedback about OUR stream: seq 0 received (+2 ms delta), seq 1 lost.
+        let fb = rtp::twcc::TwccFeedback {
+            sender_ssrc: 0xABC,
+            media_ssrc: ssrc,
+            base_seq: 0,
+            ref_time_ms: 1_000,
+            fb_count: 0,
+            entries: vec![
+                rtp::twcc::TwccEntry {
+                    seq: 0,
+                    received: true,
+                    delta_us: Some(2_000),
+                },
+                rtp::twcc::TwccEntry {
+                    seq: 1,
+                    received: false,
+                    delta_us: None,
+                },
+            ],
+        };
+        let fb_pkt = rtp::twcc::twcc_packet(&fb).unwrap();
+        tp.test
+            .send_to(&encode_packet(&fb_pkt), tp.pump_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(tp.handle.stats.twcc_feedbacks_rx(), 1);
+        assert_eq!(tp.handle.stats.twcc_window_lost(), 1);
+        // seq 0 was sent at pump-elapsed µs (small) and "received" at
+        // ref 1000 ms + 2 ms: the correlated delay must be positive.
+        assert!(
+            tp.handle.stats.twcc_mean_delay_us() > 0,
+            "send→receive delay positive, got {}",
+            tp.handle.stats.twcc_mean_delay_us()
+        );
         tp.handle.stop.send(true).ok();
     }
 }

@@ -39,7 +39,7 @@ this repository's code.
 
 ## 2. Crate graph
 
-### 2.1 Current tree (as built — 19 crates)
+### 2.1 Current tree (as built — 20 crates)
 
 ```text
    ops/assembly ┌─────────────┐  ┌──────────────┐
@@ -52,7 +52,10 @@ this repository's code.
                 │ trunk, AI,  │  │     api      │  REST/WS, /metrics, CDR queries
                 │ REST, obs   │  └──────▲───────┘
                 └──────┬──────┘         │ cdr events
-   roles        ┌──────▼──────┐  ┌──────┴───────┐  ┌────────────┐
+        RFC 3263 ┌─────▼──────┐         │
+        NAPTR/SRV│  rfc3263   │  pure-std DNS wire codec + §4.2 policy:
+        targets  └────────────┘  ordered candidate list for the trunk client
+   roles        ┌────────────┐  ┌──────┴───────┐  ┌────────────┐
                 │    b2bua    │  │     cdr      │  │ registrar  │
                 │ (legs driven│  │              │  │ proxy  sbc │
                 │  by sip-tx) │  └──────────────┘  └────────────┘
@@ -178,6 +181,16 @@ bridge → encode, so **any codec pair** the registry supports can be bridged
 without pairwise code. RTCP is demultiplexed per RFC 5761; DTMF
 (telephone-event) relays payload-level without transcoding.
 
+Every media pump also runs an RTCP channel on its leg (RFC 3550 SR/RR,
+RFC 4585 Generic NACK both directions against a 512-packet retransmission
+window, transport-cc arrival feedback every 200 ms on negotiated legs).
+Sender side: outbound packets are stamped with the one-byte transport-cc
+sequence (RFC 8285 §4.2) before entering the retransmission window, and the
+peer's RTPFB FMT 15 feedback about our SSRC is correlated against recorded
+send times into per-leg stats (feedback count, window loss, mean
+send→receive delay). Pumps enable only what the leg's SDP negotiation
+allows — unnegotiated legs stay RTCP-silent.
+
 ### 5.3 Control & observability
 
 CDR events are emitted on unbounded channels from call engines and drained by
@@ -198,6 +211,12 @@ the media path.
   SSRC restart mid-stream, late/duplicate jitter-buffer pushes.
 
 ## 7. Deployment view
+
+* **Trunk failover**: the outbound trunk resolves its address through the
+  `rfc3263` crate into a priority-ordered candidate list; `trunk::connect`
+  walks it at connect time (3 s per-candidate budget for TCP/TLS/WSS) and
+  pins the winner for keepalives, request-URIs and RTP — a dead SRV primary
+  costs one connect attempt, not the call.
 
 * **Build**: `cargo build --release`; pinned toolchain via
   `rust-toolchain.toml`; libopus is the only native dep and is optional.

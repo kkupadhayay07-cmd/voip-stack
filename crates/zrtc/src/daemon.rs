@@ -274,7 +274,7 @@ pub async fn run(mut cfg: Config) -> Result<(), String> {
 
     // ---- vendor trunk ------------------------------------------------------
     if cfg.trunk.address.as_deref().is_some_and(|a| !a.is_empty()) {
-        let ep = trunk::Endpoint::from_config(&cfg)?;
+        let mut ep = trunk::Endpoint::from_config(&cfg)?;
         let mut trunk_auth = auth::build(&cfg.trunk)?;
         tracing::info!(
             "trunk configured: {} transport={} auth={}",
@@ -285,7 +285,7 @@ pub async fn run(mut cfg: Config) -> Result<(), String> {
         if cfg.trunk.register {
             // Fail fast: a trunk that cannot register is a fatal config
             // error (the raw challenge is logged inside register::run).
-            let mut sess = trunk::connect(&ep).await?;
+            let mut sess = trunk::connect(&mut ep).await?;
             let code = trunk::register::run(
                 &mut sess,
                 &ep,
@@ -298,7 +298,7 @@ pub async fn run(mut cfg: Config) -> Result<(), String> {
                 tokio::spawn(trunk::keepalive_loop(sess, ep, trunk_auth));
             }
         } else if ep.keepalive_secs > 0 {
-            let sess = trunk::connect(&ep).await?;
+            let sess = trunk::connect(&mut ep).await?;
             tokio::spawn(trunk::keepalive_loop(sess, ep, trunk_auth));
         }
     }

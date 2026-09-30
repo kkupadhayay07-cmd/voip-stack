@@ -37,6 +37,31 @@ pub struct RtpExtension {
     pub data: Bytes,
 }
 
+impl RtpExtension {
+    /// Builds a one-byte-header extension block (RFC 8285 §4.2) carrying a
+    /// single element: `id` (1..=14) with up to 16 data bytes. The block
+    /// uses the one-byte profile sentinel 0xBEDE; elements are not padded
+    /// individually — `encode_into` pads the whole block to a 32-bit word.
+    pub fn onebyte(id: u8, payload: &[u8]) -> RtpExtension {
+        debug_assert!(
+            (1..=14).contains(&id),
+            "one-byte element id must be in 1..=14"
+        );
+        debug_assert!(
+            payload.len() <= 16,
+            "one-byte element data is at most 16 bytes"
+        );
+        let mut data = Vec::with_capacity(1 + payload.len());
+        // The 4-bit length field carries length−1 (RFC 8285 §4.2).
+        data.push((id << 4) | (payload.len() as u8 - 1));
+        data.extend_from_slice(payload);
+        RtpExtension {
+            profile: 0xBEDE,
+            data: Bytes::from(data),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RtpHeader {
     pub padding: bool,
@@ -342,5 +367,19 @@ mod tests {
         let p = RtpPacket::new(0, 1, 2, 3, false, Bytes::from_static(&[0u8; 160]));
         let enc = p.encode();
         assert_eq!(RtpPacket::parse(&enc).unwrap().header.ssrc, 3);
+    }
+
+    #[test]
+    fn onebyte_extension_roundtrips_through_encode_parse() {
+        let mut p = RtpPacket::new(0, 7, 1000, 0xBEEF, false, Bytes::from_static(b"x"));
+        p.extension = Some(RtpExtension::onebyte(1, &[0xAB]));
+        let q = RtpPacket::parse(&p.encode()).unwrap();
+        let ext = q.extension.expect("extension present after roundtrip");
+        assert_eq!(ext.profile, 0xBEDE);
+        // Element header (id 1, len field 0 = one data byte → 0x10) + the
+        // payload byte; parse hands back the full block including the word
+        // padding.
+        assert_eq!(ext.data[0], 0x10);
+        assert_eq!(ext.data[1], 0xAB);
     }
 }

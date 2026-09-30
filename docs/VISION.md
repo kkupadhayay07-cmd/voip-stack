@@ -105,10 +105,11 @@ System: Rewrites system prompt based on past failed calls.
 │ L3 · AI PIPELINE                                                 │
 │ STT · LLM · TTS · VAD · Barge-in · Fallbacks · <200ms P95        │
 ├──────────────────────────────────────────────────────────────────┤
-│ L2 · TELEPHONY                                                   │
-│ Real trunk · WebRTC · Dialer · Postgres CDR · Load-tested        │
+│ L2 · TELEPHONY  <- we are here, ~50% done                        │
+│ Real trunk [done] · WebRTC hardening [done] · Dialer [done]      │
+│ Postgres CDR + release/8-core soak [pending] · M1 verified [x]   │
 ├──────────────────────────────────────────────────────────────────┤
-│ L1 · FOUNDATION ← we are here, ~80% done                         │
+│ L1 · FOUNDATION — complete (M1 verified: 400+ gate, release)     │
 │ sip-tx · sdp · rtp · srtp · dtls · ice · codecs · b2bua · media  │
 │ registrar · proxy · sbc · observ · cdr · dialer · ai-bridge      │
 └──────────────────────────────────────────────────────────────────┘

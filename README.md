@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 548 tests passing across 56 suites in 20 crates;
+**Current state: 555 tests passing across 56 suites in 20 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
@@ -28,7 +28,7 @@ finding is fixed with regression tests
 | `crates/sdp` | RFC 4566/8866 SDP parser/serializer + RFC 3264 offer/answer engine (`StreamPlan` projection) | **Done** |
 | `crates/rtp` | RTP/RTCP (RFC 3550/3551), adaptive jitter buffer + PLC, loss recovery (RFC 4585 Generic NACK + RFC 4588 RTX), transport-cc congestion feedback, RFC 4733 DTMF, RFC 5761 demux, RFC 8285 extensions, RTCP feedback (PLI/FIR) | **Done** |
 | `crates/codecs` | Full codec suite: **Opus, PCMU, PCMA, G.722, G.729, telephone-event**, L16, CN (RFC 3389), PLC, resampler; G.729 validated against bcg729 oracle vectors | **Done** |
-| `crates/b2bua` | B2BUA call engine: dual-leg SIP driven by `sip-tx` transactions, SDP offer/answer both legs, cross-connected media pumps with 16 kHz transcode bridge (any codec pair), DTMF relay, RTCP channel per leg (RFC 3550 SR/RR, RFC 4585 NACK answer + ask, transport-cc arrival feedback), RFC 4028 session timers, RFC 3262 reliable 1xx + PRACK both legs, CDR events, `b2bua-demo` binary, full-loopback integration test | **Done** |
+| `crates/b2bua` | B2BUA call engine: dual-leg SIP driven by `sip-tx` transactions, SDP offer/answer both legs, cross-connected media pumps with 16 kHz transcode bridge (any codec pair), DTMF relay, RTCP channel per leg (RFC 3550 SR/RR, RFC 4585 NACK answer + ask, transport-cc arrival feedback + sender-side ext stamping with feedback→delay/loss correlation), RFC 4028 session timers, RFC 3262 reliable 1xx + PRACK both legs, CDR events, `b2bua-demo` binary, full-loopback integration test | **Done** |
 | `crates/srtp` | RFC 3711 (AES-CM + HMAC-SHA1, KDF, replay window, ROC estimation) + RFC 7714 AES-GCM AEAD; validated against RFC 3711 B.2/B.3 and RFC 7714 §16 vectors | **Done** |
 | `crates/dtls` | DTLS-SRTP (RFC 5764/6347) via whitelisted OpenSSL: runtime self-signed ECDSA P-256 certs, RFC 8122 fingerprint pinning, use_srtp negotiation, RFC 5764 §4.2 key export, flight retransmission | **Done** |
 | `crates/ice` | RFC 5389 STUN codec (RFC 5769 vectors), RFC 8445 ICE agent (host/srflx/relay gathering, connectivity checks, nomination), RFC 5766 TURN server (long-term auth, permissions, Send/Data, ChannelBind) | **Done** |
@@ -42,7 +42,7 @@ finding is fixed with regression tests
 | `crates/api` | Control plane: REST (CDR queries/stats, campaigns, pacing), WebSocket event stream, Prometheus `/metrics`, health/readiness | **Done** |
 | `crates/observ` | In-process observability: Wireshark-openable pcap capture (SIP + RTP), human-readable per-call traces, per-leg media diag counters (rx/tx/lost/jitter/concealed) — everything correlated by SIP Call-ID | **Done** |
 | `crates/rfc3263` | RFC 3263 SIP server discovery: RFC 1035 DNS wire codec (compression-safe name reader, loop-proof pointers), NAPTR protocol selection (RFC 2915 S-flag), RFC 2782 SRV priority + weighted ordering, A/AAAA fallback, UDP with TC→TCP fallback — pure std, zero deps | **Done** |
-| `crates/zrtc` | The daemon: wires everything into one voice service — UDP/TCP/TLS/WSS SIP listeners, SBC → proxy → registrar, B2BUA + loopback sink, outbound trunk (IP / Digest / Bearer / mTLS, RFC 3263 NAPTR/SRV discovery), outbound originator, AI tap, REST API, observability. Config: `zrtc.toml` | **Done** |
+| `crates/zrtc` | The daemon: wires everything into one voice service — UDP/TCP/TLS/WSS SIP listeners, SBC → proxy → registrar, B2BUA + loopback sink, outbound trunk (IP / Digest / Bearer / mTLS, RFC 3263 NAPTR/SRV discovery with connection-time candidate failover), outbound originator, AI tap, REST API, observability. Config: `zrtc.toml` | **Done** |
 
 ## Quick start
 
@@ -50,7 +50,7 @@ finding is fixed with regression tests
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 548 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 555 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -148,6 +148,15 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
   extension is negotiated; offers advertise `rtcp-fb nack`/`transport-cc`
   + the extmap, answers echo the negotiation, and pumps enable only what
   the leg negotiated.
+* **Sender-side transport-cc + connection-time SRV failover**: outbound RTP
+  (audio and DTMF relay) is stamped with the one-byte transport-cc sequence
+  extension (RFC 8285 §4.2 element writer in `rtp`, length field = len−1)
+  when the extmap is negotiated — retransmissions carry the original seq —
+  and inbound RTPFB FMT 15 feedback about our SSRC is correlated against
+  recorded send times into per-leg stats (feedback count, window loss, mean
+  send→receive delay); the trunk client walks its RFC 3263 candidate list
+  in priority order at connect time (3 s per-candidate budget for
+  TCP/TLS/WSS) and pins `target`, keepalives and RTP to the winner.
 * **Dependency hygiene sweep**: 36 unused `[dependencies]`/`[dev-dependencies]`
   entries removed across 14 crates (e.g. the pure-std `proxy` state machine
   carried `tokio`/`rand` for nothing), the never-referenced workspace
@@ -189,14 +198,14 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
 3. Postgres CDR persistence (sqlx) + retention policies.
 4. WebRTC hardening — library layer ✅ (RFC 4585 NACK, RFC 4588 RTX,
    transport-cc feedback in `crates/rtp`) **and B2BUA RTCP plumbing ✅**
-   (SR/RR + NACK answer/ask + TWCC feedback live on every media leg);
-   remaining: data channels (SCTP), sender-side transport-cc extension
-   attach.
+   (SR/RR + NACK answer/ask + TWCC feedback live on every media leg)
+   **and sender-side transport-cc ✅** (outbound ext stamping + feedback
+   correlation into per-leg stats); remaining: data channels (SCTP).
 5. SDP hardening — rejected m-lines, port-0 offers, RFC 3264 §6.1 direction
    clamp, extras serialization, **IPv6 answer address types and RFC 8843
    BUNDLE group echo done**. RFC 3263 NAPTR/SRV server discovery — **done**
-   (new `rfc3263` crate, live on the zrtc outbound trunk); remaining:
-   GRUU/Outbound.
+   (new `rfc3263` crate, live on the zrtc outbound trunk) with
+   **connection-time candidate failover done**; remaining: GRUU/Outbound.
 
 ## Documentation
 

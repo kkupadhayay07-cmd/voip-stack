@@ -21,7 +21,7 @@ hardening (IP4/IP6 `o=`/`c=` address types picked from the local host
 literal, RFC 8843 BUNDLE group echo with the accepted mids), a
 concurrent-call load harness with percentile reporting, and RTP loss
 recovery + congestion feedback (RFC 4585 Generic NACK, RFC 4588 RTX,
-transport-cc); 548 tests green
+transport-cc); 555 tests green
 across 56 suites — **every audit finding at every severity is fixed**).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
@@ -33,11 +33,11 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC 3261 | SIP: message layer | **Done** | `sip-core`: strict panic-free byte parser (UDP datagram + TCP/TLS/WS stream framing, §18.3), canonical serializer, URI/header model, branch/tag/Call-ID generators. Parser limits enforced (64 KiB msg, 128 headers, 8 KiB/line). |
 | RFC 3261 | SIP: registrar (§10) | **Done** | `registrar` crate: AoR binding DB (q-ordering, expiry, CSeq/Call-ID consistency, wildcard removal), Digest auth challenge/verify with one-time nonces, domain check. §10.2.8: registrations below the configured minimum expiry are refused with 423 `Interval Too Brief` carrying `Min-Expires`; the nonce table is pruned of expired entries on every challenge so it stays bounded under floods. |
 | RFC 3261 | SIP: stateful proxy (§16) | **Done** (core) | `proxy` crate: request validation (483), Route-set processing, Via prepend/pop, Record-Route, parallel forking, 100 Trying, CANCEL matching (§9.1), response routing (received/rport → sent-by). Fork state is in-memory only (no failover); adopting the `sip-tx` timer state machines in the proxy is a planned hardening step. |
-| RFC 3261 | SIP: transactions (§17) | **Done** (core) | `sip-tx` crate: client INVITE (Timers A/B/D), client non-INVITE (E/F/K), server INVITE (G/H/I), server non-INVITE (J); §17.1.3 response matching + §17.2.3 ACK matching; the non-2xx ACK carries a single top Via plus the original Route set (§17.1.1.2); the non-INVITE server transaction enters Proceeding on a provisional and matches retransmissions by branch+sent-by+CSeq AND method (§17.2.2); pure state machines, fake-clock tests at exact fire instants. The B2BUA drives both call legs through it. Failover (RFC 3263) remains open. |
+| RFC 3261 | SIP: transactions (§17) | **Done** (core) | `sip-tx` crate: client INVITE (Timers A/B/D), client non-INVITE (E/F/K), server INVITE (G/H/I), server non-INVITE (J); §17.1.3 response matching + §17.2.3 ACK matching; the non-2xx ACK carries a single top Via plus the original Route set (§17.1.1.2); the non-INVITE server transaction enters Proceeding on a provisional and matches retransmissions by branch+sent-by+CSeq AND method (§17.2.2); pure state machines, fake-clock tests at exact fire instants. The B2BUA drives both call legs through it. Connection-time failover across the trunk's RFC 3263 candidate list is live in the zrtc trunk client (see RFC 3263 row). |
 | RFC 3261 | SIP: transports (§18) | **Done** (core) | UDP/TCP/TLS/WSS listeners wired in the `zrtc` daemon (TLS via whitelisted OpenSSL, self-signed identity at startup, mTLS client certs for trunks); message layer covers datagram + stream framing incl. §18.3 robustness. |
 | RFC 3261 | SIP: dialogs (§12) | **Partial** | B2BUA tracks per-leg dialog state (tags/Call-ID/CSeq); generic dialog package not extracted. |
 | RFC 3262 | PRACK / 100rel | **Done** (core) | B2BUA, both legs. UAS: reliable 180 (`Require: 100rel` + `RSeq` from [1, 2³¹−1], To-tagged early dialog) when the caller advertises 100rel, Timer-G-style retransmission (T1 doubling to T2) until `PRACK`, 64·T1 give-up with 503 + BYE, the final 200 parked until the PRACK arrives (§3), RAck matching with 481/400 verdicts and idempotent 200 for retransmitted PRACKs. UAC: only a 101–199 carrying BOTH `Require: 100rel` and `RSeq` is PRACKed (§4 — never a 100, never an unmarked 1xx), answered with PRACK carrying `RAck` (own dialog CSeq); a retransmitted 1xx (same `RSeq`) is answered by resending the STORED PRACK byte-identically (same CSeq number and branch, RFC 3261 §17.1.2); 421 Extension-Required dial retry once with the demanded extensions merged into `Supported` (§3); non-INVITE responses excluded from the INVITE transaction slot. |
-| RFC 3263 | DNS (NAPTR/SRV) for SIP | **Done** (client discovery) | `rfc3263` crate: RFC 1035 wire codec (name decompression with a strictly-backwards pointer rule + jump cap — loops are structurally rejected), NAPTR (RFC 2915) S-flag protocol selection from the service field (SIP+D2U/D2T, SIPS+D2T) with the replacement key as the next SRV query, SRV (RFC 2782) priority + weighted-random ordering (zero-weight last, seeded xorshift, deterministic in tests), A/AAAA fallback with transport-default ports (5060/5061), explicit-port short-circuit per §4.2, IP-literal fast path (no DNS). Client: UDP with one retransmission, TC→TCP fallback, ID-validated responses. Live on the zrtc outbound trunk: HOST / HOST:PORT / `sip:` URI / IPv6-literal addresses resolve through RFC 3263 into an ordered candidate list (SRV targets whose addresses fail are skipped — client-side failover to the next candidate), with a libc-resolver fallback when no nameserver is configured. Remaining: NAPTR regexp rewrite (regexp-only NAPTRs are skipped), DNSSEC, connection-timeout failover re-resolution. |
+| RFC 3263 | DNS (NAPTR/SRV) for SIP | **Done** (client discovery) | `rfc3263` crate: RFC 1035 wire codec (name decompression with a strictly-backwards pointer rule + jump cap — loops are structurally rejected), NAPTR (RFC 2915) S-flag protocol selection from the service field (SIP+D2U/D2T, SIPS+D2T) with the replacement key as the next SRV query, SRV (RFC 2782) priority + weighted-random ordering (zero-weight last, seeded xorshift, deterministic in tests), A/AAAA fallback with transport-default ports (5060/5061), explicit-port short-circuit per §4.2, IP-literal fast path (no DNS). Client: UDP with one retransmission, TC→TCP fallback, ID-validated responses. Live on the zrtc outbound trunk: HOST / HOST:PORT / `sip:` URI / IPv6-literal addresses resolve through RFC 3263 into an ordered candidate list (SRV targets whose addresses fail are skipped — client-side failover to the next candidate), with a libc-resolver fallback when no nameserver is configured. **Connection-time failover is live**: `trunk::connect` walks the candidate list in priority order with a 3 s per-candidate connect budget (TCP/TLS/WSS) and pins `target`, keepalives and RTP to the winner. Remaining: NAPTR regexp rewrite (regexp-only NAPTRs are skipped), DNSSEC, mid-dialog re-resolution (an established session that dies does not yet re-resolve). |
 | RFC 3264 | Offer/answer | **Done** | `sdp::negotiate`: full RFC 3264 engine with `StreamPlan` projection. Answer direction is the explicit §6.1 matrix clamped to what the offer permits (sendonly offers can never draw a receiving answer, etc.), rejected m-lines are answered with their own m-line at port 0 and a null `c=` line of the offer's address type (§6), port-0 offers are answered port 0. The answer's own `o=`/`c=` lines pick `IN IP4`/`IN IP6` from the local host literal (RFC 8866 §4.4 — an IPv6 address is never mislabeled IP4); the offer's family never dictates the answer's. |
 | RFC 3326 | Reason header | **Partial** | Header type modelled; no protocol semantics applied yet. |
 | RFC 3515 | REFER | **Planned** | `Refer-To` header type modelled; call flows not implemented. |
@@ -60,10 +60,10 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC 3556 | SDP bandwidth modifiers | **Partial** | `b=` lines parsed/modelled; `TIAS` pacing semantics not applied. |
 | RFC 4585 | RTCP-based feedback | **Done (core)** | `rtp::nack`: Generic NACK `PID`/`BLP` FCI encode/parse (§6.2.1) + receiver-side gap tracker (extended sequences, repeat throttle, give-up limits, stream-restart guards); **wired into the B2BUA**: legs that negotiate `a=rtcp-fb:<pt> nack` answer inbound NACKs verbatim from a 512-packet retransmission window (20 ms per-seq flood guard) and NACK the peer's gaps; PLI/FIR still modelled as typed Psfb (no B2BUA path); REMB not implemented. |
 | RFC 4588 | RTX retransmission | **Done (core)** | `rtp::nack`: sender `RtxPool` (bounded retransmission window), `RtxStream` packetizer (separate SSRC/PT + OSN payload prefix, CSRCs dropped per §4), receiver `RtxDepacketizer` restoring `apt` PT + original sequence; SSRC learning until pinned from SDP. |
-| transport-cc (draft-holmerberg-avt-01) | RTPFB FMT 15 congestion feedback | **Done (core)** | `rtp::twcc`: libwebrtc-compatible FCI encode/parse (run/vector chunks, small u8 + large i16 recv deltas at 250 µs, 64 ms reference time, feedback counter), receiver `TwccRxMonitor` (gap-marked arrival windows) and sender `TwccSendTracker` (per-packet delay + window loss correlation). **B2BUA receive side wired**: offers advertise the extmap (`id 1`, draft URI), answers echo it, and negotiated legs feed arrival times into `TwccRxMonitor` (1-byte seq unwrapped to u16) emitting RTPFB FMT 15 every 200 ms; sender-side extension attach on outbound RTP is the follow-up. |
+| transport-cc (draft-holmerberg-avt-01) | RTPFB FMT 15 congestion feedback | **Done** | `rtp::twcc`: libwebrtc-compatible FCI encode/parse (run/vector chunks, small u8 + large i16 recv deltas at 250 µs, 64 ms reference time, feedback counter), receiver `TwccRxMonitor` (gap-marked arrival windows) and sender `TwccSendTracker` (per-packet delay + window loss correlation). **B2BUA both sides wired**: offers advertise the extmap (`id 1`, draft URI), answers echo it; negotiated legs feed arrival times into `TwccRxMonitor` (1-byte seq unwrapped to u16) emitting RTPFB FMT 15 every 200 ms, and outbound RTP (audio + DTMF relay) is stamped with the one-byte sequence (RFC 8285 §4.2 element writer; retransmissions carry the original seq) — inbound feedback about our SSRC is validated (`media_ssrc` match), correlated against send times, and surfaced as per-leg stats (feedback count, window loss, mean send→receive delay). |
 | RFC 4733 | RTP DTMF (telephone-event) | **Done** | Events 0–15 with start/end semantics + tests; relayed end-to-end by the B2BUA. |
 | RFC 5761 | RTP/RTCP demultiplexing | **Done** | §4 heuristic, unit-tested. |
-| RFC 8285 | RTP header extensions | **Done** | One-byte and two-byte blocks parse/serialize. |
+| RFC 8285 | RTP header extensions | **Done** | One-byte and two-byte blocks parse/serialize; `RtpExtension::onebyte` builds single-element one-byte blocks (id 1–14, ≤16 data bytes, length field = len−1) used by the transport-cc sender path. |
 | RFC 3711 | SRTP/SRTCP | **Done** | `srtp` crate: AES-CM + HMAC-SHA1 (80/32 tags), key derivation (labels 0–5, rate semantics), 64-entry replay window (libsrtp-style relative bits), RFC 3711 Appendix A ROC estimation, per-SSRC stream state, SRTCP E-bit/index. Validated against RFC 3711 B.2/B.3 vectors. |
 | RFC 7714 | SRTP AES-GCM | **Done** | AEAD_AES_128/256_GCM (16-byte tags) + 96-bit tag variants; SRTP/SRTCP IV per §8.1/§9.1; E=0 AAD semantics per §9.3 incl. authenticate-only acceptance of unencrypted SRTCP and the §9 tag-before-index wire order; validated against §16.1.1/16.1.2/16.1.4/16.2.1 and §17.1/§17.3 (SRTCP encrypted + tagging-only, tamper-tested) vectors. |
 | RFC 5764 | DTLS-SRTP handshake/usage | **Done** | `dtls` crate: use_srtp negotiation, RFC 8122 fingerprint generation + pinning, RFC 5764 §4.2 keying export (`EXTRACTOR-dtls_srtp`), self-signed runtime ECDSA P-256 identities. |
@@ -105,9 +105,11 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
 ## 5. Not claimed (honest gaps)
 
-* **Failover (RFC 3263)**: DNS-based next-server selection on timeout/
-  transport failure is not implemented; the transaction layer (sip-tx)
-  reports timeouts so callers can fail over.
+* **Failover (RFC 3263)**: connection-time failover across the resolved
+  candidate list is live on the trunk client (priority-ordered walk with a
+  per-candidate connect budget, winner pinned for keepalives/RTP). Not yet
+  covered: mid-dialog re-resolution for an established session whose peer
+  dies, and DNS TTL-driven cache refresh.
 * **Standalone dialog layer (§12)**: the B2BUA tracks per-leg dialog state
   (tags/Call-ID/CSeq, in-dialog re-INVITE/UPDATE with tag checks); a
   reusable dialog package has not been extracted yet.
@@ -127,14 +129,13 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
   (200 calls @ concurrency 20 → 100% answered, setup p95 305 ms; knee
   between 20–50 under CPU saturation); the release-build 8-core soak
   remains.
-* REMB, B2BUA RTCP channel plumbing (sending NACKs / answering TWCC on live
-  legs), audio-band DTMF detection,
-  NAPTR/SRV, GRUU/Outbound, WebRTC data channels.
+* REMB, audio-band DTMF detection,
+  GRUU/Outbound, WebRTC data channels, mid-dialog RFC 3263 re-resolution.
 
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **548 passing across 56 suites**.
+  `cargo test --workspace` → **555 passing across 56 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16 + §17.1/§17.3
   SRTCP AEAD), STUN (RFC 5769 §2.1/§2.2; MD5 long-term keys + MESSAGE-INTEGRITY
   against independent vectors), G.729 (bcg729 oracle), cross-decode by ffmpeg.

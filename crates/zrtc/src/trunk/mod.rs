@@ -23,10 +23,8 @@ pub struct Endpoint {
     /// Primary SIP target (equals `targets[0]`).
     pub target: SocketAddr,
     /// Full candidate list in RFC 3263 priority order (SRV priority/weight,
-    /// then A/AAAA per target). Connection-time failover across this list
-    /// is the documented follow-up — today only the primary is dialed, so
-    /// the field is reserved (hence the allow).
-    #[allow(dead_code)]
+    /// then A/AAAA per target). `connect` walks it in order and pins
+    /// `target` to the candidate that actually accepted the connection.
     pub targets: Vec<SocketAddr>,
     pub transport: uac::Transport,
     /// SIP identity used for REGISTER (From/To of the REGISTER).
@@ -187,17 +185,51 @@ fn resolve_trunk_targets(
     }
 }
 
-/// Opens a client session to the trunk.
-pub(crate) async fn connect(ep: &Endpoint) -> Result<uac::Session, String> {
-    let opts = uac::UacOpts {
-        target: ep.target,
-        transport: ep.transport,
-        to: ep.aor.clone(),
-        from: ep.aor.clone(),
-        tls_identity: ep.identity.clone(),
-        ..Default::default()
-    };
-    uac::Session::connect(&opts).await
+/// Per-candidate connect timeout. Bounds a dead TCP/TLS/WSS candidate so
+/// the remaining RFC 3263 candidates still get a chance (UDP "connects"
+/// are instant — they only pin the default destination, so the first
+/// candidate always wins there, which is correct: UDP has no connection).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Opens a client session to the trunk, walking the RFC 3263 candidate
+/// list in priority order (connection-time failover). On success `ep.target`
+/// is pinned to the candidate that actually accepted the connection, so
+/// keepalives, request-URIs and RTP all address the winning server.
+pub(crate) async fn connect(ep: &mut Endpoint) -> Result<uac::Session, String> {
+    let mut attempts: Vec<String> = Vec::new();
+    for (i, &candidate) in ep.targets.iter().enumerate() {
+        let opts = uac::UacOpts {
+            target: candidate,
+            transport: ep.transport,
+            to: ep.aor.clone(),
+            from: ep.aor.clone(),
+            tls_identity: ep.identity.clone(),
+            ..Default::default()
+        };
+        match tokio::time::timeout(CONNECT_TIMEOUT, uac::Session::connect(&opts)).await {
+            Ok(Ok(sess)) => {
+                if i > 0 {
+                    tracing::warn!(
+                        candidate = %candidate,
+                        attempt = i + 1,
+                        total = ep.targets.len(),
+                        "trunk failover: primary unreachable, connected to candidate"
+                    );
+                } else {
+                    tracing::debug!(target = %candidate, "trunk connected");
+                }
+                ep.target = candidate;
+                return Ok(sess);
+            }
+            Ok(Err(e)) => attempts.push(format!("{candidate}: {e}")),
+            Err(_) => attempts.push(format!("{candidate}: timed out after {CONNECT_TIMEOUT:?}")),
+        }
+    }
+    Err(format!(
+        "trunk connect failed for {} candidate(s): {}",
+        attempts.len(),
+        attempts.join("; ")
+    ))
 }
 
 /// Builds a request with the endpoint's standard header set plus `extra`
@@ -377,5 +409,65 @@ mod tests {
         assert!(Endpoint::from_config(&cfg("127.0.0.1:5060", "sctp"))
             .unwrap_err()
             .contains("transport"));
+    }
+
+    fn manual_endpoint(targets: Vec<SocketAddr>, transport: uac::Transport) -> Endpoint {
+        Endpoint {
+            target: targets[0],
+            targets,
+            transport,
+            aor: "sip:trunk@127.0.0.1".into(),
+            contact: "sip:trunk@127.0.0.1".into(),
+            keepalive_secs: 0,
+            identity: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_fails_over_to_next_candidate_and_pins_it() {
+        // Candidate 1: a port with no listener (instant ECONNREFUSED).
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live.local_addr().unwrap();
+        let mut ep = manual_endpoint(vec![dead, live_addr], uac::Transport::Tcp);
+
+        let _sess = connect(&mut ep).await.expect("failover connect succeeds");
+        assert_eq!(
+            ep.target, live_addr,
+            "target pinned to the candidate that accepted"
+        );
+        // Keepalive request-URI follows the winner.
+        assert_eq!(
+            ep.keepalive_uri(),
+            format!("sip:127.0.0.1:{}", live_addr.port())
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_reports_every_failed_candidate() {
+        let dead1: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let dead2: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let mut ep = manual_endpoint(vec![dead1, dead2], uac::Transport::Tcp);
+
+        // `Session` is not Debug, so match instead of unwrap_err().
+        let err = match connect(&mut ep).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected every candidate to fail"),
+        };
+        assert!(
+            err.contains(&dead1.to_string()) && err.contains(&dead2.to_string()),
+            "both candidates listed: {err}"
+        );
+        assert_eq!(ep.target, dead1, "target unchanged on total failure");
+    }
+
+    #[tokio::test]
+    async fn connect_single_candidate_behaves_as_before() {
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = live.local_addr().unwrap();
+        let mut ep = manual_endpoint(vec![addr], uac::Transport::Tcp);
+
+        let _sess = connect(&mut ep).await.expect("direct connect");
+        assert_eq!(ep.target, addr);
     }
 }

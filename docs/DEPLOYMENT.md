@@ -79,7 +79,11 @@ accepts `HOST`, `HOST:PORT`, `sip:user@HOST:PORT`, and IPv6 literals
 (`[2001:db8::1]` or `[2001:db8::1]:5060`): a port-less target is resolved
 through RFC 3263 NAPTR/SRV discovery (SRV priority/weight ordering with
 failover candidates, A/AAAA fallback), while an explicit port pins the
-endpoint and skips SRV per §4.2.
+endpoint and skips SRV per §4.2. At connect time the daemon walks the
+resolved candidate list in priority order (3 s connect budget per candidate
+for TCP/TLS/WSS; a dead primary logs `trunk failover` and the next candidate
+takes the call), and the winning address is pinned for keepalives, request
+URIs and RTP. If every candidate fails, the error names each attempt.
 
 The UAC probe supports `--transport udp|tcp|tls|wss`, `--to`, `--from`,
 `--rtp-ms`, `--timeout-secs`.
