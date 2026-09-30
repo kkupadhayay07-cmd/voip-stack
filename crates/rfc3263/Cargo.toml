@@ -1,0 +1,8 @@
+[package]
+name = "rfc3263"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RFC 3263 SIP server discovery: RFC 1035 DNS wire codec, NAPTR (RFC 2915) protocol selection, SRV (RFC 2782) target ordering, A/AAAA fallback — pure std, UDP with TCP fallback for truncated answers"
+
+[dependencies]

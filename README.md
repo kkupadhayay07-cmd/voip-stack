@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 512 tests passing across 54 suites in 19 crates;
+**Current state: 548 tests passing across 56 suites in 20 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
@@ -41,7 +41,8 @@ finding is fixed with regression tests
 | `crates/ai-bridge` | AI bridge: AudioSocket TCP framing (UUID/AUDIO/DTMF/TERMINATE), WebSocket media tap, VAD events (SpeechStart/End), **barge-in** detection, ≤ 20 ms added latency | **Done** |
 | `crates/api` | Control plane: REST (CDR queries/stats, campaigns, pacing), WebSocket event stream, Prometheus `/metrics`, health/readiness | **Done** |
 | `crates/observ` | In-process observability: Wireshark-openable pcap capture (SIP + RTP), human-readable per-call traces, per-leg media diag counters (rx/tx/lost/jitter/concealed) — everything correlated by SIP Call-ID | **Done** |
-| `crates/zrtc` | The daemon: wires everything into one voice service — UDP/TCP/TLS/WSS SIP listeners, SBC → proxy → registrar, B2BUA + loopback sink, outbound trunk (IP / Digest / Bearer / mTLS), outbound originator, AI tap, REST API, observability. Config: `zrtc.toml` | **Done** |
+| `crates/rfc3263` | RFC 3263 SIP server discovery: RFC 1035 DNS wire codec (compression-safe name reader, loop-proof pointers), NAPTR protocol selection (RFC 2915 S-flag), RFC 2782 SRV priority + weighted ordering, A/AAAA fallback, UDP with TC→TCP fallback — pure std, zero deps | **Done** |
+| `crates/zrtc` | The daemon: wires everything into one voice service — UDP/TCP/TLS/WSS SIP listeners, SBC → proxy → registrar, B2BUA + loopback sink, outbound trunk (IP / Digest / Bearer / mTLS, RFC 3263 NAPTR/SRV discovery), outbound originator, AI tap, REST API, observability. Config: `zrtc.toml` | **Done** |
 
 ## Quick start
 
@@ -49,7 +50,7 @@ finding is fixed with regression tests
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 512 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 548 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -193,8 +194,9 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
    attach.
 5. SDP hardening — rejected m-lines, port-0 offers, RFC 3264 §6.1 direction
    clamp, extras serialization, **IPv6 answer address types and RFC 8843
-   BUNDLE group echo done**; remaining: GRUU/Outbound, NAPTR/SRV for
-   carrier-grade signaling.
+   BUNDLE group echo done**. RFC 3263 NAPTR/SRV server discovery — **done**
+   (new `rfc3263` crate, live on the zrtc outbound trunk); remaining:
+   GRUU/Outbound.
 
 ## Documentation
 

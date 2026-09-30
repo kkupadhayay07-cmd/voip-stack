@@ -124,10 +124,12 @@ verified by SNR on real audio).
    on 8-core hardware; publish numbers in DEPLOYMENT.
 4. **Postgres CDR backend** (sqlx) + retention/archival policies.
 5. **WebRTC hardening** — library layer ✅ done in `crates/rtp` (RFC 4585
-   Generic NACK, RFC 4588 RTX, transport-cc feedback); remaining: B2BUA
-   RTCP channel plumbing, data channels (SCTP).
-6. **PRACK/100rel** ✅ done (see addendum); **GRUU/Outbound, NAPTR/SRV**
-   still open for carrier-grade signaling.
+   Generic NACK, RFC 4588 RTX, transport-cc feedback) and B2BUA RTCP
+   plumbing ✅ done (SR/RR + NACK + TWCC live on every media leg);
+   remaining: data channels (SCTP).
+6. **PRACK/100rel** ✅ done (see addendum); **NAPTR/SRV** ✅ done as the
+   `rfc3263` crate (client discovery, live on the zrtc trunk); **GRUU/
+   Outbound** still open for carrier-grade signaling.
 
 ---
 
@@ -160,10 +162,11 @@ addendum records what landed since, so the document stays honest.
 | Load harness | `zrtc load` — concurrent UAC call generator driving the full pipeline (listener → SBC → proxy → B2BUA → sink → paced RTP): `--calls`/`--concurrency`/`--pace-ms`, per-call INVITE→200 setup metric (`uac::run_call` → `PlacedCall`), summary report (mean/p50/p95/p99/max, calls-per-second, mean call hold, deduplicated failure breakdown), `--json` single-line output; `demo/soak.sh` wraps it with a port pre-flight, daemon CDR cross-check and panic gate. Unit tests cover the stats math; the loop is exercised by the soak. Sandbox baseline (2 vCPU, debug build): 200 calls at concurrency 20 → 200/200 answered, setup p50 116 ms / p95 305 ms; release/8-core soak is the documented follow-up |
 | Loss recovery + congestion feedback | `rtp::nack` — RTCP Generic NACK (RFC 4585 §6.2.1): typed `PID`/`BLP` FCI encode/parse with expansion, receiver `NackTracker` (wraparound-safe extended sequences, gap detection, repeat throttling, give-up by age/count, stream-restart + jump guards, ≤16-packet BLP batching); RFC 4588 RTX: sender `RtxPool` (bounded window) + `RtxStream` packetizer (own SSRC/PT/seq, OSN payload prefix, CSRCs dropped) + receiver `RtxDepacketizer` (apt PT + OSN restore, SSRC learning until pinned). `rtp::twcc` — transport-cc feedback (RTPFB FMT 15, draft-holmerberg / libwebrtc wire form): run/vector chunk encode + parse (250 µs recv deltas small/large, 64 ms reference time, feedback counter), receiver `TwccRxMonitor` (gap-marked windows, 64 ms reference floor, bounded memory) and sender `TwccSendTracker` (per-packet delay, window loss, max/mean delay); 23 new tests |
 | B2BUA RTCP plumbing + M1 verified | The media pump now speaks RTCP on every leg: periodic SR (NTP 1900-epoch timestamps, TX packet/octet counters) carrying an RR block about the peer (fraction/cumulative loss, highest extended sequence via the new `NackTracker::highest_extended`, jitter, last-SR/DLSR); RFC 4585 Generic NACK both directions — jitter-buffer gaps produce NACKs through the repeat-throttled tracker, inbound NACKs pull verbatim packets from a 512-packet `RtxPool` retransmission window guarded by a 20 ms per-seq flood limiter (counters: `nacks_rx/tx`, `retransmits_tx`, `nack_misses`, `rtcp_rx`); transport-cc arrival feedback every 200 ms on negotiated legs (1-byte ext seq unwrapped to u16); `sdp::negotiate` answers now echo the offer's `rtcp-fb` list per accepted payload (§4.2) and the transport-cc extmap (RFC 8285 §6), `StreamPlan` carries `rtcp_fb_nack`/`twcc_ext_id`, and offers advertise the channels; pumps enable only what the leg negotiated (unnegotiated legs stay RTCP-silent). 9 new tests (rtp 69→70, sdp 28→30, b2bua 28→33). **VISION M1 checkpoint verified in the same session**: `cargo test --workspace --release` → 503/0 (pre-sweep baseline, well above the 400+ gate) |
+| RFC 3263 trunk discovery | New `rfc3263` crate (the stack's 20th, zero dependencies): RFC 1035 DNS wire codec (query encode with label/length limits; response parse with compression-safe name reader — strictly-backwards pointer rule + 64-hop cap make loops structurally impossible, plus a root-byte end-offset correctness the tests pin), NAPTR (RFC 2915) S-flag protocol selection (SIP+D2U/D2T, SIPS+D2T; replacement IS the next SRV key; regexp-only/A-flag/non-SIP records skipped), RFC 2782 SRV ordering (priority, then weighted-random shuffle with zero-weight records last — seeded xorshift, proportional-distribution test over 30k shuffles), A/AAAA fallback with transport-default ports, explicit-port §4.2 short-circuit, UDP with one retransmission + TC→TCP fallback and ID-validated responses. Wired into the zrtc trunk `Endpoint`: ordered `targets` candidate list (unresolvable SRV targets skipped — client-side failover), HOST/HOST:PORT/`sip:`-URI/IPv6-literal address forms, libc-resolver fallback; fixed a pre-existing malformed trunk keepalive request-URI (`sip:host@port` → `sip:host:port`). 36 new tests (rfc3263 31, zrtc 25→30); workspace 512→548 across 56 suites |
 | Dependency hygiene sweep | 36 unused `[dependencies]`/`[dev-dependencies]` entries removed across 14 crates (proxy/registrar/sbc carried `tokio` they never touched, slim crates held `thiserror`/`tracing`/`rand` with zero call sites, ai-bridge/api held `futures-util`, api a stray `mime` dev-dep, ice a stray `srtp` dev-dep); the never-referenced workspace `async-trait` entry dropped; `cdr` unified onto the workspace `uuid` entry (was a divergent direct version); two dead test-only `snr_db` helpers (superseded by `aligned_snr_db`) deleted from g722/opus; 503/54 gates + demo unchanged |
 
-**Current baseline (supersedes the header numbers):** 19 crates, **512 tests
-across 54 suites**, `clippy -D warnings` clean, `cargo audit` clean. The
+**Current baseline (supersedes the header numbers):** 20 crates, **548 tests
+across 56 suites**, `clippy -D warnings` clean, `cargo audit` clean. The
 external audit is fully closed at every severity — Critical, High and the
 complete P2 backlog — with regression tests
 (`docs/BUG_AUDIT_2026-09.md`).
@@ -175,7 +178,8 @@ sandbox baseline published); WebRTC hardening library layer ✅ done (RFC 4585
 NACK, RFC 4588 RTX, transport-cc in `rtp`) and B2BUA RTCP plumbing ✅ done
 (SR/RR + NACK answer/ask + TWCC feedback live on every media leg);
 **VISION M1 checkpoint ✅ verified** (`cargo test --workspace --release`,
-503/0 pre-sweep). Remaining: release-mode soak on 8-core
+503/0 pre-sweep). RFC 3263 server discovery ✅ done (`rfc3263` crate, 20th,
+live on the zrtc trunk). Remaining: release-mode soak on 8-core
 hardware, Postgres CDR backend, data channels (SCTP), sender-side
 transport-cc extension attach, SDP hardening (rejected m-lines, port-0
 answers, the §6.1 direction clamp, IPv6 answer address types and RFC 8843

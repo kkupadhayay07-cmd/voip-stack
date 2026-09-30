@@ -74,7 +74,12 @@ prefix routes), `[sink]` (loopback UAS for demos), `[outbound]`
 (REST port), `[observ]` (enable, log dir, pcap + trace options), and
 `[trunk]` for outbound carrier peering — auth modes `ip`, `digest`
 (REGISTER or INVITE-challenge), `bearer`, or `tls_client_cert` (mTLS);
-see `demo/zrtc.toml.example` for a worked example of each.
+see `demo/zrtc.toml.example` for a worked example of each. `[trunk].address`
+accepts `HOST`, `HOST:PORT`, `sip:user@HOST:PORT`, and IPv6 literals
+(`[2001:db8::1]` or `[2001:db8::1]:5060`): a port-less target is resolved
+through RFC 3263 NAPTR/SRV discovery (SRV priority/weight ordering with
+failover candidates, A/AAAA fallback), while an explicit port pins the
+endpoint and skips SRV per §4.2.
 
 The UAC probe supports `--transport udp|tcp|tls|wss`, `--to`, `--from`,
 `--rtp-ms`, `--timeout-secs`.

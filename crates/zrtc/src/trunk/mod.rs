@@ -5,7 +5,7 @@
 pub mod call;
 pub mod register;
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use sip_core::builder::RequestBuilder;
@@ -18,8 +18,16 @@ use crate::config::Config;
 use crate::uac;
 
 /// A resolved vendor trunk endpoint.
+#[derive(Debug)]
 pub struct Endpoint {
+    /// Primary SIP target (equals `targets[0]`).
     pub target: SocketAddr,
+    /// Full candidate list in RFC 3263 priority order (SRV priority/weight,
+    /// then A/AAAA per target). Connection-time failover across this list
+    /// is the documented follow-up — today only the primary is dialed, so
+    /// the field is reserved (hence the allow).
+    #[allow(dead_code)]
+    pub targets: Vec<SocketAddr>,
     pub transport: uac::Transport,
     /// SIP identity used for REGISTER (From/To of the REGISTER).
     pub aor: String,
@@ -42,8 +50,8 @@ impl Endpoint {
             .ok_or("trunk not configured: [trunk] address is missing")?
             .to_string();
 
-        // Accept HOST, HOST:PORT or a full "sip:...@HOST:PORT" — extract the
-        // host:port part and resolve it (DNS allowed). A user@ part is
+        // Accept HOST, HOST:PORT, "sip:...@HOST:PORT", or IPv6 literals
+        // ("[2001:db8::1]" or "[2001:db8::1]:5060"). A user@ part is
         // stripped: "sip:user@host:port" must resolve host:port, not
         // "user@host".
         let hostport = address
@@ -57,21 +65,15 @@ impl Endpoint {
             .next()
             .unwrap_or(&address)
             .to_string();
-        let (host, port) = match hostport.rsplit_once(':') {
-            Some((h, p)) => (
-                h.to_string(),
-                p.parse::<u16>()
-                    .map_err(|_| format!("trunk address '{hostport}': bad port"))?,
-            ),
-            None => (hostport.clone(), 5060),
-        };
-        // Blocking resolve is fine at startup/call setup (one-shot).
-        let target: SocketAddr = std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), port))
-            .map_err(|e| format!("trunk address '{hostport}': cannot resolve: {e}"))?
-            .next()
-            .ok_or_else(|| format!("trunk address '{hostport}': no addresses"))?;
+        let (host, explicit_port) = split_host_port(&hostport)?;
 
         let transport = uac::Transport::parse(&t.transport)?;
+        // Blocking resolve is fine at startup/call setup (one-shot).
+        let targets = resolve_trunk_targets(&host, explicit_port, transport, &hostport)?;
+        tracing::debug!(trunk = %hostport, candidates = targets.len(),
+            primary = %targets[0], "trunk targets resolved (RFC 3263 order)");
+        let target = targets[0];
+
         let user = t.auth_user.clone().unwrap_or_else(|| "trunk".to_string());
         let aor = t
             .aor
@@ -80,6 +82,7 @@ impl Endpoint {
         let contact = format!("sip:{user}@{}", cfg.sip.host);
         Ok(Endpoint {
             target,
+            targets,
             transport,
             aor,
             contact,
@@ -103,7 +106,84 @@ impl Endpoint {
 
     /// Keepalive request-URI (points at the trunk itself).
     pub fn keepalive_uri(&self) -> String {
-        format!("sip:{}@{}", self.host(), self.target.port())
+        format!("sip:{}:{}", self.host(), self.target.port())
+    }
+}
+
+/// Splits a trunk "hostport" token into (host, explicit port). Handles
+/// bracketed and bare IPv6 literals; the default port is applied later by
+/// the transport (RFC 3263: a port-less target goes through SRV).
+fn split_host_port(hostport: &str) -> Result<(String, Option<u16>), String> {
+    if hostport.starts_with('[') {
+        let (h6, rest) = hostport
+            .split_once(']')
+            .ok_or_else(|| format!("trunk address '{hostport}': unclosed '['"))?;
+        let host = h6.trim_start_matches('[').to_string();
+        let port = rest
+            .strip_prefix(':')
+            .map(|p| p.parse::<u16>())
+            .transpose()
+            .map_err(|_| format!("trunk address '{hostport}': bad port"))?;
+        return Ok((host, port));
+    }
+    if hostport.matches(':').count() > 1 {
+        // Bare IPv6 literal (no brackets, no port).
+        return Ok((hostport.to_string(), None));
+    }
+    match hostport.rsplit_once(':') {
+        Some((h, p)) => {
+            let port = p
+                .parse::<u16>()
+                .map_err(|_| format!("trunk address '{hostport}': bad port"))?;
+            Ok((h.to_string(), Some(port)))
+        }
+        None => Ok((hostport.to_string(), None)),
+    }
+}
+
+/// Resolves the trunk host into an ordered candidate list.
+///
+/// RFC 3263 discovery first (NAPTR/SRV/A/AAAA via the system resolver on
+/// :53): an explicit port pins the endpoint, a transport selects the SRV
+/// key (`_sip._udp.host` / `_sip._tcp` / `_sips._tcp`), and SRV records
+/// give prioritized, load-weighted failover candidates. When the system
+/// resolver is unavailable or discovery yields nothing, falls back to the
+/// libc resolver with the explicit or transport-default port.
+fn resolve_trunk_targets(
+    host: &str,
+    explicit_port: Option<u16>,
+    transport: uac::Transport,
+    addr_label: &str,
+) -> Result<Vec<SocketAddr>, String> {
+    let sip_transport = match transport {
+        uac::Transport::Udp => rfc3263::SipTransport::Udp,
+        uac::Transport::Tcp => rfc3263::SipTransport::Tcp,
+        uac::Transport::Tls => rfc3263::SipTransport::Tls,
+        // RFC 3263 predates WebSocket: WSS rides on TCP, so use the TCP SRV
+        // key (there is no SIP+D2W service token).
+        uac::Transport::Wss => rfc3263::SipTransport::Tcp,
+    };
+    match rfc3263::Resolver::system() {
+        Ok(resolver) => match resolver.resolve(host, Some(sip_transport), explicit_port) {
+            Ok(list) if !list.is_empty() => return Ok(list),
+            Ok(_) => {
+                tracing::warn!(trunk = %addr_label, "RFC 3263 discovery returned no addresses")
+            }
+            Err(e) => tracing::warn!(trunk = %addr_label, error = %e,
+                "RFC 3263 discovery failed; falling back to libc resolver"),
+        },
+        Err(e) => tracing::warn!(trunk = %addr_label, error = %e,
+            "no DNS nameserver available; falling back to libc resolver"),
+    }
+    let port = explicit_port.unwrap_or(sip_transport.default_port());
+    let addrs: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("trunk address '{addr_label}': cannot resolve: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        Err(format!("trunk address '{addr_label}': no addresses"))
+    } else {
+        Ok(addrs)
     }
 }
 
@@ -224,5 +304,78 @@ pub(crate) async fn keepalive_loop(
             Ok(Err(e)) => tracing::warn!("trunk keepalive recv failed: {e}"),
             Err(_) => tracing::warn!("trunk keepalive: no response within 2s"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(address: &str, transport: &str) -> Config {
+        toml::from_str(&format!(
+            "[trunk]\naddress = \"{address}\"\ntransport = \"{transport}\"\n"
+        ))
+        .expect("test config")
+    }
+
+    #[test]
+    fn split_host_port_handles_v4_v6_and_sip_uris() {
+        assert_eq!(
+            split_host_port("pbx.example.com").unwrap(),
+            ("pbx.example.com".to_string(), None)
+        );
+        assert_eq!(
+            split_host_port("pbx.example.com:5070").unwrap(),
+            ("pbx.example.com".to_string(), Some(5070))
+        );
+        assert_eq!(
+            split_host_port("2001:db8::1").unwrap(),
+            ("2001:db8::1".to_string(), None)
+        );
+        assert_eq!(
+            split_host_port("[2001:db8::1]:5061").unwrap(),
+            ("2001:db8::1".to_string(), Some(5061))
+        );
+        assert!(split_host_port("host:notaport").is_err());
+        assert!(split_host_port("[2001:db8::1").is_err());
+    }
+
+    #[test]
+    fn endpoint_resolves_ip_literal_target_with_explicit_port() {
+        // IP literal + explicit port: RFC 3263 fast path, no DNS at all.
+        let ep = Endpoint::from_config(&cfg("127.0.0.1:5070", "udp")).unwrap();
+        assert_eq!(ep.target.port(), 5070);
+        assert_eq!(ep.targets.len(), 1);
+        assert_eq!(ep.targets[0], ep.target);
+        assert_eq!(ep.transport, uac::Transport::Udp);
+        assert_eq!(ep.host(), "127.0.0.1");
+        assert_eq!(ep.keepalive_uri(), "sip:127.0.0.1:5070");
+    }
+
+    #[test]
+    fn endpoint_accepts_sip_uri_address_form_and_strips_params() {
+        // "sip:trunk@127.0.0.1:6060;transport=udp" — user part and params
+        // are stripped before resolution.
+        let ep =
+            Endpoint::from_config(&cfg("sip:trunk@127.0.0.1:6060;transport=udp", "udp")).unwrap();
+        assert_eq!(ep.target, "127.0.0.1:6060".parse::<SocketAddr>().unwrap());
+        assert_eq!(ep.aor, "sip:trunk@127.0.0.1");
+    }
+
+    #[test]
+    fn endpoint_resolves_bracketed_ipv6_literal() {
+        let ep = Endpoint::from_config(&cfg("[::1]:5080", "tcp")).unwrap();
+        assert_eq!(ep.target, "[::1]:5080".parse::<SocketAddr>().unwrap());
+        assert_eq!(ep.transport, uac::Transport::Tcp);
+    }
+
+    #[test]
+    fn endpoint_errors_on_missing_address_and_bad_transport() {
+        assert!(Endpoint::from_config(&cfg("", "udp"))
+            .unwrap_err()
+            .contains("address is missing"));
+        assert!(Endpoint::from_config(&cfg("127.0.0.1:5060", "sctp"))
+            .unwrap_err()
+            .contains("transport"));
     }
 }

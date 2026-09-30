@@ -21,8 +21,8 @@ hardening (IP4/IP6 `o=`/`c=` address types picked from the local host
 literal, RFC 8843 BUNDLE group echo with the accepted mids), a
 concurrent-call load harness with percentile reporting, and RTP loss
 recovery + congestion feedback (RFC 4585 Generic NACK, RFC 4588 RTX,
-transport-cc); 512 tests green
-across 54 suites — **every audit finding at every severity is fixed**).
+transport-cc); 548 tests green
+across 56 suites — **every audit finding at every severity is fixed**).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
@@ -37,7 +37,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC 3261 | SIP: transports (§18) | **Done** (core) | UDP/TCP/TLS/WSS listeners wired in the `zrtc` daemon (TLS via whitelisted OpenSSL, self-signed identity at startup, mTLS client certs for trunks); message layer covers datagram + stream framing incl. §18.3 robustness. |
 | RFC 3261 | SIP: dialogs (§12) | **Partial** | B2BUA tracks per-leg dialog state (tags/Call-ID/CSeq); generic dialog package not extracted. |
 | RFC 3262 | PRACK / 100rel | **Done** (core) | B2BUA, both legs. UAS: reliable 180 (`Require: 100rel` + `RSeq` from [1, 2³¹−1], To-tagged early dialog) when the caller advertises 100rel, Timer-G-style retransmission (T1 doubling to T2) until `PRACK`, 64·T1 give-up with 503 + BYE, the final 200 parked until the PRACK arrives (§3), RAck matching with 481/400 verdicts and idempotent 200 for retransmitted PRACKs. UAC: only a 101–199 carrying BOTH `Require: 100rel` and `RSeq` is PRACKed (§4 — never a 100, never an unmarked 1xx), answered with PRACK carrying `RAck` (own dialog CSeq); a retransmitted 1xx (same `RSeq`) is answered by resending the STORED PRACK byte-identically (same CSeq number and branch, RFC 3261 §17.1.2); 421 Extension-Required dial retry once with the demanded extensions merged into `Supported` (§3); non-INVITE responses excluded from the INVITE transaction slot. |
-| RFC 3263 | DNS (NAPTR/SRV) for SIP | **Partial** | Proxy falls back to system resolver for hostnames; NAPTR/SRV discovery not implemented. |
+| RFC 3263 | DNS (NAPTR/SRV) for SIP | **Done** (client discovery) | `rfc3263` crate: RFC 1035 wire codec (name decompression with a strictly-backwards pointer rule + jump cap — loops are structurally rejected), NAPTR (RFC 2915) S-flag protocol selection from the service field (SIP+D2U/D2T, SIPS+D2T) with the replacement key as the next SRV query, SRV (RFC 2782) priority + weighted-random ordering (zero-weight last, seeded xorshift, deterministic in tests), A/AAAA fallback with transport-default ports (5060/5061), explicit-port short-circuit per §4.2, IP-literal fast path (no DNS). Client: UDP with one retransmission, TC→TCP fallback, ID-validated responses. Live on the zrtc outbound trunk: HOST / HOST:PORT / `sip:` URI / IPv6-literal addresses resolve through RFC 3263 into an ordered candidate list (SRV targets whose addresses fail are skipped — client-side failover to the next candidate), with a libc-resolver fallback when no nameserver is configured. Remaining: NAPTR regexp rewrite (regexp-only NAPTRs are skipped), DNSSEC, connection-timeout failover re-resolution. |
 | RFC 3264 | Offer/answer | **Done** | `sdp::negotiate`: full RFC 3264 engine with `StreamPlan` projection. Answer direction is the explicit §6.1 matrix clamped to what the offer permits (sendonly offers can never draw a receiving answer, etc.), rejected m-lines are answered with their own m-line at port 0 and a null `c=` line of the offer's address type (§6), port-0 offers are answered port 0. The answer's own `o=`/`c=` lines pick `IN IP4`/`IN IP6` from the local host literal (RFC 8866 §4.4 — an IPv6 address is never mislabeled IP4); the offer's family never dictates the answer's. |
 | RFC 3326 | Reason header | **Partial** | Header type modelled; no protocol semantics applied yet. |
 | RFC 3515 | REFER | **Planned** | `Refer-To` header type modelled; call flows not implemented. |
@@ -134,7 +134,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **512 passing across 54 suites**.
+  `cargo test --workspace` → **548 passing across 56 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16 + §17.1/§17.3
   SRTCP AEAD), STUN (RFC 5769 §2.1/§2.2; MD5 long-term keys + MESSAGE-INTEGRITY
   against independent vectors), G.729 (bcg729 oracle), cross-decode by ffmpeg.
