@@ -13,11 +13,15 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 555 tests passing across 56 suites in 20 crates;
+**Current state: 561 tests passing across 56 suites in 20 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
-([`docs/BUG_AUDIT_2026-09.md`](docs/BUG_AUDIT_2026-09.md)).**
+([`docs/BUG_AUDIT_2026-09.md`](docs/BUG_AUDIT_2026-09.md)) — and a self-audit
+of the Task 39–42 media/DNS work fixed 1 critical + 5 major wire-level bugs
+before they could ship (transport-cc S-bit chunks, inter-arrival deltas,
+2-byte sequences, rtcp-mux advertisement, IPv6 trunk URIs, blocking DNS on
+async workers).**
 
 ## Workspace layout
 
@@ -50,7 +54,7 @@ finding is fixed with regression tests
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 555 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 561 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -97,6 +101,17 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
   padding case (bit never emitted without its octets); the jitter buffer
   stays paced across the 32-bit timestamp wrap and never jumps sequence
   gaps (hole slots are concealed with proper loss accounting).
+* **transport-cc wire correctness (draft-holmerberg §3.1.4/§3.1.5)**: status
+  chunks follow the real bit layout — run chunks (T=0), one-bit vector
+  chunks (T=1, S=0, fourteen symbols at bits 13..0, the form libwebrtc/pion
+  emit most) and two-bit vector chunks (T=1, S=1 = word 0xC000, seven
+  symbols at bit pairs 13:12 … 1:0, MSB-first); recv deltas are true
+  INTER-ARRIVAL deltas (first vs the reference, rest vs the previous
+  received packet) and the sender reconstructs arrivals by accumulation;
+  the transport-cc sequence rides a 2-byte big-endian one-byte-header
+  element (RFC 8285 §4.2) in both directions. Self-roundtrip tests alone
+  could never catch these — the fixed expectations were cross-checked
+  against libwebrtc/pion behavior and hand-built spec wire forms.
 * **Security primitives**: SRTP validated against RFC 3711 B.2/B.3 and
   RFC 7714 §16 conformance vectors; SRTCP AEAD against RFC 7714 §17.1/§17.3
   (encrypted, tagging-only E=0, tamper); STUN against RFC 5769 §2.1/§2.2;
@@ -200,7 +215,10 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
    transport-cc feedback in `crates/rtp`) **and B2BUA RTCP plumbing ✅**
    (SR/RR + NACK answer/ask + TWCC feedback live on every media leg)
    **and sender-side transport-cc ✅** (outbound ext stamping + feedback
-   correlation into per-leg stats); remaining: data channels (SCTP).
+   correlation into per-leg stats) **and wire-format audit ✅** (S-bit
+   chunks, inter-arrival deltas, 2-byte sequences, rtcp-mux offered per
+   RFC 5761, RR-prefixed compounds + SDES CNAME per RFC 3550); remaining:
+   data channels (SCTP).
 5. SDP hardening — rejected m-lines, port-0 offers, RFC 3264 §6.1 direction
    clamp, extras serialization, **IPv6 answer address types and RFC 8843
    BUNDLE group echo done**. RFC 3263 NAPTR/SRV server discovery — **done**

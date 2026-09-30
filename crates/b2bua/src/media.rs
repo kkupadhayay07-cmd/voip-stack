@@ -11,7 +11,7 @@ use rand::Rng;
 use rtp::jitter::{JitterBuffer, JitterConfig, PushResult};
 use rtp::nack::{nack_packet, nack_seqs, parse_nack_fci, NackTracker, RtxPool, RTX_POOL_DEFAULT};
 use rtp::packet::{RtpExtension, RtpPacket};
-use rtp::rtcp::{encode_compound, encode_packet, parse_compound, RtcpPacket, SenderInfo};
+use rtp::rtcp::{encode_compound, parse_compound, RtcpPacket, SdesChunk, SdesType, SenderInfo};
 use rtp::twcc::{parse_twcc, twcc_packet, TwccRxMonitor, TwccSendTracker};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -70,11 +70,13 @@ pub struct MediaStats {
     pub packets_rx: std::sync::atomic::AtomicU64,
     pub packets_tx: std::sync::atomic::AtomicU64,
     pub packets_lost: std::sync::atomic::AtomicU64,
-    /// RTCP datagrams parsed (any packet type).
+    /// RTCP packets parsed (counted per packet inside a compound, not per
+    /// datagram).
     pub rtcp_rx: std::sync::atomic::AtomicU64,
     /// Generic NACK requests received (RFC 4585 §6.2.1).
     pub nacks_rx: std::sync::atomic::AtomicU64,
-    /// Generic NACK packets we sent (gap reports to the peer).
+    /// Generic NACK FCI entries sent (gap sequences reported to the peer;
+    /// up to 64 entries ride in one feedback packet).
     pub nacks_tx: std::sync::atomic::AtomicU64,
     /// Media packets retransmitted to answer a NACK.
     pub retransmits_tx: std::sync::atomic::AtomicU64,
@@ -85,7 +87,9 @@ pub struct MediaStats {
     pub twcc_feedbacks_rx: std::sync::atomic::AtomicU64,
     /// Packets reported lost in the latest transport-cc feedback window.
     pub twcc_window_lost: std::sync::atomic::AtomicU64,
-    /// Mean send→receive delay (µs) across the latest feedback window.
+    /// Mean excess transport-cc delay (µs) over the fastest observed packet
+    /// across the latest feedback window (clock-domain free — see
+    /// `TwccPacketResult::delay_us`).
     pub twcc_mean_delay_us: std::sync::atomic::AtomicI64,
 }
 
@@ -300,11 +304,9 @@ async fn run_pump(
     let mut nack_tracker = NackTracker::default();
     let mut twcc = TwccRxMonitor::new(1024);
     let mut twcc_fb_count: u8 = 0;
-    // Unwrapped 16-bit view of the 1-byte transport-cc sequence numbers.
-    let mut twcc_ext_seq: Option<u16> = None;
-    // Sender side: stamp the negotiated one-byte transport-cc sequence on
-    // every outbound packet and remember send times so the peer's feedback
-    // correlates into per-packet delays.
+    // Sender side: stamp the negotiated transport-cc sequence (2-byte
+    // element, draft-holmerberg §3.1) on every outbound packet and remember
+    // send times so the peer's feedback correlates into per-packet delays.
     let mut twcc_tx_seq: u16 = 0;
     let mut twcc_tx = cfg.twcc_ext.map(|_| TwccSendTracker::new(1024));
     let mut remote_ssrc: Option<u32> = None;
@@ -364,7 +366,12 @@ async fn run_pump(
                     let (last_sr_mid, dlsr) = match last_sr {
                         Some((mid, t)) => {
                             let el = t.elapsed();
-                            (mid, (el.as_secs() * 65536 + u64::from(el.subsec_millis()) * 65 + 50) as u32)
+                            // DLSR in 1/65536 s: micros × 65536 / 1e6,
+                            // rounded (the millisecond shortcut drifted up
+                            // to 7.4 ms, polluting peer RTT estimates).
+                            let ticks = ((el.as_micros() * 65536 + 500_000) / 1_000_000)
+                                .min(u128::from(u32::MAX)) as u32;
+                            (mid, ticks)
                         }
                         None => (0, 0),
                     };
@@ -372,9 +379,15 @@ async fn run_pump(
                     blocks.push(rtp::rtcp::ReportBlock {
                         ssrc: rssrc,
                         fraction_lost: fraction,
-                        cumulative_lost: lost_now.min(0x00FF_FFFF) as u32,
+                        cumulative_lost: lost_now.min(0x007F_FFFF) as u32,
                         highest_sequence: if highest < 0 { 0 } else { (highest as u64 & 0xFFFF_FFFF) as u32 },
-                        interarrival_jitter: ((jb.jitter_ms() as u64 * u64::from(rx_clock)) / 1000).min(u64::from(u32::MAX)) as u32,
+                        // Jitter in RTP timestamp units: keep µs precision
+                        // through the conversion (an early ms truncation
+                        // reported 0 for sub-millisecond jitter).
+                        interarrival_jitter: (((jb.jitter_ms() * 1000.0) as u64
+                            * u64::from(rx_clock))
+                            / 1_000_000)
+                            .min(u64::from(u32::MAX)) as u32,
                         last_sr: last_sr_mid,
                         delay_since_last_sr: dlsr,
                     });
@@ -392,7 +405,13 @@ async fn run_pump(
                     },
                     blocks,
                 );
-                let wire = encode_compound(&[sr]);
+                // RFC 3550 §6.5.1: every compound RTCP packet carries SDES
+                // with the CNAME item, identifying this RTCP member.
+                let cname = RtcpPacket::Sdes(vec![SdesChunk {
+                    ssrc,
+                    items: vec![(SdesType::Cname, format!("zrtc-{ssrc:08x}"))],
+                }]);
+                let wire = encode_compound(&[sr, cname]);
                 let _ = rtp.send_to(&wire, dst).await;
             }
             _ = twcc_tick.tick() => {
@@ -404,7 +423,14 @@ async fn run_pump(
                         if let Some(fb) = twcc.build_feedback(ssrc, rssrc, twcc_fb_count) {
                             twcc_fb_count = twcc_fb_count.wrapping_add(1);
                             if let Ok(p) = twcc_packet(&fb) {
-                                let _ = rtp.send_to(&encode_packet(&p), dst).await;
+                                // RFC 3550 §6.1 / RFC 4585 §6.1: a compound
+                                // starts with SR/RR — prefix an empty RR so
+                                // strict receivers accept the feedback.
+                                let rr = RtcpPacket::ReceiverReport {
+                                    ssrc,
+                                    blocks: Vec::new(),
+                                };
+                                let _ = rtp.send_to(&encode_compound(&[rr, p]), dst).await;
                             }
                         }
                     }
@@ -428,6 +454,7 @@ async fn run_pump(
                         &mut last_sr,
                         &mut twcc_tx,
                         ssrc,
+                        remote_ssrc,
                         &stats,
                     )
                     .await;
@@ -456,23 +483,21 @@ async fn run_pump(
                     if !ready.is_empty() {
                         stats.nacks_tx.fetch_add(ready.len() as u64, Relaxed);
                         let p = nack_packet(ssrc, pkt.ssrc(), &ready);
-                        let _ = rtp.send_to(&encode_packet(&p), src).await;
+                        // RFC 3550 §6.1 / RFC 4585 §6.1: a compound starts
+                        // with SR/RR — prefix an empty RR.
+                        let rr = RtcpPacket::ReceiverReport {
+                            ssrc,
+                            blocks: Vec::new(),
+                        };
+                        let _ = rtp.send_to(&encode_compound(&[rr, p]), src).await;
                     }
                 }
                 if let (Some(ext_id), Some(ext)) = (cfg.twcc_ext, pkt.extension.as_ref()) {
                     if let Some(tseq) = onebyte_ext_value(ext, ext_id) {
-                        // The draft's sequence number is one byte wide (mod
-                        // 256); unwrap it into the u16 space the monitor and
-                        // the feedback encoding use.
-                        let unwrapped = match twcc_ext_seq {
-                            None => u16::from(tseq),
-                            Some(last) => {
-                                let d = tseq.wrapping_sub(last as u8) as i8;
-                                last.wrapping_add(d as u16)
-                            }
-                        };
-                        twcc_ext_seq = Some(unwrapped);
-                        twcc.on_packet(unwrapped, Some(started.elapsed().as_micros() as u64));
+                        // The draft's transport-cc sequence number is a
+                        // 2-byte big-endian element; the monitor unwraps the
+                        // u16 space itself.
+                        twcc.on_packet(tseq, Some(started.elapsed().as_micros() as u64));
                     }
                 }
                 // RFC 4733 DTMF passthrough: the event crosses the bridge
@@ -579,11 +604,13 @@ async fn run_pump(
                             );
                             twcc_tx_seq = twcc_tx_seq.wrapping_add(1);
                         }
-                        tx_pkts += 1;
-                        tx_octets += relay.payload.len() as u64;
-                        resend.store(&relay);
                         let dst = *remote.lock().await;
                         if let Some(dst) = dst {
+                            // RFC 3550 §6.4.1: SR packet/octet counters track
+                            // what was actually SENT.
+                            tx_pkts += 1;
+                            tx_octets += relay.payload.len() as u64;
+                            resend.store(&relay);
                             // media hook: DTMF relay tap
                             let wire = relay.encode();
                             stats.packets_tx.fetch_add(1, Relaxed);
@@ -618,11 +645,13 @@ async fn run_pump(
                                     twcc_tx_seq = twcc_tx_seq.wrapping_add(1);
                                 }
                                 stats.frames_encoded.fetch_add(1, Relaxed);
-                                tx_pkts += 1;
-                                tx_octets += pkt.payload.len() as u64;
-                                resend.store(&pkt);
                                 let dst = *remote.lock().await;
                                 if let Some(dst) = dst {
+                                    // RFC 3550 §6.4.1: SR packet/octet counters
+                                    // track what was actually SENT.
+                                    tx_pkts += 1;
+                                    tx_octets += pkt.payload.len() as u64;
+                                    resend.store(&pkt);
                                     // media hook: encoded frame tap
                                     let encoded = pkt.encode();
                                     stats.packets_tx.fetch_add(1, Relaxed);
@@ -672,6 +701,7 @@ async fn handle_rtcp(
     last_sr: &mut Option<(u32, Instant)>,
     twcc_tx: &mut Option<TwccSendTracker>,
     our_ssrc: u32,
+    remote_ssrc: Option<u32>,
     stats: &MediaStats,
 ) {
     let Ok(packets) = parse_compound(wire) else {
@@ -681,9 +711,14 @@ async fn handle_rtcp(
         stats.rtcp_rx.fetch_add(1, Relaxed);
         match p {
             RtcpPacket::SenderReport(info, _) => {
-                let mid =
-                    ((u64::from(info.ntp_sec) & 0xFFFF) << 16) | u64::from(info.ntp_frac >> 16);
-                *last_sr = Some((mid as u32, Instant::now()));
+                // RFC 3550 §6.4.1: LSR/DLSR must refer to the last SR from
+                // THE PEER'S media stream — an SR from any other SSRC (RTX,
+                // probing) must not overwrite the bookkeeping.
+                if Some(info.ssrc) == remote_ssrc {
+                    let mid =
+                        ((u64::from(info.ntp_sec) & 0xFFFF) << 16) | u64::from(info.ntp_frac >> 16);
+                    *last_sr = Some((mid as u32, Instant::now()));
+                }
             }
             RtcpPacket::Rtpfb {
                 fmt: 1, payload, ..
@@ -718,7 +753,7 @@ async fn handle_rtcp(
                 // Transport-cc feedback about OUR outbound stream (the peer
                 // echoes our SSRC as media_ssrc): correlate against send
                 // times and surface the congestion window.
-                let Some(tracker) = twcc_tx.as_ref() else {
+                let Some(tracker) = twcc_tx.as_mut() else {
                     continue;
                 };
                 let about_us = matches!(
@@ -747,9 +782,10 @@ async fn handle_rtcp(
 }
 
 /// Extract a one-byte-header extension element value (RFC 8285 §4.2) by id.
-/// Transport-cc sequence numbers are 1-byte elements; returns their payload
-/// byte. `id == 0` starts padding, `id == 15` is reserved — both end the scan.
-fn onebyte_ext_value(ext: &rtp::packet::RtpExtension, want_id: u8) -> Option<u8> {
+/// Transport-cc sequence numbers are 2-byte big-endian elements (draft
+/// §3.1); returns their u16 value. `id == 0` starts padding, `id == 15` is
+/// reserved — both end the scan.
+fn onebyte_ext_value(ext: &rtp::packet::RtpExtension, want_id: u8) -> Option<u16> {
     if ext.profile != 0xBEDE {
         return None;
     }
@@ -765,8 +801,8 @@ fn onebyte_ext_value(ext: &rtp::packet::RtpExtension, want_id: u8) -> Option<u8>
         if id == 15 {
             break;
         }
-        if id == want_id && data_len == 1 && off + 1 < d.len() {
-            return Some(d[off + 1]);
+        if id == want_id && data_len == 2 && off + 2 < d.len() {
+            return Some(u16::from_be_bytes([d[off + 1], d[off + 2]]));
         }
         off += 1 + data_len;
     }
@@ -785,7 +821,12 @@ fn attach_twcc(
     pkt: &mut RtpPacket,
     now_us: u64,
 ) {
-    pkt.extension = Some(RtpExtension::onebyte(ext_id, &[(seq & 0xFF) as u8]));
+    // 2-byte big-endian element (draft-holmerberg §3.1); a negotiated id
+    // outside 1..=14 skips stamping rather than emitting malformed wire.
+    match RtpExtension::onebyte(ext_id, &seq.to_be_bytes()) {
+        Ok(ext) => pkt.extension = Some(ext),
+        Err(e) => tracing::debug!(ext_id, error = %e, "transport-cc ext not stamped"),
+    }
     tracker.record_send(seq, now_us);
 }
 
@@ -794,6 +835,7 @@ mod tests {
     use super::*;
     use rtp::nack::{nack_packet, GenericNack};
     use rtp::packet::RtpExtension;
+    use rtp::rtcp::encode_packet;
 
     fn pump_cfg() -> PumpConfig {
         PumpConfig {
@@ -820,12 +862,17 @@ mod tests {
         )
     }
 
-    fn ext_pkt(seq: u16, ssrc: u32, twcc_seq: u8) -> Vec<u8> {
+    fn ext_pkt(seq: u16, ssrc: u32, twcc_seq: u16) -> Vec<u8> {
         let mut p = media_pkt(seq, ssrc);
         p.extension = Some(RtpExtension {
             profile: 0xBEDE,
-            // id 1, 1-byte data (transport-cc seq), zero-padded to a word.
-            data: Bytes::from(vec![0x10, twcc_seq, 0, 0]),
+            // id 1, 2-byte BE data (transport-cc seq), zero-padded to a word.
+            data: Bytes::from(vec![
+                0x11,
+                (twcc_seq >> 8) as u8,
+                (twcc_seq & 0xFF) as u8,
+                0,
+            ]),
         });
         p.encode()
     }
@@ -885,9 +932,9 @@ mod tests {
     fn onebyte_ext_extraction_matches_id_and_profile() {
         let ext = RtpExtension {
             profile: 0xBEDE,
-            data: Bytes::from(vec![0x10, 0x7F, 0, 0]),
+            data: Bytes::from(vec![0x11, 0x01, 0x02, 0]), // id 1, 2-byte data
         };
-        assert_eq!(onebyte_ext_value(&ext, 1), Some(0x7F));
+        assert_eq!(onebyte_ext_value(&ext, 1), Some(0x0102));
         assert_eq!(onebyte_ext_value(&ext, 2), None);
         // Wrong profile (two-byte space) → never matches.
         let wrong = RtpExtension {
@@ -898,9 +945,16 @@ mod tests {
         // Padding terminates the scan.
         let padded = RtpExtension {
             profile: 0xBEDE,
-            data: Bytes::from(vec![0x00, 0x10, 0x33]),
+            data: Bytes::from(vec![0x00, 0x11, 0x00, 0x01]),
         };
         assert_eq!(onebyte_ext_value(&padded, 1), None);
+        // A 1-byte element with the right id is NOT a transport-cc sequence
+        // (the draft requires 2 bytes) — must not be misread.
+        let short = RtpExtension {
+            profile: 0xBEDE,
+            data: Bytes::from(vec![0x10, 0x7F, 0, 0]),
+        };
+        assert_eq!(onebyte_ext_value(&short, 1), None);
     }
 
     #[tokio::test]
@@ -1007,8 +1061,8 @@ mod tests {
         cfg.twcc_ext = Some(1);
         let tp = start(cfg).await;
 
-        for i in 0..4u8 {
-            let w = ext_pkt(200 + u16::from(i), 0x777, 10 + i);
+        for i in 0..4u16 {
+            let w = ext_pkt(200 + i, 0x777, 10 + i);
             tp.test.send_to(&w, tp.pump_addr).await.unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1073,8 +1127,8 @@ mod tests {
             .as_ref()
             .expect("tx packet carries an extension");
         assert_eq!(ext1.profile, 0xBEDE);
-        let s1 = onebyte_ext_value(ext1, 1).expect("one-byte transport-cc element");
-        let s2 = onebyte_ext_value(ext2, 1).expect("one-byte transport-cc element");
+        let s1 = onebyte_ext_value(ext1, 1).expect("transport-cc element");
+        let s2 = onebyte_ext_value(ext2, 1).expect("transport-cc element");
         assert_eq!(
             s1.wrapping_add(1),
             s2,
@@ -1139,7 +1193,10 @@ mod tests {
         let q1 = RtpPacket::parse(&w1).unwrap();
         let ssrc = q1.ssrc();
 
-        // Feedback about OUR stream: seq 0 received (+2 ms delta), seq 1 lost.
+        // Feedback about OUR stream: seq 0 received (+2 ms delta), seq 1
+        // received with a much larger inter-arrival delta, seq 2 lost.
+        // Delays are relative to the fastest observed packet: seq 0 pins
+        // the clock offset, seq 1 reports ~98 ms of excess delay.
         let fb = rtp::twcc::TwccFeedback {
             sender_ssrc: 0xABC,
             media_ssrc: ssrc,
@@ -1154,6 +1211,11 @@ mod tests {
                 },
                 rtp::twcc::TwccEntry {
                     seq: 1,
+                    received: true,
+                    delta_us: Some(100_000),
+                },
+                rtp::twcc::TwccEntry {
+                    seq: 2,
                     received: false,
                     delta_us: None,
                 },
@@ -1168,11 +1230,12 @@ mod tests {
 
         assert_eq!(tp.handle.stats.twcc_feedbacks_rx(), 1);
         assert_eq!(tp.handle.stats.twcc_window_lost(), 1);
-        // seq 0 was sent at pump-elapsed µs (small) and "received" at
-        // ref 1000 ms + 2 ms: the correlated delay must be positive.
+        // seq 0 pins the clock offset; seq 1's inter-arrival delta was
+        // 98 ms larger than its send spacing → clearly positive excess
+        // delay even across independent clock domains.
         assert!(
-            tp.handle.stats.twcc_mean_delay_us() > 0,
-            "send→receive delay positive, got {}",
+            tp.handle.stats.twcc_mean_delay_us() > 10_000,
+            "excess send→receive delay positive, got {}",
             tp.handle.stats.twcc_mean_delay_us()
         );
         tp.handle.stop.send(true).ok();

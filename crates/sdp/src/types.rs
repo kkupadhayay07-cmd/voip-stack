@@ -359,6 +359,9 @@ impl fmt::Display for Session {
                 write_connection(&mut out, c);
             }
             write_bandwidths(&mut out, &m.bandwidths);
+            if m.rtcp_mux {
+                out.push_str("a=rtcp-mux\r\n");
+            }
             for a in &m.attributes {
                 write_attr(&mut out, a);
             }

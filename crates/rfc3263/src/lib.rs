@@ -355,9 +355,11 @@ impl Resolver {
                 let Some(t) = naptr_service_transport(&n.service) else {
                     continue;
                 };
-                // RFC 2915: a non-"." replacement IS the next query key
-                // (already a full SRV name for S-flag records); with no
-                // replacement the owner name is used instead.
+                // RFC 2915/3263: a non-"." replacement IS the next query
+                // key (already a full SRV name for S-flag records); when the
+                // field is empty (or "." — RFC 2782 "service decidedly not
+                // available"), we synthesize the RFC 3263 SRV key for the
+                // selected transport instead of using the owner name.
                 let srv_key = if n.replacement.is_empty() || n.replacement == "." {
                     t.srv_name(host)
                 } else {

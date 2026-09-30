@@ -426,11 +426,12 @@ pub fn answer_session(offer: &Session, caps: &[MediaCaps]) -> Result<Session, Ne
         m.direction = Some(ans_dir);
         m.attributes.push(Attribute::new(ans_dir.as_str(), None));
 
-        // rtcp-mux: only if offered and supported
+        // rtcp-mux: only if offered and supported. The flag alone is enough —
+        // the serializer emits `a=rtcp-mux` from the typed mirror (pushing
+        // the attribute here too would double-emit the line).
         let offered_mux = offer_m.rtcp_mux || offer.has_attr("rtcp-mux");
         if offered_mux && caps_m.rtcp_mux {
             m.rtcp_mux = true;
-            m.attributes.push(Attribute::new("rtcp-mux", None));
         }
 
         // mid echo (required for BUNDLE continuity)

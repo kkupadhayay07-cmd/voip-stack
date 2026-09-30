@@ -7,7 +7,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::wire::{encode_query, parse_response, DnsError, Message};
@@ -16,21 +16,31 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1000);
 /// UDP is tried twice (initial + one retransmission) before giving up.
 const UDP_ATTEMPTS: usize = 2;
 
-/// Monotonic query-id source: xorshift state seeded from the clock, mixed
-/// with a process-wide counter so concurrent resolvers cannot collide.
-static ID_COUNTER: AtomicU32 = AtomicU32::new(0);
+/// Monotonic query-id source: a process-wide xorshift state seeded once
+/// from the clock and advanced atomically, so concurrent resolvers neither
+/// collide nor repeat a small searchable ID sequence (RFC 5452 hardening).
+static ID_STATE: AtomicU64 = AtomicU64::new(0);
 
 fn next_query_id() -> u16 {
-    let mut state = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64 ^ (d.as_secs() << 20))
-        .unwrap_or(0x9E3779B97F4A7C15)
-        | 1;
-    state ^= state << 13;
-    state ^= state >> 7;
-    state ^= state << 17;
-    let n = ID_COUNTER.fetch_add(1, Ordering::Relaxed) as u64;
-    (state as u16) ^ (n as u16).wrapping_mul(0x9E37)
+    let mut prev = ID_STATE.load(Ordering::Relaxed);
+    loop {
+        let mut s = prev;
+        if s == 0 {
+            // First caller seeds from the clock (non-zero via | 1).
+            s = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64 ^ (d.as_secs() << 20))
+                .unwrap_or(0x9E37_79B9_7F4A_7C15)
+                | 1;
+        }
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        match ID_STATE.compare_exchange_weak(prev, s, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return ((s >> 32) as u16) ^ (s as u16),
+            Err(cur) => prev = cur,
+        }
+    }
 }
 
 /// A blocking DNS client pointed at one recursive resolver.
@@ -59,7 +69,14 @@ impl DnsClient {
     }
 
     fn query_udp(&self, id: u16, packet: &[u8]) -> Result<Message, DnsError> {
-        let sock = UdpSocket::bind("0.0.0.0:0")?;
+        // Bind by the server's address family: resolv.conf may hand us an
+        // IPv6 nameserver, and an AF_INET socket cannot connect() to one.
+        let bind = if self.server.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let sock = UdpSocket::bind(bind)?;
         sock.connect(self.server)?;
         sock.set_write_timeout(Some(self.timeout))?;
         for _ in 0..UDP_ATTEMPTS {
@@ -72,8 +89,10 @@ impl DnsClient {
         Err(DnsError::Timeout)
     }
 
-    /// Waits up to `timeout`, discarding malformed and mismatched-ID
-    /// datagrams (late answers to a previous query are not answers).
+    /// Waits up to `timeout`, discarding malformed, non-response (QR bit
+    /// clear — a spoofed/reflected QUERY is not an answer) and
+    /// mismatched-ID datagrams (late answers to a previous query are not
+    /// answers).
     fn recv_matching_udp(&self, sock: &UdpSocket, id: u16) -> Result<Option<Message>, DnsError> {
         let deadline = Instant::now() + self.timeout;
         let mut buf = [0u8; 4096];
@@ -86,11 +105,11 @@ impl DnsClient {
             match sock.recv(&mut buf) {
                 Ok(n) => {
                     if let Ok(msg) = parse_response(&buf[..n]) {
-                        if msg.id == id {
+                        if msg.is_response && msg.id == id {
                             return Ok(Some(msg));
                         }
                     }
-                    // Malformed or foreign datagram: keep waiting.
+                    // Malformed, non-response or foreign datagram: keep waiting.
                 }
                 Err(e)
                     if matches!(
@@ -125,7 +144,8 @@ impl DnsClient {
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf)?;
         let msg = parse_response(&buf)?;
-        if msg.id != id {
+        if msg.id != id || !msg.is_response {
+            // Wrong id, or QR bit clear (a query, not an answer) — reject.
             return Err(DnsError::IdMismatch);
         }
         Ok(msg)
@@ -169,9 +189,20 @@ pub(crate) mod fake {
             routes: HashMap<(String, u16), Vec<u8>>,
             tcp_response: Option<Vec<u8>>,
         ) -> FakeDns {
-            let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = tcp.local_addr().unwrap().port();
-            let udp = UdpSocket::bind(("127.0.0.1", port)).unwrap();
+            Self::spawn_on("127.0.0.1:0".parse().unwrap(), routes, tcp_response)
+        }
+
+        /// Variant bound to an explicit address (e.g. `[::1]:0` for IPv6
+        /// nameserver tests). UDP and TCP share the port, as in `spawn`.
+        pub fn spawn_on(
+            bind_addr: SocketAddr,
+            routes: HashMap<(String, u16), Vec<u8>>,
+            tcp_response: Option<Vec<u8>>,
+        ) -> FakeDns {
+            let tcp = std::net::TcpListener::bind(bind_addr).unwrap();
+            // UDP shares the TCP listener's actual (ephemeral) port so the
+            // TC→TCP fallback dials a port that really serves both.
+            let udp = UdpSocket::bind(tcp.local_addr().unwrap()).unwrap();
             let addr = udp.local_addr().unwrap();
 
             let queries: std::sync::Arc<std::sync::Mutex<Vec<(String, u16)>>> =
@@ -433,5 +464,47 @@ mod tests {
         let client = DnsClient::new(addr, Duration::from_millis(100));
         let err = client.query("x.example.com", QTYPE_A).unwrap_err();
         assert!(matches!(err, DnsError::Timeout));
+    }
+
+    #[test]
+    fn query_form_responses_are_rejected_qr_bit() {
+        // RFC 5452 hardening: a datagram with the QR bit clear is a QUERY,
+        // not an answer — even with a matching id it must be discarded
+        // (spoofed/reflected-query rejection), surfacing as a timeout.
+        let mut routes = HashMap::new();
+        routes.insert(
+            ("qr.test".to_string(), QTYPE_A),
+            // Canned "response" that is actually a QUERY packet (QR=0):
+            // encode_query emits flags 0x0100, never 0x8000.
+            crate::wire::encode_query(0, "qr.test", QTYPE_A).unwrap(),
+        );
+        let dns = FakeDns::spawn(routes, None);
+        let client = DnsClient::new(dns.addr, Duration::from_millis(100));
+        let err = client.query("qr.test", QTYPE_A).unwrap_err();
+        assert!(matches!(err, DnsError::Timeout), "got {err:?}");
+        dns.shutdown();
+    }
+
+    #[test]
+    fn udp_queries_work_over_an_ipv6_nameserver() {
+        // Regression: resolv.conf may name an IPv6 resolver; the UDP socket
+        // must bind that family (an AF_INET bind cannot connect() to v6 and
+        // every query would hard-fail into the libc fallback).
+        let mut routes = HashMap::new();
+        routes.insert(
+            ("v6.example.com".to_string(), QTYPE_A),
+            response(
+                0,
+                "v6.example.com",
+                QTYPE_A,
+                &[("v6.example.com", Rr::A(Ipv4Addr::new(192, 0, 2, 7)))],
+            ),
+        );
+        let dns = FakeDns::spawn_on("[::1]:0".parse().unwrap(), routes, None);
+        let client = DnsClient::new(dns.addr, Duration::from_millis(500));
+        let msg = client.query("v6.example.com", QTYPE_A).unwrap();
+        assert_eq!(msg.records.len(), 1);
+        assert!(matches!(&msg.records[0], crate::wire::Record::A { .. }));
+        dns.shutdown();
     }
 }

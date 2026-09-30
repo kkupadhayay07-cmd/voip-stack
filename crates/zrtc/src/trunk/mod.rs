@@ -76,7 +76,7 @@ impl Endpoint {
         let aor = t
             .aor
             .clone()
-            .unwrap_or_else(|| format!("sip:{user}@{host}"));
+            .unwrap_or_else(|| format!("sip:{user}@{}", uri_host(&host)));
         let contact = format!("sip:{user}@{}", cfg.sip.host);
         Ok(Endpoint {
             target,
@@ -98,13 +98,40 @@ impl Endpoint {
     }
 
     /// Host portion of the trunk address (for request-URIs).
+    ///
+    /// Bare form — use for SDP `c=` lines (RFC 4566 requires the bare IP).
+    /// For SIP URIs use [`Endpoint::host_uri`], which brackets IPv6
+    /// literals (RFC 3261 §19.1.2).
     pub fn host(&self) -> String {
         self.target.ip().to_string()
     }
 
+    /// Host portion for use inside SIP URIs: IPv6 literals are bracketed
+    /// (RFC 3261 §19.1.2 — a bare literal makes the URI unparseable because
+    /// the first colon is mistaken for the port separator), IPv4 stays bare.
+    pub fn host_uri(&self) -> String {
+        let ip = self.target.ip();
+        if ip.is_ipv6() {
+            format!("[{ip}]")
+        } else {
+            ip.to_string()
+        }
+    }
+
     /// Keepalive request-URI (points at the trunk itself).
     pub fn keepalive_uri(&self) -> String {
-        format!("sip:{}:{}", self.host(), self.target.port())
+        format!("sip:{}:{}", self.host_uri(), self.target.port())
+    }
+}
+
+/// Brackets a config-provided host for use inside a SIP URI. A host that is
+/// already bracketed passes through untouched.
+fn uri_host(host: &str) -> String {
+    let trimmed = host.trim_start_matches('[').trim_end_matches(']');
+    if trimmed.contains(':') {
+        format!("[{trimmed}]")
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -117,11 +144,30 @@ fn split_host_port(hostport: &str) -> Result<(String, Option<u16>), String> {
             .split_once(']')
             .ok_or_else(|| format!("trunk address '{hostport}': unclosed '['"))?;
         let host = h6.trim_start_matches('[').to_string();
-        let port = rest
-            .strip_prefix(':')
-            .map(|p| p.parse::<u16>())
-            .transpose()
-            .map_err(|_| format!("trunk address '{hostport}': bad port"))?;
+        if host.is_empty() {
+            return Err(format!("trunk address '{hostport}': empty host"));
+        }
+        // Only "" or ":port" may follow the closing bracket — anything else
+        // is a malformed address, not silently ignored junk.
+        let port = match rest {
+            "" => None,
+            r if r.starts_with(':') => {
+                let p: u16 = r[1..]
+                    .parse()
+                    .map_err(|_| format!("trunk address '{hostport}': bad port"))?;
+                if p == 0 {
+                    return Err(format!(
+                        "trunk address '{hostport}': port 0 is not a valid SIP port"
+                    ));
+                }
+                Some(p)
+            }
+            _ => {
+                return Err(format!(
+                    "trunk address '{hostport}': unexpected characters after ']'"
+                ))
+            }
+        };
         return Ok((host, port));
     }
     if hostport.matches(':').count() > 1 {
@@ -130,12 +176,25 @@ fn split_host_port(hostport: &str) -> Result<(String, Option<u16>), String> {
     }
     match hostport.rsplit_once(':') {
         Some((h, p)) => {
-            let port = p
-                .parse::<u16>()
+            if h.is_empty() {
+                return Err(format!("trunk address '{hostport}': empty host"));
+            }
+            let port: u16 = p
+                .parse()
                 .map_err(|_| format!("trunk address '{hostport}': bad port"))?;
+            if port == 0 {
+                return Err(format!(
+                    "trunk address '{hostport}': port 0 is not a valid SIP port"
+                ));
+            }
             Ok((h.to_string(), Some(port)))
         }
-        None => Ok((hostport.to_string(), None)),
+        None => {
+            if hostport.is_empty() {
+                return Err("trunk address is empty".to_string());
+            }
+            Ok((hostport.to_string(), None))
+        }
     }
 }
 
@@ -370,6 +429,38 @@ mod tests {
         );
         assert!(split_host_port("host:notaport").is_err());
         assert!(split_host_port("[2001:db8::1").is_err());
+        // Hardening: port 0 is not a SIP port, junk after ']' is a malformed
+        // address, and an empty host is rejected outright.
+        assert!(split_host_port("host:0").is_err());
+        assert!(split_host_port("[2001:db8::1]:0").is_err());
+        assert!(split_host_port("[2001:db8::1]garbage").is_err());
+        assert!(split_host_port("[]:5060").is_err());
+        assert!(split_host_port(":5060").is_err());
+        assert!(split_host_port("host:").is_err());
+    }
+
+    #[test]
+    fn ipv6_targets_are_bracketed_in_uris_but_bare_in_sdp() {
+        // Regression: a bare IPv6 literal in a SIP URI is unparseable (the
+        // first colon is mistaken for the port separator); URIs must bracket
+        // the host while the SDP c= fallback keeps the bare form (RFC 4566).
+        let mut ep = Endpoint::from_config(&cfg("[2001:db8::1]:5070", "udp")).unwrap();
+        assert_eq!(ep.host(), "2001:db8::1", "SDP c= form stays bare");
+        assert_eq!(ep.host_uri(), "[2001:db8::1]");
+        assert_eq!(ep.keepalive_uri(), "sip:[2001:db8::1]:5070");
+        assert_eq!(ep.aor, "sip:trunk@[2001:db8::1]");
+        // And the request-URI form used by `zrtc call` parses back cleanly.
+        let ruri = format!("sip:15551234567@{}", ep.host_uri());
+        assert!(
+            SipUri::parse(&ruri).is_ok(),
+            "bracketed R-URI parses: {ruri}"
+        );
+        // Failover pinning replaces the target: URIs must follow the winner.
+        ep.target = "[2001:db8::99]:5080".parse::<SocketAddr>().unwrap();
+        assert_eq!(ep.keepalive_uri(), "sip:[2001:db8::99]:5080");
+        // IPv4 URIs stay bracket-free.
+        ep.target = "127.0.0.1:5070".parse::<SocketAddr>().unwrap();
+        assert_eq!(ep.keepalive_uri(), "sip:127.0.0.1:5070");
     }
 
     #[test]

@@ -89,9 +89,52 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **555 passing** across 56 suites, `clippy -D warnings`
+`cargo test --workspace` → **561 passing** across 56 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
 **The external audit is fully closed**: every finding at every severity —
 Critical, High, and the complete Medium/Low (P2) list — is **Fixed** with
 regression tests. No open items. No silent gaps.
+
+---
+
+# Self-Audit of Tasks 39–42 (2026-09, Task 43)
+
+After the Task 39–42 feature wave (NACK/RTX/TWCC library, B2BUA RTCP
+plumbing, RFC 3263 discovery + failover), a three-track read-only audit
+(b2bua media pump / rfc3263+zrtc / rtp nack-rtx-twcc) re-examined the new
+code against the RFCs and the libwebrtc/pion reference implementations.
+**1 Critical + 5 Major + ~12 minor findings** — all verified against the
+code before acting (same rule as the external audit). Fixed in this commit:
+
+## Fixed
+
+| # | Finding | Severity | Fix |
+|---|---------|----------|-----|
+| S1 | TWCC status-vector chunks: encoder wrote 7×2-bit symbols under word `0x8000` (S-bit ignored, symbols also misplaced one bit left of the spec's `12−2k` layout); parser treated every T=1 chunk as 2-bit. Wire-incompatible with Chrome/pion in BOTH directions while self-roundtrips stayed green | **Critical** | Encoder emits `0xC000` for 2-bit chunks (spec bit order) and compact 1-bit vector chunks (14 symbols at bits 13..0) when no large delta is pending; parser dispatches on the S-bit. Hand-built spec wire-form tests + libwebrtc-layout vector |
+| S2 | TWCC recv deltas were offsets-from-reference, not inter-arrival deltas (§3.1.5); sender reconstructed per-packet without accumulating — a conformant peer's BWE would see exploding arrival times | **Major** | `build_feedback` reports deltas vs the previous RECEIVED packet; `on_feedback` accumulates from the reference. Monitor test re-pinned (40 000/5 000/7 000) |
+| S3 | transport-cc sequence carried as a 1-byte element; the draft requires 2 bytes BE (Chrome rejects both directions) | **Major** | `attach_twcc` writes `seq.to_be_bytes()`, reader accepts `data_len == 2`; the u8→u16 unwrap loop deleted |
+| S4 | TWCC delay = `recv − sent` across INDEPENDENT clock domains (peer epoch vs our pump elapsed) — the stat was meaningless garbage in production | **Major** | `TwccSendTracker` estimates the clock offset (min observed raw delay) and reports EXCESS delay vs the fastest observed packet — domain-free, like reference delay estimators |
+| S5 | zrtc emitted bare IPv6 literals inside SIP URIs (keepalive/R-URI/AOR) — unparseable (`sip:2001:db8::1:5060`); SDP `c=` needs the BARE form while URIs need brackets | **Major** | New `host_uri()` (bracketed, RFC 3261 §19.1.2) used for URIs; `host()` kept bare for RFC 4566 `c=`; failover pinning keeps URIs following the winner; regression test parses the bracketed R-URI back |
+| S6 | Blocking RFC 3263 DNS + libc fallback ran on tokio workers (daemon + `zrtc call`), stalling the runtime and making the outer `timeout` unenforceable (up to ~20 s+ on a black-holed resolver) | **Major** | Resolution wrapped in `spawn_blocking` at both call sites |
+| S7 | SDP offered `rtcp_mux: false` while the pump is mux-only — strict non-zrtc peers would address RTCP at port+1 (never bound) and the whole RTCP channel would silently die | **Major** | Offer advertises `a=rtcp-mux`; the serializer now emits it from the typed mirror (parse consumes it — roundtrip stays a fixed point), negotiation echoes it when offered |
+| S8 | RFC 3550 compound violations: NACK/TWCC sent as bare RTPFB (§6.1: compounds start with SR/RR); SR compounds lacked SDES CNAME (§6.5.1 MUST) | Minor | Empty-RR prefix on standalone feedback; CNAME (`zrtc-<ssrc>`) appended to every SR compound |
+| S9 | SR field accuracy: cumulative-lost clamp allowed the sign bit of the signed 24-bit field (`0xFFFFFF` reads negative); DLSR quantization drifted up to 7.4 ms (ms shortcut); jitter truncated to whole ms (0.9 ms → 0); `last_sr` accepted an SR from ANY sender SSRC | Minor | Clamp `0x007F_FFFF`; DLSR via µs × 65536 / 1e6 rounded; jitter via µs; `last_sr` recorded only when the SR sender == the peer's media SSRC |
+| S10 | SR packet/octet counters incremented for packets never sent (dst not yet latched) — RFC 3550 §6.4.1 counts SENT packets; `RtpExtension::onebyte` validated ids/lengths with `debug_assert` only (release builds could emit malformed wire); `TwccSendTracker::record_send` re-stamped retransmits; `TwccRxMonitor` cursor froze when a gap run saturated the pending window | Minor | Counters/counters move into the send path; `onebyte` returns `Result` with runtime checks (+regression test); `or_insert` on record; monitor slides the window (oldest dropped) so the cursor always advances (+regression test) |
+| S11 | rfc3263 hardening: forged 12-byte header could trigger a ~12 MB allocation (`with_capacity` of unvalidated RR counts); IPv6 nameserver from resolv.conf failed on the IPv4-only UDP bind; QR bit never checked (a reflected QUERY accepted); query IDs re-derived per call from the wall clock | Minor | RR-count reservation capped by buffer size; family-matched UDP bind (+v6 FakeDns e2e test); QR-bit check in UDP + TCP accept (+canned-query rejection test); process-wide atomic xorshift ID state |
+| S12 | `split_host_port` accepted port 0 (→ confusing later failures), silently dropped junk after `]`, accepted empty hosts | Minor | Port 0, trailing junk, and empty hosts are rejected with clear errors (+test edges) |
+
+## Deferred (documented, not silent)
+
+* Non-mux RTCP port (port+1) listener — we advertise rtcp-mux instead;
+  strict non-mux peers remain unsupported (COMPLIANCE §5).
+* DNS bailiwick (owner-name) filtering of response records; TCP fallback on
+  locally-truncated UDP datagrams without the server TC flag.
+* RTP destination from the SDP answer's `c=` line (split signaling/media
+  hosts) — pre-existing, now documented in COMPLIANCE §5.
+* RTCP BYE on media teardown; `nacks_tx` counts FCI entries (documented).
+
+Net: **561 tests / 56 suites** (was 555) — 6 new regression tests pin the
+fixed behavior; the wire-format expectations were cross-checked against
+libwebrtc/pion because self-roundtrip tests structurally could not catch
+S1–S3.

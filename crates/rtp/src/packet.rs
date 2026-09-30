@@ -9,6 +9,7 @@ pub enum RtpError {
     TooShort { need: usize, got: usize },
     BadVersion(u8),
     BadExtensionLength,
+    BadExtensionId(u8),
     Truncated,
     BadCsrcCount(u8),
 }
@@ -21,6 +22,7 @@ impl fmt::Display for RtpError {
             }
             RtpError::BadVersion(v) => write!(f, "unsupported RTP version {}", v),
             RtpError::BadExtensionLength => write!(f, "bad extension length"),
+            RtpError::BadExtensionId(id) => write!(f, "bad extension element id {id} (1..=14)"),
             RtpError::Truncated => write!(f, "truncated packet"),
             RtpError::BadCsrcCount(c) => write!(f, "bad CSRC count {}", c),
         }
@@ -42,23 +44,23 @@ impl RtpExtension {
     /// single element: `id` (1..=14) with up to 16 data bytes. The block
     /// uses the one-byte profile sentinel 0xBEDE; elements are not padded
     /// individually — `encode_into` pads the whole block to a 32-bit word.
-    pub fn onebyte(id: u8, payload: &[u8]) -> RtpExtension {
-        debug_assert!(
-            (1..=14).contains(&id),
-            "one-byte element id must be in 1..=14"
-        );
-        debug_assert!(
-            payload.len() <= 16,
-            "one-byte element data is at most 16 bytes"
-        );
+    /// Returns an error for ids 0/15 (reserved) or oversized payloads so
+    /// release builds can never emit malformed wire data.
+    pub fn onebyte(id: u8, payload: &[u8]) -> Result<RtpExtension, RtpError> {
+        if !(1..=14).contains(&id) {
+            return Err(RtpError::BadExtensionId(id));
+        }
+        if payload.is_empty() || payload.len() > 16 {
+            return Err(RtpError::BadExtensionLength);
+        }
         let mut data = Vec::with_capacity(1 + payload.len());
         // The 4-bit length field carries length−1 (RFC 8285 §4.2).
         data.push((id << 4) | (payload.len() as u8 - 1));
         data.extend_from_slice(payload);
-        RtpExtension {
+        Ok(RtpExtension {
             profile: 0xBEDE,
             data: Bytes::from(data),
-        }
+        })
     }
 }
 
@@ -372,7 +374,7 @@ mod tests {
     #[test]
     fn onebyte_extension_roundtrips_through_encode_parse() {
         let mut p = RtpPacket::new(0, 7, 1000, 0xBEEF, false, Bytes::from_static(b"x"));
-        p.extension = Some(RtpExtension::onebyte(1, &[0xAB]));
+        p.extension = Some(RtpExtension::onebyte(1, &[0xAB]).unwrap());
         let q = RtpPacket::parse(&p.encode()).unwrap();
         let ext = q.extension.expect("extension present after roundtrip");
         assert_eq!(ext.profile, 0xBEDE);
@@ -381,5 +383,27 @@ mod tests {
         // padding.
         assert_eq!(ext.data[0], 0x10);
         assert_eq!(ext.data[1], 0xAB);
+    }
+
+    #[test]
+    fn onebyte_rejects_reserved_ids_and_bad_lengths() {
+        // Ids 0 and 15 are reserved (RFC 8285 §4.2); an empty payload would
+        // wrap the length field to 0xFF. All must be runtime errors, not
+        // debug-only assertions — release builds must never emit malformed
+        // wire data.
+        assert!(matches!(
+            RtpExtension::onebyte(0, &[0x01]),
+            Err(RtpError::BadExtensionId(0))
+        ));
+        assert!(matches!(
+            RtpExtension::onebyte(15, &[0x01]),
+            Err(RtpError::BadExtensionId(15))
+        ));
+        assert!(matches!(
+            RtpExtension::onebyte(1, &[]),
+            Err(RtpError::BadExtensionLength)
+        ));
+        assert!(RtpExtension::onebyte(1, &[0u8; 17]).is_err());
+        assert!(RtpExtension::onebyte(14, &[0x11, 0x22]).is_ok());
     }
 }

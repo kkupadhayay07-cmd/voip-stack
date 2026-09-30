@@ -197,8 +197,13 @@ pub fn parse_response(buf: &[u8]) -> Result<Message, DnsError> {
         pos = next + 4; // QTYPE + QCLASS
     }
 
-    let mut records = Vec::with_capacity(ancount + nscount + arcount);
-    for _ in 0..(ancount + nscount + arcount) {
+    let expected = ancount + nscount + arcount;
+    // Every real RR occupies ≥ 11 wire bytes (fixed fields alone), so a
+    // legitimate response can never claim more records than the buffer has
+    // room for. Capping the reservation keeps a forged 12-byte header from
+    // triggering a ~12 MB allocation (~10⁶× amplification).
+    let mut records = Vec::with_capacity(expected.min(buf.len() / 11));
+    for _ in 0..expected {
         let (name, after_name) = read_name(buf, pos)?;
         if after_name + 10 > buf.len() {
             return Err(DnsError::Truncated);

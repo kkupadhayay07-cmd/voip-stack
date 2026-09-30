@@ -274,7 +274,14 @@ pub async fn run(mut cfg: Config) -> Result<(), String> {
 
     // ---- vendor trunk ------------------------------------------------------
     if cfg.trunk.address.as_deref().is_some_and(|a| !a.is_empty()) {
-        let mut ep = trunk::Endpoint::from_config(&cfg)?;
+        // RFC 3263 resolution (DNS + libc fallback) is blocking I/O — keep
+        // it off the runtime workers so heartbeats and other tasks are
+        // never stalled by a slow resolver.
+        let cfg_for_resolve = cfg.clone();
+        let mut ep =
+            tokio::task::spawn_blocking(move || trunk::Endpoint::from_config(&cfg_for_resolve))
+                .await
+                .map_err(|e| format!("trunk resolve task failed: {e}"))??;
         let mut trunk_auth = auth::build(&cfg.trunk)?;
         tracing::info!(
             "trunk configured: {} transport={} auth={}",

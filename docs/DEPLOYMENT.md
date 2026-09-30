@@ -79,7 +79,12 @@ accepts `HOST`, `HOST:PORT`, `sip:user@HOST:PORT`, and IPv6 literals
 (`[2001:db8::1]` or `[2001:db8::1]:5060`): a port-less target is resolved
 through RFC 3263 NAPTR/SRV discovery (SRV priority/weight ordering with
 failover candidates, A/AAAA fallback), while an explicit port pins the
-endpoint and skips SRV per §4.2. At connect time the daemon walks the
+endpoint and skips SRV per §4.2. IPv6 targets are handled correctly at both
+layers — SIP URIs (request-URI, keepalive, AoR) bracket the literal per
+RFC 3261 §19.1.2, while the SDP `c=` fallback keeps the bare form per
+RFC 4566. Resolution runs on a blocking thread (`spawn_blocking`), so a
+slow or black-holed resolver never stalls the async runtime, and the
+`zrtc call` timeout stays enforceable. At connect time the daemon walks the
 resolved candidate list in priority order (3 s connect budget per candidate
 for TCP/TLS/WSS; a dead primary logs `trunk failover` and the next candidate
 takes the call), and the winning address is pinned for keepalives, request

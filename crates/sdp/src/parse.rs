@@ -527,7 +527,14 @@ fn apply_media_attr(m: &mut MediaBuilder, attr: Attribute, line: usize) -> Resul
         "sendrecv" | "sendonly" | "recvonly" | "inactive" => {
             m.direction = Direction::parse(&attr.name);
         }
-        "rtcp-mux" => m.rtcp_mux = true,
+        "rtcp-mux" => {
+            // Typed mirror owns this attribute: the serializer re-emits it
+            // from `rtcp_mux`, so consuming it here (instead of pushing it
+            // raw like the pass-through attributes) keeps
+            // parse → serialize → parse a fixed point and avoids duplicates.
+            m.rtcp_mux = true;
+            return Ok(());
+        }
         "mid" => m.mid = attr.value.clone(),
         "ptime" => {
             m.ptime = Some(parse_u16(attr.value.as_deref(), line)?);

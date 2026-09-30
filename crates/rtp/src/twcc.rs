@@ -10,11 +10,15 @@
 //! - packet status count (u16) — sequences covered
 //! - reference time (u24) — in 64 ms units ([`REF_SCALE_MS`])
 //! - feedback packet count (u8) — sender-side round-trip counter
-//! - status chunk stream: run chunks (V=0: 1-bit symbol + 13-bit run
-//!   length) or vector chunks (V=1: fourteen 2-bit symbols), symbols
-//!   0 = not received, 1 = small delta, 2 = large/negative delta
+//! - status chunk stream, per draft §3.1.4: run chunks (T=0: 1-bit symbol
+//!   at bit 14 + 13-bit run length), one-bit vector chunks (T=1, S=0:
+//!   fourteen 1-bit symbols at bits 13..0) or two-bit vector chunks (T=1,
+//!   S=1, i.e. word 0xC000: seven 2-bit symbols at bit pairs 13:12 … 1:0);
+//!   symbols 0 = not received, 1 = small delta, 2 = large/negative delta
 //! - recv delta stream, in packet order: small = u8 · [`DELTA_SCALE_US`],
-//!   large = i16 · [`DELTA_SCALE_US`]
+//!   large = i16 · [`DELTA_SCALE_US`]. Each delta is the arrival-time
+//!   difference from the PREVIOUS received packet (the first from the
+//!   reference time); consumers reconstruct arrivals by accumulation
 
 use crate::nack::wrap_diff;
 use crate::packet::RtpError;
@@ -34,7 +38,8 @@ pub struct TwccEntry {
     /// Wire sequence number (base sequence + offset, mod 2¹⁶).
     pub seq: u16,
     pub received: bool,
-    /// Arrival delta from the reference time, in microseconds.
+    /// Delta since the previous received packet in this report (the first
+    /// received packet: from the reference time), microseconds — draft §3.1.5.
     pub delta_us: Option<i64>,
 }
 
@@ -126,26 +131,52 @@ pub fn twcc_fci(entries: &[TwccEntry]) -> Result<Vec<u8>, RtpError> {
             }
             i += run_len;
         } else {
-            let take = (syms.len() - i).min(7);
-            // Vector chunk: V=1 + up to fourteen 2-bit symbols.
-            let mut w: u16 = 0x8000;
-            for (k, s) in syms[i..i + take].iter().enumerate() {
-                let bits: u16 = match s {
-                    Sym::NotReceived => 0,
-                    Sym::Small(_) => 1,
-                    Sym::Large(_) => 2,
-                };
-                w |= bits << (13 - 2 * k);
-            }
-            chunk_words.push(w);
-            for s in &syms[i..i + take] {
-                match s {
-                    Sym::Small(d) => deltas.push(*d),
-                    Sym::Large(d) => deltas.extend_from_slice(&d.to_be_bytes()),
-                    Sym::NotReceived => {}
+            // Status-vector chunk (T=1). Bit 14 (S) selects the symbol size:
+            // S=0 packs fourteen 1-bit symbols at bits 13..0 (0 = not
+            // received, 1 = received with a small delta) and is preferred
+            // whenever the next ≤14 entries need no large delta — the form
+            // libwebrtc and pion emit most; S=1 (word base 0xC000) packs
+            // seven 2-bit symbols at bit pairs 13:12 … 1:0. Symbol k lives
+            // at bits (12−2k):(13−2k) for 2-bit and bit 13−k for 1-bit.
+            let take14 = (syms.len() - i).min(14);
+            let one_bit = syms[i..i + take14]
+                .iter()
+                .all(|s| matches!(s, Sym::NotReceived | Sym::Small(_)));
+            if one_bit {
+                let mut w: u16 = 0x8000;
+                for (k, s) in syms[i..i + take14].iter().enumerate() {
+                    if matches!(s, Sym::Small(_)) {
+                        w |= 1 << (13 - k);
+                    }
                 }
+                chunk_words.push(w);
+                for s in &syms[i..i + take14] {
+                    if let Sym::Small(d) = s {
+                        deltas.push(*d);
+                    }
+                }
+                i += take14;
+            } else {
+                let take = (syms.len() - i).min(7);
+                let mut w: u16 = 0xC000;
+                for (k, s) in syms[i..i + take].iter().enumerate() {
+                    let bits: u16 = match s {
+                        Sym::NotReceived => 0,
+                        Sym::Small(_) => 1,
+                        Sym::Large(_) => 2,
+                    };
+                    w |= bits << (12 - 2 * k);
+                }
+                chunk_words.push(w);
+                for s in &syms[i..i + take] {
+                    match s {
+                        Sym::Small(d) => deltas.push(*d),
+                        Sym::Large(d) => deltas.extend_from_slice(&d.to_be_bytes()),
+                        Sym::NotReceived => {}
+                    }
+                }
+                i += take;
             }
-            i += take;
         }
     }
 
@@ -210,14 +241,28 @@ pub fn parse_twcc(pkt: &RtcpPacket) -> Result<TwccFeedback, RtpError> {
             for _ in 0..run.min(status_count - syms.len()) {
                 syms.push(sym);
             }
+        } else if w & 0x4000 == 0 {
+            // Status-vector chunk, S=0: fourteen 1-bit symbols (libwebrtc
+            // wire form: sym_k at bit 13−k; 0 = not received, 1 = small).
+            for k in 0..14u32 {
+                if syms.len() >= status_count {
+                    break;
+                }
+                let bit = (w >> (13 - k)) & 1;
+                syms.push(if bit == 1 {
+                    Sym::Small(0)
+                } else {
+                    Sym::NotReceived
+                });
+            }
         } else {
-            // Vector chunk: V=1 + seven 2-bit symbols (libwebrtc wire form:
-            // sym_k at bits 13−2k, bit 0 unused).
+            // Status-vector chunk, S=1: seven 2-bit symbols (sym_k at bit
+            // pairs 13:12 … 1:0, MSB-first; 2 = large/negative).
             for k in 0..7u32 {
                 if syms.len() >= status_count {
                     break;
                 }
-                let bits = (w >> (13 - 2 * k)) & 0b11;
+                let bits = (w >> (12 - 2 * k)) & 0b11;
                 syms.push(match bits {
                     0 => Sym::NotReceived,
                     1 => Sym::Small(0),
@@ -332,17 +377,25 @@ impl TwccRxMonitor {
         if ext <= self.last_ext {
             return; // duplicate / reorder below the cursor: not re-reported
         }
-        // Mark the skipped slots as not received (bounded by max_entries).
+        // Mark the skipped slots as not received. The window is bounded by
+        // max_entries: when a gap run would saturate it, the OLDEST
+        // unreported slot is dropped so the cursor always advances (with a
+        // fixed window a long black hole would otherwise freeze reporting).
         let mut gap = self.last_ext + 1;
-        while gap < ext && self.pending.len() < self.max_entries {
-            self.pending.push((gap, None));
+        while gap < ext {
+            self.push_bounded((gap, None));
             gap += 1;
         }
-        if self.pending.len() < self.max_entries {
-            self.pending.push((ext, arrival_us));
-            self.last_ext = ext;
-        }
+        self.push_bounded((ext, arrival_us));
+        self.last_ext = ext;
         self.trim();
+    }
+
+    fn push_bounded(&mut self, slot: (i64, Option<u64>)) {
+        if self.pending.len() >= self.max_entries {
+            self.pending.remove(0);
+        }
+        self.pending.push(slot);
     }
 
     fn trim(&mut self) {
@@ -364,16 +417,35 @@ impl TwccRxMonitor {
         let base_ext = self.pending[0].0;
         let ref_us = self.pending.iter().find_map(|(_, a)| *a).unwrap_or(0);
         // Reference time lives on the 64 ms grid, at or below the first
-        // arrival, so every delta stays non-negative.
+        // arrival, so the first delta stays non-negative.
         let ref_time_ms = (ref_us / 1_000 / REF_SCALE_MS as u64) * REF_SCALE_MS as u64;
         let ref_us_grid = ref_time_ms * 1_000;
+        // Draft §3.1.5: every delta is the difference from the previous
+        // RECEIVED packet (the first from the reference time); the sender
+        // reconstructs arrivals by accumulation. A small regression inside
+        // the window encodes as a large/negative delta, which the format
+        // supports.
+        let mut prev_recv_us: Option<u64> = None;
         let entries = self
             .pending
             .drain(..)
-            .map(|(ext, arrival)| TwccEntry {
-                seq: ext as u16,
-                received: arrival.is_some(),
-                delta_us: arrival.map(|a| (a as i64 - ref_us_grid as i64).max(0)),
+            .map(|(ext, arrival)| {
+                let (received, delta_us) = match arrival {
+                    None => (false, None),
+                    Some(a) => {
+                        let d = match prev_recv_us {
+                            None => (a as i64 - ref_us_grid as i64).max(0),
+                            Some(p) => a as i64 - p as i64,
+                        };
+                        prev_recv_us = Some(a);
+                        (true, Some(d))
+                    }
+                };
+                TwccEntry {
+                    seq: ext as u16,
+                    received,
+                    delta_us,
+                }
             })
             .collect();
         Some(TwccFeedback {
@@ -394,7 +466,11 @@ pub struct TwccPacketResult {
     pub received: bool,
     pub sent_us: Option<u64>,
     pub recv_us: Option<u64>,
-    /// `recv − sent` in microseconds; `None` when unknown or lost.
+    /// Excess delay over the fastest observed packet in the feedback
+    /// history, µs (`recv − sent − offset`); `None` when unknown or lost.
+    /// Reported relative to the fastest packet so two independent peer
+    /// clocks cancel — an absolute `recv − sent` across clock domains is
+    /// meaningless.
     pub delay_us: Option<i64>,
 }
 
@@ -419,6 +495,11 @@ pub struct TwccSendTracker {
     sent: HashMap<u16, u64>,
     order: VecDeque<u16>,
     max_tracked: usize,
+    /// Clock-offset estimate: minimum observed `recv − sent`. The receiver's
+    /// clock shares no epoch with ours, so raw delays carry an arbitrary
+    /// offset; reporting delay relative to the fastest observed packet
+    /// cancels it and yields a meaningful congestion signal.
+    offset_us: Option<i64>,
 }
 
 impl TwccSendTracker {
@@ -427,45 +508,57 @@ impl TwccSendTracker {
             sent: HashMap::new(),
             order: VecDeque::new(),
             max_tracked: max_tracked.max(1),
+            offset_us: None,
         }
     }
 
-    /// Remember when `seq` was sent (microseconds).
+    /// Remember when `seq` was sent (microseconds). Re-recording a sequence
+    /// (verbatim NACK retransmit keeps its original sequence) never
+    /// overwrites the original send time — that would corrupt the sample.
     pub fn record_send(&mut self, seq: u16, now_us: u64) {
         if !self.sent.contains_key(&seq) {
             self.order.push_back(seq);
         }
-        self.sent.insert(seq, now_us);
+        self.sent.entry(seq).or_insert(now_us);
         while self.order.len() > self.max_tracked {
             let old = self.order.pop_front().expect("non-empty");
             self.sent.remove(&old);
         }
     }
 
-    /// Correlate a feedback report against recorded send times.
-    pub fn on_feedback(&self, fb: &TwccFeedback) -> TwccReport {
+    /// Correlate a feedback report against recorded send times. Arrival
+    /// times are reconstructed by ACCUMULATING the inter-arrival deltas from
+    /// the reference time (draft §3.1.5); delays are reported relative to
+    /// the fastest observed packet (see [`TwccPacketResult::delay_us`]).
+    pub fn on_feedback(&mut self, fb: &TwccFeedback) -> TwccReport {
         let recv_base_us = fb.ref_time_ms * 1_000;
-        let packets: Vec<TwccPacketResult> = fb
-            .entries
-            .iter()
-            .map(|e| {
-                let recv_us = e
-                    .received
-                    .then(|| (recv_base_us as i64 + e.delta_us.unwrap_or(0)) as u64);
-                let sent_us = self.sent.get(&e.seq).copied();
-                let delay_us = match (sent_us, recv_us) {
-                    (Some(s), Some(r)) => Some(r as i64 - s as i64),
-                    _ => None,
-                };
-                TwccPacketResult {
-                    seq: e.seq,
-                    received: e.received,
-                    sent_us,
-                    recv_us,
-                    delay_us,
-                }
-            })
-            .collect();
+        let mut acc_us: i64 = 0;
+        let mut packets: Vec<TwccPacketResult> = Vec::with_capacity(fb.entries.len());
+        for e in &fb.entries {
+            let recv_us = e.received.then(|| {
+                acc_us += e.delta_us.unwrap_or(0);
+                (recv_base_us as i64 + acc_us) as u64
+            });
+            let sent_us = self.sent.get(&e.seq).copied();
+            let raw_delay = match (sent_us, recv_us) {
+                (Some(s), Some(r)) => Some(r as i64 - s as i64),
+                _ => None,
+            };
+            if let Some(d) = raw_delay {
+                self.offset_us = Some(match self.offset_us {
+                    Some(o) => o.min(d),
+                    None => d,
+                });
+            }
+            let delay_us = raw_delay.map(|d| d - self.offset_us.unwrap_or(d));
+            packets.push(TwccPacketResult {
+                seq: e.seq,
+                received: e.received,
+                sent_us,
+                recv_us,
+                delay_us,
+            });
+        }
 
         let received_set: HashSet<u16> = fb
             .entries
@@ -520,7 +613,9 @@ mod tests {
     }
 
     #[test]
-    fn small_delta_vector_roundtrip() {
+    fn one_bit_vector_roundtrip() {
+        // All-small entries take the compact 1-bit vector chunk (S=0):
+        // seven received packets at bits 13..7.
         let entries: Vec<TwccEntry> = (0..7)
             .map(|i| entry(i, Some(1000 + i as i64 * 250)))
             .collect();
@@ -528,10 +623,51 @@ mod tests {
         // 2-byte chunk + 7 one-byte deltas = 9 → padded to a 4-byte boundary.
         assert_eq!(fci.len(), 12);
         let w = u16::from_be_bytes([fci[0], fci[1]]);
-        assert_eq!(w >> 15, 1, "vector chunk");
+        assert_eq!(w & 0xC000, 0x8000, "1-bit vector chunk (T=1, S=0)");
         for k in 0..7u32 {
-            assert_eq!((w >> (13 - 2 * k)) & 0b11, 1, "symbol {k} small");
+            assert_eq!((w >> (13 - k)) & 1, 1, "symbol {k} received-small");
         }
+        // And it parses back through the spec wire form.
+        let pkt = RtcpPacket::Rtpfb {
+            fmt: FMT_TWCC,
+            sender_ssrc: 1,
+            media_ssrc: 2,
+            payload: {
+                let mut p = vec![0, 0, 0, 7, 0, 0, 0, 0];
+                p.extend_from_slice(&fci);
+                p
+            },
+        };
+        let fb = parse_twcc(&pkt).unwrap();
+        assert_eq!(fb.entries, entries);
+    }
+
+    #[test]
+    #[allow(clippy::identity_op)] // hand-built wire form keeps all symbol slots visible
+    fn one_bit_wire_form_parses_libwebrtc_layout() {
+        // libwebrtc/pion 1-bit vector (T=1, S=0): fourteen symbols at bits
+        // 13..0. Hand-built: syms [small, not-received, small] + u8 deltas.
+        let mut fci: Vec<u8> = vec![0x00, 0x64, 0x00, 0x03, 0x00, 0x00, 0x05, 0x07];
+        let w: u16 = 0x8000 | (1 << 13) | (0 << 12) | (1 << 11);
+        fci.extend_from_slice(&w.to_be_bytes());
+        fci.push(4); // 4 × 250 µs
+        fci.push(40); // 40 × 250 µs
+        fci.extend(std::iter::repeat_n(0, (4 - fci.len() % 4) % 4));
+        let pkt = RtcpPacket::Rtpfb {
+            fmt: FMT_TWCC,
+            sender_ssrc: 0x1111,
+            media_ssrc: 0x2222,
+            payload: fci,
+        };
+        let fb = parse_twcc(&pkt).unwrap();
+        assert_eq!(
+            fb.entries,
+            vec![
+                entry(100, Some(1_000)),
+                entry(101, None),
+                entry(102, Some(10_000)),
+            ]
+        );
     }
 
     #[test]
@@ -546,6 +682,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::identity_op, clippy::erasing_op)] // hand-built wire form keeps all symbol slots visible
     fn large_and_negative_deltas() {
         let entries = vec![
             entry(0, Some(200_000)), // > 63.75 ms → large positive
@@ -554,10 +691,11 @@ mod tests {
         ];
         let fci = twcc_fci(&entries).unwrap();
         let w = u16::from_be_bytes([fci[0], fci[1]]);
-        assert_eq!((w >> 15) & 1, 1, "vector chunk");
-        assert_eq!((w >> 13) & 0b11, 2, "sym0 large");
-        assert_eq!((w >> 11) & 0b11, 2, "sym1 large");
-        assert_eq!((w >> 9) & 0b11, 1, "sym2 small");
+        assert_eq!(w & 0xC000, 0xC000, "2-bit vector chunk (T=1, S=1)");
+        // Spec bit order: sym_k at bits (13−2k):(12−2k), MSB-first.
+        assert_eq!((w >> (12 - 2 * 0)) & 0b11, 2, "sym0 large");
+        assert_eq!((w >> (12 - 2 * 1)) & 0b11, 2, "sym1 large");
+        assert_eq!((w >> (12 - 2 * 2)) & 0b11, 1, "sym2 small");
         assert_eq!(&fci[2..4], &800i16.to_be_bytes());
         assert_eq!(&fci[4..6], &(-16i16).to_be_bytes());
         assert_eq!(fci[6], 0);
@@ -579,10 +717,11 @@ mod tests {
     #[allow(clippy::identity_op)] // hand-built wire form keeps all symbol slots visible
     fn parse_known_wire_form() {
         // Hand-built FCI: base=100, count=3, ref_ticks=5 (320 ms), fb=7;
-        // vector chunk [small, not-received, large]; deltas u8 4, i16 -8.
+        // 2-bit vector chunk [small, not-received, large]; deltas u8 4, i16 -8.
         let mut fci: Vec<u8> = vec![0x00, 0x64, 0x00, 0x03, 0x00, 0x00, 0x05, 0x07];
-        // Vector chunk word: V=1, sym0=small(1), sym1=not-received(0), sym2=large(2).
-        let w: u16 = 0x8000 | (1 << 13) | (0 << 11) | (2 << 9);
+        // Vector chunk word: T=1, S=1, sym0=small(01 at bits 13:12),
+        // sym1=not-received(00), sym2=large(10 at bits 9:8).
+        let w: u16 = 0xC000 | (1 << 12) | (0 << 10) | (2 << 8);
         fci.extend_from_slice(&w.to_be_bytes());
         fci.push(4); // small delta: 4 × 250 µs
         fci.extend_from_slice(&(-8i16).to_be_bytes()); // large: −2000 µs
@@ -684,11 +823,13 @@ mod tests {
         assert_eq!(fb.fb_count, 1);
         assert_eq!(fb.entries.len(), 5);
         assert_eq!(fb.entries[0].seq, 10);
+        // Deltas are INTER-ARRIVAL (draft §3.1.5): first vs the reference
+        // grid, the rest vs the previous received packet.
         assert_eq!(fb.entries[0].delta_us, Some(40_000));
-        assert_eq!(fb.entries[1].delta_us, Some(45_000));
+        assert_eq!(fb.entries[1].delta_us, Some(5_000));
         assert_eq!(fb.entries[2], entry(12, None));
         assert_eq!(fb.entries[3], entry(13, None));
-        assert_eq!(fb.entries[4].delta_us, Some(52_000));
+        assert_eq!(fb.entries[4].delta_us, Some(7_000));
         // Window drained.
         assert!(m.build_feedback(0x1, 0x2, 2).is_none());
         // And it parses back identically.
@@ -718,6 +859,26 @@ mod tests {
     }
 
     #[test]
+    fn monitor_advances_cursor_when_window_saturates() {
+        // Regression: a gap run longer than max_entries used to freeze the
+        // cursor (the arriving packet was dropped, last_ext never advanced,
+        // and every later packet re-filled the same stale window). The
+        // window must instead slide — oldest unreported slot dropped — so
+        // the arriving packet is always admitted.
+        let mut m = TwccRxMonitor::new(4);
+        m.on_packet(1, Some(1_000));
+        m.on_packet(1_000, Some(2_000)); // gap 2..1000 saturates the window
+        let fb = m.build_feedback(1, 1, 1).expect("feedback");
+        assert_eq!(fb.entries.len(), 4);
+        assert_eq!(fb.entries.last().unwrap().seq, 1_000, "cursor advanced");
+        // Reporting continues normally after the black hole.
+        m.on_packet(1_001, Some(3_000));
+        let fb2 = m.build_feedback(1, 1, 2).expect("feedback");
+        assert_eq!(fb2.entries.len(), 1);
+        assert_eq!(fb2.entries[0].seq, 1_001);
+    }
+
+    #[test]
     fn send_tracker_correlates_delays_and_loss() {
         let mut t = TwccSendTracker::new(1024);
         t.record_send(10, 100_000);
@@ -739,11 +900,17 @@ mod tests {
         assert_eq!(rep.sent_in_window, 3);
         assert_eq!(rep.received, 2);
         assert_eq!(rep.lost, 1);
-        assert_eq!(rep.packets[0].delay_us, Some(5_000)); // 105_000 − 100_000
-        assert_eq!(rep.packets[1].delay_us, Some(8_000)); // 115_000 − 107_000
+        // Arrivals accumulate from the reference: recv(10) = 105_000,
+        // recv(11) = 105_000 + 15_000 = 120_000.
+        assert_eq!(rep.packets[0].recv_us, Some(105_000));
+        assert_eq!(rep.packets[1].recv_us, Some(120_000));
+        // Delays are relative to the fastest observed packet (clock-domain
+        // free): raw 5_000/13_000 minus offset 5_000.
+        assert_eq!(rep.packets[0].delay_us, Some(0));
+        assert_eq!(rep.packets[1].delay_us, Some(8_000));
         assert_eq!(rep.packets[2].delay_us, None);
         assert_eq!(rep.max_delay_us, 8_000);
-        assert_eq!(rep.mean_delay_us, 6_500);
+        assert_eq!(rep.mean_delay_us, 4_000);
         // Unknown seq (never sent) reports delay None without panicking.
         let fb2 = TwccFeedback {
             entries: vec![entry(99, Some(1_000))],

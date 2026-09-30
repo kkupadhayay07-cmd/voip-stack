@@ -184,12 +184,19 @@ without pairwise code. RTCP is demultiplexed per RFC 5761; DTMF
 Every media pump also runs an RTCP channel on its leg (RFC 3550 SR/RR,
 RFC 4585 Generic NACK both directions against a 512-packet retransmission
 window, transport-cc arrival feedback every 200 ms on negotiated legs).
-Sender side: outbound packets are stamped with the one-byte transport-cc
-sequence (RFC 8285 §4.2) before entering the retransmission window, and the
+Every SR compound carries SDES CNAME (§6.5.1); standalone NACK/transport-cc
+feedback is prefixed with an empty RR so compounds always start with SR/RR
+(§6.1). The B2BUA offers `a=rtcp-mux` (RFC 5761) because the pump is
+mux-only — one socket carries RTP and RTCP. Sender side: outbound packets
+are stamped with the 2-byte transport-cc sequence (RFC 8285 §4.2 element,
+draft-holmerberg §3.1) before entering the retransmission window, and the
 peer's RTPFB FMT 15 feedback about our SSRC is correlated against recorded
-send times into per-leg stats (feedback count, window loss, mean
-send→receive delay). Pumps enable only what the leg's SDP negotiation
-allows — unnegotiated legs stay RTCP-silent.
+send times into per-leg stats (feedback count, window loss, excess
+delay over the fastest observed packet — clock-domain free). The wire
+format follows the draft exactly: 1-bit/2-bit vector chunks + run chunks
+with the S-bit (bit 14) selecting symbol size, and inter-arrival recv
+deltas the sender accumulates. Pumps enable only what the leg's SDP
+negotiation allows — unnegotiated legs stay RTCP-silent.
 
 ### 5.3 Control & observability
 

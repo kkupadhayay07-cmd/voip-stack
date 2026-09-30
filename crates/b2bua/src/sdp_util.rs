@@ -169,7 +169,10 @@ pub fn build_offer(host: &str, port: u16, codecs: &[CodecId], sess_id: u32) -> S
             fmtps: Default::default(),
             rtcp_fb,
             direction: None,
-            rtcp_mux: false,
+            // RFC 5761: the media pump is mux-only (one socket for RTP and
+            // RTCP) — offer rtcp-mux so strict peers address RTCP at the
+            // RTP port instead of a port we never bound.
+            rtcp_mux: true,
             mid: None,
             ptime: None,
             maxptime: None,
@@ -258,6 +261,8 @@ mod tests {
         let text = offer.serialize();
         assert!(text.contains("a=rtcp-fb:0 nack\r\n"), "{text}");
         assert!(text.contains("a=rtcp-fb:0 transport-cc\r\n"), "{text}");
+        // The pump is mux-only: the offer must say so (RFC 5761).
+        assert!(text.contains("a=rtcp-mux\r\n"), "{text}");
         assert!(
             text.contains(
                 "a=extmap:1 http://www.ietf.org/id/draft-holmerberg-avt-01 transport-cc\r\n"

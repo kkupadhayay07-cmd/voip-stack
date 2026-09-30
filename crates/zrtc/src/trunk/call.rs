@@ -24,10 +24,17 @@ use super::{recv_response, Endpoint};
 /// been torn down (BYE 200) or on the first failure.
 pub async fn run(cfg: &Config, e164: &str, rtp_ms: u64) -> Result<(), String> {
     let mut auth_boxed = crate::auth::build(&cfg.trunk)?;
-    let mut ep = Endpoint::from_config(cfg)?;
+    // RFC 3263 resolution (DNS + libc fallback) is blocking I/O — run it on
+    // a blocking thread so the async runtime's workers and the caller's
+    // outer timeout stay live.
+    let cfg_for_resolve = cfg.clone();
+    let mut ep = tokio::task::spawn_blocking(move || Endpoint::from_config(&cfg_for_resolve))
+        .await
+        .map_err(|e| format!("trunk resolve task failed: {e}"))??;
     let mut sess = super::connect(&mut ep).await?;
 
-    let ruri = format!("sip:{e164}@{}", ep.host());
+    // IPv6 literals must be bracketed inside URIs (RFC 3261 §19.1.2).
+    let ruri = format!("sip:{e164}@{}", ep.host_uri());
     let call_id = new_call_id("zrtc-trunk-call");
     let from_tag = new_tag();
 

@@ -21,7 +21,7 @@ hardening (IP4/IP6 `o=`/`c=` address types picked from the local host
 literal, RFC 8843 BUNDLE group echo with the accepted mids), a
 concurrent-call load harness with percentile reporting, and RTP loss
 recovery + congestion feedback (RFC 4585 Generic NACK, RFC 4588 RTX,
-transport-cc); 555 tests green
+transport-cc); 561 tests green
 across 56 suites — **every audit finding at every severity is fixed**).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
@@ -55,15 +55,15 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
 | RFC | Feature | Status | Notes |
 |-----|---------|--------|-------|
-| RFC 3550 | RTP/RTCP | **Done** | `rtp` crate: fixed-header parse/serialize; RTCP SR/RR/SDES/BYE/APP compound parse/encode; interarrival jitter estimator; SSRC probation. Padding round-trips byte-exactly (the padding bit is never emitted without its octets); the playout buffer is wrap-safe for both the 16-bit sequence and 32-bit timestamp spaces. The B2BUA media pumps send periodic SRs (NTP 1900-epoch timestamps, TX packet/octet counts) carrying a reception report about the peer (fraction/cumulative loss, highest extended sequence, jitter, last-SR/DLSR). |
+| RFC 3550 | RTP/RTCP | **Done** | `rtp` crate: fixed-header parse/serialize; RTCP SR/RR/SDES/BYE/APP compound parse/encode; interarrival jitter estimator; SSRC probation. Padding round-trips byte-exactly (the padding bit is never emitted without its octets); the playout buffer is wrap-safe for both the 16-bit sequence and 32-bit timestamp spaces. The B2BUA media pumps send periodic SRs (NTP 1900-epoch timestamps, TX packet/octet counts counting only actually-sent packets) carrying a reception report about the peer (fraction/cumulative loss clamped to the signed-24-bit positive range, highest extended sequence, jitter converted via µs to keep sub-millisecond precision, last-SR/DLSR with µs-accurate DLSR, LSR keyed to the peer's media SSRC only). Every SR compound carries SDES with CNAME (§6.5.1); standalone NACK/transport-cc feedback packets are prefixed with an empty RR so every compound starts with SR/RR (§6.1). |
 | RFC 3551 | RTP/AVP profile | **Done** | Static payload types (0 PCMU, 8 PCMA, 9 G722, 18 G729, 13 CN, 100 telephone-event) + L16 (BE). |
 | RFC 3556 | SDP bandwidth modifiers | **Partial** | `b=` lines parsed/modelled; `TIAS` pacing semantics not applied. |
 | RFC 4585 | RTCP-based feedback | **Done (core)** | `rtp::nack`: Generic NACK `PID`/`BLP` FCI encode/parse (§6.2.1) + receiver-side gap tracker (extended sequences, repeat throttle, give-up limits, stream-restart guards); **wired into the B2BUA**: legs that negotiate `a=rtcp-fb:<pt> nack` answer inbound NACKs verbatim from a 512-packet retransmission window (20 ms per-seq flood guard) and NACK the peer's gaps; PLI/FIR still modelled as typed Psfb (no B2BUA path); REMB not implemented. |
 | RFC 4588 | RTX retransmission | **Done (core)** | `rtp::nack`: sender `RtxPool` (bounded retransmission window), `RtxStream` packetizer (separate SSRC/PT + OSN payload prefix, CSRCs dropped per §4), receiver `RtxDepacketizer` restoring `apt` PT + original sequence; SSRC learning until pinned from SDP. |
-| transport-cc (draft-holmerberg-avt-01) | RTPFB FMT 15 congestion feedback | **Done** | `rtp::twcc`: libwebrtc-compatible FCI encode/parse (run/vector chunks, small u8 + large i16 recv deltas at 250 µs, 64 ms reference time, feedback counter), receiver `TwccRxMonitor` (gap-marked arrival windows) and sender `TwccSendTracker` (per-packet delay + window loss correlation). **B2BUA both sides wired**: offers advertise the extmap (`id 1`, draft URI), answers echo it; negotiated legs feed arrival times into `TwccRxMonitor` (1-byte seq unwrapped to u16) emitting RTPFB FMT 15 every 200 ms, and outbound RTP (audio + DTMF relay) is stamped with the one-byte sequence (RFC 8285 §4.2 element writer; retransmissions carry the original seq) — inbound feedback about our SSRC is validated (`media_ssrc` match), correlated against send times, and surfaced as per-leg stats (feedback count, window loss, mean send→receive delay). |
+| transport-cc (draft-holmerberg-avt-01) | RTPFB FMT 15 congestion feedback | **Done (audit-corrected)** | `rtp::twcc`: draft-conformant FCI encode/parse — run chunks (T=0), one-bit vector chunks (T=1, S=0, fourteen symbols at bits 13..0, the form libwebrtc/pion emit most) and two-bit vector chunks (T=1, S=1 = word 0xC000, seven symbols at bit pairs 13:12 … 1:0 MSB-first); recv deltas are true INTER-ARRIVAL deltas (§3.1.5: first vs the reference, rest vs the previous received packet) with the sender reconstructing arrivals by accumulation; small u8 + large i16 deltas at 250 µs, 64 ms reference time, feedback counter. Receiver `TwccRxMonitor` (gap-marked arrival windows, cursor slides under window saturation) and sender `TwccSendTracker` (delay relative to the fastest observed packet — clock-domain free — plus window loss attribution). **B2BUA both sides wired**: offers advertise the extmap (`id 1`, draft URI), answers echo it; negotiated legs feed arrival times into `TwccRxMonitor` from the 2-byte big-endian sequence element emitting RTPFB FMT 15 every 200 ms, and outbound RTP (audio + DTMF relay) is stamped with the 2-byte element (RFC 8285 §4.2 writer; retransmissions carry the original seq) — inbound feedback about our SSRC is validated (`media_ssrc` match), correlated against send times, and surfaced as per-leg stats (feedback count, window loss, excess delay). *History: a self-audit (Task 43) found the first implementation wrote 7×2-bit symbols under word 0x8000, used reference-relative deltas, and carried a 1-byte sequence — self-interop only; all three were corrected against libwebrtc/pion and the draft before any real peer use.* |
 | RFC 4733 | RTP DTMF (telephone-event) | **Done** | Events 0–15 with start/end semantics + tests; relayed end-to-end by the B2BUA. |
-| RFC 5761 | RTP/RTCP demultiplexing | **Done** | §4 heuristic, unit-tested. |
-| RFC 8285 | RTP header extensions | **Done** | One-byte and two-byte blocks parse/serialize; `RtpExtension::onebyte` builds single-element one-byte blocks (id 1–14, ≤16 data bytes, length field = len−1) used by the transport-cc sender path. |
+| RFC 5761 | RTP/RTCP demultiplexing | **Done** | §4 heuristic, unit-tested; the B2BUA offers `a=rtcp-mux` (the media pump is mux-only) and SDP negotiation echoes it when offered. |
+| RFC 8285 | RTP header extensions | **Done** | One-byte and two-byte blocks parse/serialize; `RtpExtension::onebyte` builds single-element one-byte blocks (id 1–14, 1–16 data bytes, length field = len−1) used by the transport-cc sender path — validation is runtime (`Result`), so release builds can never emit malformed wire data. |
 | RFC 3711 | SRTP/SRTCP | **Done** | `srtp` crate: AES-CM + HMAC-SHA1 (80/32 tags), key derivation (labels 0–5, rate semantics), 64-entry replay window (libsrtp-style relative bits), RFC 3711 Appendix A ROC estimation, per-SSRC stream state, SRTCP E-bit/index. Validated against RFC 3711 B.2/B.3 vectors. |
 | RFC 7714 | SRTP AES-GCM | **Done** | AEAD_AES_128/256_GCM (16-byte tags) + 96-bit tag variants; SRTP/SRTCP IV per §8.1/§9.1; E=0 AAD semantics per §9.3 incl. authenticate-only acceptance of unencrypted SRTCP and the §9 tag-before-index wire order; validated against §16.1.1/16.1.2/16.1.4/16.2.1 and §17.1/§17.3 (SRTCP encrypted + tagging-only, tamper-tested) vectors. |
 | RFC 5764 | DTLS-SRTP handshake/usage | **Done** | `dtls` crate: use_srtp negotiation, RFC 8122 fingerprint generation + pinning, RFC 5764 §4.2 keying export (`EXTRACTOR-dtls_srtp`), self-signed runtime ECDSA P-256 identities. |
@@ -131,11 +131,25 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
   remains.
 * REMB, audio-band DTMF detection,
   GRUU/Outbound, WebRTC data channels, mid-dialog RFC 3263 re-resolution.
+* **RTCP non-mux addressing (RFC 3550 §11)**: the media pump is mux-only;
+  peers that refuse `a=rtcp-mux` would address RTCP at the RTP port+1,
+  which we never bind (their feedback would be lost). We now at least
+  advertise rtcp-mux so mux-capable peers (browsers, this stack) negotiate
+  the channel correctly; a non-mux RTCP listener remains future work.
+* **DNS hardening residues (RFC 5452)**: responses are validated for QR
+  bit and query id (and every real RR is size-checked), but records are
+  not yet filtered by owner-name bailiwick, and locally-truncated UDP
+  datagrams (>4096 B without a server TC flag) do not trigger the TCP
+  fallback.
+* **RTP destination from the SDP answer**: the trunk call path sends RTP
+  to the pinned signaling target's IP + the answer's media port; a
+  carrier with split signaling/media hosts would need the answer's `c=`
+  line honored (pre-existing gap, unchanged by the RFC 3263 work).
 
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **555 passing across 56 suites**.
+  `cargo test --workspace` → **561 passing across 56 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16 + §17.1/§17.3
   SRTCP AEAD), STUN (RFC 5769 §2.1/§2.2; MD5 long-term keys + MESSAGE-INTEGRITY
   against independent vectors), G.729 (bcg729 oracle), cross-decode by ffmpeg.
