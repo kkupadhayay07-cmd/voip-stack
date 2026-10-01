@@ -136,6 +136,22 @@ impl Link {
         }
     }
 
+    /// Sends a WebSocket control frame (Ping) on the WSS link. Errors on
+    /// non-WS links (callers only use it for WSS flows).
+    async fn send_ws_control(
+        &mut self,
+        msg: tokio_tungstenite::tungstenite::Message,
+    ) -> Result<(), String> {
+        use futures_util::SinkExt;
+        match self {
+            Link::Ws(s) => s
+                .send(msg)
+                .await
+                .map_err(|e| format!("ws control send: {e}")),
+            _ => Err("ws control frame on a non-WS link".into()),
+        }
+    }
+
     /// Returns one datagram (UDP) or one buffered chunk (streams) / one WS
     /// message payload.
     async fn recv(&mut self, buf: &mut [u8]) -> Result<Option<Vec<u8>>, String> {
@@ -256,6 +272,24 @@ impl Session {
     pub(crate) async fn send_msg(&mut self, msg: &SipMessage) -> Result<(), String> {
         let bytes = serialize(msg);
         self.link.send(&bytes).await
+    }
+
+    /// RFC 5626 §4.4 / §5.5 client keep-alive on a reliable flow: double
+    /// CRLF on TCP/TLS, a WebSocket Ping control frame on WSS. No-op on
+    /// UDP (datagram transports have no flow to keep alive — the OPTIONS
+    /// keepalive covers reachability there).
+    pub(crate) async fn send_flow_keepalive(&mut self) -> Result<(), String> {
+        match self.link {
+            Link::Udp(_) => Ok(()),
+            Link::Tcp(_) | Link::Tls(_) => self.link.send(b"\r\n\r\n").await,
+            // A Ping control frame, not a Binary data frame (servers would
+            // try to parse the latter as SIP).
+            Link::Ws(_) => {
+                self.link
+                    .send_ws_control(tokio_tungstenite::tungstenite::Message::Ping(Vec::new()))
+                    .await
+            }
+        }
     }
 
     pub(crate) async fn recv_msg(&mut self) -> Result<SipMessage, String> {

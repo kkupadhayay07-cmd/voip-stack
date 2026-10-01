@@ -2,6 +2,14 @@
 //! in-memory binding database (Address-of-Record → Contact bindings), with
 //! optional Digest authentication (RFC 3261 §22) reusing `sip_core::digest`.
 //!
+//! Extensions implemented on top of the base REGISTER:
+//! - RFC 5626 Outbound: `+sip.instance` + `reg-id` bindings, flow detection
+//!   via the top Via transport, `Flow-Timer` and `Supported: outbound` echo
+//!   for reliable-transport registrations.
+//! - RFC 5627 GRUU: a public GRUU (`sip:aor;gr=<instance>`) is synthesized
+//!   for every contact that registers a `+sip.instance` and echoed in the
+//!   200 OK alongside `Supported: gruu`.
+//!
 //! The registrar is transport-agnostic: [`Registrar::process`] takes a
 //! parsed request plus the transport source and returns the response to
 //! send, which keeps the protocol logic unit-testable.
@@ -12,6 +20,7 @@ use std::time::{Duration, Instant};
 use sip_core::builder::respond_to;
 use sip_core::digest::{Algorithm, Qop};
 use sip_core::message::Method;
+use sip_core::uri::TransportKind;
 use sip_core::{Request, Response};
 
 /// Errors surfaced by the registrar.
@@ -36,6 +45,17 @@ pub struct Binding {
     /// Registration consistency bookkeeping (§10.2.4).
     pub call_id: String,
     pub cseq: u32,
+    /// `+sip.instance` value (RFC 5626 §9.1) when registered with one.
+    pub instance: Option<String>,
+    /// `reg-id` (RFC 5626 §9.4); 0 = absent. Multiple reg-ids under one
+    /// instance are distinct bindings (one per client flow).
+    pub reg_id: u32,
+    /// Public GRUU synthesized for this binding (RFC 5627 §4.3), present
+    /// only when the contact registered a `+sip.instance`.
+    pub pub_gruu: Option<String>,
+    /// True when the registration arrived over a reliable-transport flow
+    /// (TCP/TLS/WSS top Via), i.e. an Outbound-manageable connection.
+    pub flow: bool,
 }
 
 impl Binding {
@@ -110,6 +130,11 @@ pub struct RegistrarConfig {
     pub max_expires: u32,
     /// Whether REGISTER requests must carry a valid Digest response.
     pub require_auth: bool,
+    /// Keep-alive interval demanded from Outbound clients (RFC 5626 §4.2):
+    /// echoed as `Flow-Timer` when a REGISTER negotiates Outbound over a
+    /// reliable transport. MUST be shorter than any flow idle timeout on
+    /// the path.
+    pub flow_timer_secs: u64,
 }
 
 impl Default for RegistrarConfig {
@@ -119,6 +144,7 @@ impl Default for RegistrarConfig {
             min_expires: 60,
             max_expires: 3600,
             require_auth: false,
+            flow_timer_secs: 120,
         }
     }
 }
@@ -259,42 +285,79 @@ impl Registrar {
         let now = Instant::now();
         let default_expires = self.config.max_expires;
 
+        // Flow detection (RFC 5626 §5.1): a registration over TCP/TLS/WSS
+        // arrives on a connection the client can keep alive; UDP has no
+        // flow to manage. Outbound is negotiated only when the client
+        // advertises `Supported: outbound` AND the request used such a
+        // transport.
+        let flow = matches!(
+            req.headers.first_via().as_ref().map(|v| &v.transport),
+            Some(TransportKind::Tcp)
+                | Some(TransportKind::Tls)
+                | Some(TransportKind::Ws)
+                | Some(TransportKind::Wss)
+        );
+        let outbound = flow && req.headers.supported().has("outbound");
+
         // Compute every contact's effective expiry FIRST: an expiry below
         // the configured minimum (RFC 3261 §10.2.8) is refused with
         // 423 (Interval Too Brief) carrying Min-Expires BEFORE any binding
         // is created or updated. Expiry 0 is de-registration, never 423.
-        let mut computed: Vec<(String, u32, f32)> = Vec::with_capacity(contacts.addresses.len());
+        struct ContactReg {
+            contact: String,
+            expires: u32,
+            q: f32,
+            instance: Option<String>,
+            reg_id: u32,
+        }
+        let mut computed: Vec<ContactReg> = Vec::with_capacity(contacts.addresses.len());
         for c in &contacts.addresses {
             let contact_str = c.addr.to_string();
-            let param_expires = c
-                .params
-                .iter()
-                .find(|p| p.name.eq_ignore_ascii_case("expires"))
-                .and_then(|p| p.value.as_deref())
-                .and_then(|v| v.parse::<u32>().ok());
+            let param = |name: &str| {
+                c.params
+                    .iter()
+                    .find(|p| p.name_eq(name))
+                    .and_then(|p| p.value.clone())
+            };
+            let param_expires = param("expires").and_then(|v| v.parse::<u32>().ok());
             let expires = param_expires
                 .or(header_expires)
                 .unwrap_or(default_expires)
                 .min(self.config.max_expires);
-            let q = c
-                .params
-                .iter()
-                .find(|p| p.name.eq_ignore_ascii_case("q"))
-                .and_then(|p| p.value.as_deref())
+            let q = param("q")
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(1.0);
+            let instance = param("+sip.instance").filter(|v| !v.is_empty());
+            // reg-id (RFC 5626 §9.4): must be a positive 32-bit number when
+            // present. reg-id without +sip.instance is meaningless but not
+            // an error; reg-id = 0 is a protocol violation (400).
+            let reg_id = match param("reg-id") {
+                Some(v) => match v.parse::<u32>() {
+                    Ok(0) | Err(_) => {
+                        return Ok(respond_to(req, 400, "Bad Request", Vec::new(), None));
+                    }
+                    Ok(id) => id,
+                },
+                None => 0,
+            };
             if expires != 0 && expires < self.config.min_expires {
                 let mut resp = respond_to(req, 423, "Interval Too Brief", Vec::new(), None);
                 resp.headers
                     .add("Min-Expires", self.config.min_expires.to_string());
                 return Ok(resp);
             }
-            computed.push((contact_str, expires, q));
+            computed.push(ContactReg {
+                contact: contact_str,
+                expires,
+                q,
+                instance,
+                reg_id,
+            });
         }
 
         let existed = self.aors.contains_key(&aor);
         let entry = self.aors.entry(aor.clone()).or_default();
-        let mut updates: Vec<(String, u32)> = Vec::new();
+        let mut updates: Vec<(String, u32, u32)> = Vec::new();
         // AoR lookup tap (after lookup, before response)
         observ::session::emit_for(
             &call_id,
@@ -305,40 +368,55 @@ impl Registrar {
             },
         );
 
-        for (contact_str, expires, q) in &computed {
-            updates.push((contact_str.clone(), *expires));
+        for c in &computed {
+            // Pub-GRUU synthesis (RFC 5627 §4.3): registrar policy keeps it
+            // simple — the AoR plus `;gr=<instance>`. Stable across
+            // refreshes because the instance is stable.
+            let pub_gruu = c.instance.as_ref().map(|inst| format!("{};gr={inst}", aor));
+            updates.push((c.contact.clone(), c.expires, c.reg_id));
             if let Some(existing) = entry
                 .bindings
                 .iter_mut()
-                .find(|b| b.contact == *contact_str && b.call_id == call_id)
+                .find(|b| b.contact == c.contact && b.call_id == call_id && b.reg_id == c.reg_id)
             {
-                if *expires == 0 {
+                if c.expires == 0 {
                     continue; // removal handled below
                 }
                 if cseq >= existing.cseq {
                     existing.cseq = cseq;
                     existing.source = source.to_string();
-                    existing.q = *q;
-                    existing.expires_at = now + Duration::from_secs(*expires as u64);
+                    existing.q = c.q;
+                    existing.expires_at = now + Duration::from_secs(c.expires as u64);
+                    existing.instance = c.instance.clone();
+                    existing.pub_gruu = pub_gruu.clone();
+                    existing.flow = flow;
                 }
-            } else if *expires > 0 {
+            } else if c.expires > 0 {
                 entry.bindings.push(Binding {
-                    contact: contact_str.clone(),
+                    contact: c.contact.clone(),
                     source: source.to_string(),
-                    q: *q,
-                    expires_at: now + Duration::from_secs(*expires as u64),
+                    q: c.q,
+                    expires_at: now + Duration::from_secs(c.expires as u64),
                     call_id: call_id.clone(),
                     cseq,
+                    instance: c.instance.clone(),
+                    reg_id: c.reg_id,
+                    pub_gruu: pub_gruu.clone(),
+                    flow,
                 });
             }
         }
 
-        // Apply removals / prune expired.
-        for (contact, expires) in &updates {
+        // Apply removals / prune expired. A de-registration (Expires: 0)
+        // only removes the binding it names: same contact, same Call-ID,
+        // same reg-id (RFC 5626 §4.2 — other flows of the same instance
+        // stay registered).
+        for (contact, expires, reg_id) in &updates {
             if *expires == 0 {
                 if let Some(e) = self.aors.get_mut(&aor) {
-                    e.bindings
-                        .retain(|b| !(b.contact == *contact && b.call_id == call_id));
+                    e.bindings.retain(|b| {
+                        !(b.contact == *contact && b.call_id == call_id && b.reg_id == *reg_id)
+                    });
                 }
             }
         }
@@ -347,18 +425,44 @@ impl Registrar {
         }
 
         // 200 OK echoing every current binding with its remaining expiry
-        // (RFC 3261 §10.2.8).
+        // (RFC 3261 §10.2.8), plus the Outbound/GRUU extension headers.
         let mut resp = respond_to(req, 200, "OK", Vec::new(), None);
+        let any_instance = computed.iter().any(|c| c.instance.is_some());
         if let Some(e) = self.aors.get(&aor) {
             for b in e.active() {
-                resp.headers.add(
-                    "Contact",
-                    format!("<{}>;expires={}", b.contact, b.remaining()),
-                );
+                let mut v = format!("<{}>;expires={}", b.contact, b.remaining());
+                if b.q != 1.0 {
+                    v.push_str(&format!(";q={}", b.q));
+                }
+                if let Some(inst) = &b.instance {
+                    // Quoted per RFC 3261 generic-param (URN is not a token).
+                    v.push_str(&format!(";+sip.instance=\"{inst}\""));
+                }
+                if b.reg_id > 0 {
+                    v.push_str(&format!(";reg-id={}", b.reg_id));
+                }
+                if let Some(gruu) = &b.pub_gruu {
+                    // The GRUU URI contains `;`, so it must be quoted.
+                    v.push_str(&format!(";pub-gruu=\"{gruu}\""));
+                }
+                resp.headers.add("Contact", v);
             }
         }
-        if let Some(e) = self.config.max_expires.checked_sub(0) {
-            let _ = e;
+        // RFC 5626 §4.2: Flow-Timer only for negotiated Outbound over a
+        // flow; the client must keep the connection alive within this
+        // budget. RFC 5627 §4.2: Supported: gruu when the REGISTER
+        // announced GRUU support or carried instance contacts.
+        if outbound {
+            resp.headers
+                .add("Flow-Timer", self.config.flow_timer_secs.to_string());
+            let mut tags = vec!["outbound"];
+            if req.headers.supported().has("gruu") || any_instance {
+                tags.push("gruu");
+            }
+            resp.headers.add("Supported", tags.join(", "));
+            if req.headers.require().has("outbound") {
+                resp.headers.add("Require", "outbound");
+            }
         }
         Ok(resp)
     }

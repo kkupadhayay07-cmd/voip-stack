@@ -236,6 +236,8 @@ pub fn reason_for_code(code: u16) -> &'static str {
         421 => "Extension Required",
         422 => "Session Interval Too Small",
         423 => "Interval Too Brief",
+        430 => "Flow Failed",
+        439 => "First Hop Lacks Outbound Support",
         480 => "Temporarily Unavailable",
         481 => "Call/Transaction Does Not Exist",
         482 => "Loop Detected",

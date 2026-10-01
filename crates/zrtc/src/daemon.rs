@@ -293,17 +293,17 @@ pub async fn run(mut cfg: Config) -> Result<(), String> {
             // Fail fast: a trunk that cannot register is a fatal config
             // error (the raw challenge is logged inside register::run).
             let mut sess = trunk::connect(&mut ep).await?;
-            let code = trunk::register::run(
+            let flow = trunk::register::run(
                 &mut sess,
                 &ep,
                 trunk_auth.as_mut(),
                 cfg.registrar.expires.max(300),
             )
             .await?;
-            tracing::info!("trunk ready (REGISTER {})", code);
-            if ep.keepalive_secs > 0 {
-                tokio::spawn(trunk::keepalive_loop(sess, ep, trunk_auth));
-            }
+            tracing::info!("trunk ready (REGISTER cseq {})", flow.cseq);
+            // The flow loop owns the session: OPTIONS keepalives, RFC 5626
+            // flow keep-alives (Flow-Timer), and registration refreshes.
+            tokio::spawn(trunk::flow_loop(sess, ep, trunk_auth, flow));
         } else if ep.keepalive_secs > 0 {
             let sess = trunk::connect(&mut ep).await?;
             tokio::spawn(trunk::keepalive_loop(sess, ep, trunk_auth));
@@ -436,6 +436,9 @@ fn build_registrar(cfg: &Config) -> Registrar {
         min_expires: 30,
         max_expires: cfg.registrar.expires.max(3600),
         require_auth: cfg.registrar.require_auth,
+        // Demands flow keep-alives every 120 s from Outbound clients —
+        // comfortably under the 180 s reliable-transport idle timeout.
+        flow_timer_secs: 120,
     };
     let mut registrar = Registrar::new(config);
     if cfg.registrar.require_auth {

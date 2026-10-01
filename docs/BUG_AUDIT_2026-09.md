@@ -89,7 +89,7 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **561 passing** across 56 suites, `clippy -D warnings`
+`cargo test --workspace` → **571 passing** across 56 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
 **The external audit is fully closed**: every finding at every severity —
@@ -134,7 +134,31 @@ code before acting (same rule as the external audit). Fixed in this commit:
   hosts) — pre-existing, now documented in COMPLIANCE §5.
 * RTCP BYE on media teardown; `nacks_tx` counts FCI entries (documented).
 
-Net: **561 tests / 56 suites** (was 555) — 6 new regression tests pin the
+Net: **571 tests / 56 suites** (was 561) — 6 new regression tests pin the
 fixed behavior; the wire-format expectations were cross-checked against
 libwebrtc/pion because self-roundtrip tests structurally could not catch
 S1–S3.
+
+
+---
+
+# GRUU/Outbound wave findings (2026-09, Task 44)
+
+The RFC 5626/5627 implementation wave surfaced two real parser-layer defects
+during development (both caught by new roundtrip tests BEFORE any push —
+the Task 43 lesson "self-roundtrip tests catch spec bugs only if the test
+encodes the spec form" applied again, this time at the generic-param layer):
+
+| # | Finding | Severity | Fix |
+|---|---------|----------|-----|
+| G1 | `Param::Display` re-emitted `+sip.instance="<urn:uuid:…>"` UNQUOTED (the quote rule did not cover `<`/`>`), producing a generic-param value that is not a legal token — strict RFC 5626/5627 peers reject the header | **Major** (wire) | Quote rule widened to `<`/`>`; roundtrip test pins instance + pub-gruu forms |
+| G2 | `parse_params` split the parameter string with a blind `split(';')`, so a quoted value containing `;` (`pub-gruu="sip:alice@example.com;gr=urn:uuid:…"`) was shredded into a phantom `gr` param and a truncated value | **Major** (parser) | Quote-aware `split_outside_quotes` (backslash-escape aware) used for all URI/name-addr params; regression test covers instance, gr, and pub-gruu |
+
+Also corrected while implementing: registrar de-registration of one
+reg-id no longer removes the other flows of the same contact, the `q`
+value is echoed in the 200 OK (RFC 3261 §10.2.8), and the dead
+`max_expires.checked_sub(0)` no-op in the registrar was removed.
+
+Net: **571 tests / 56 suites** (was 561) — 10 new tests (sip-core +1,
+registrar +5, zrtc +4 incl. an end-to-end TCP flow test driving the real
+flow loop against a fake registrar).

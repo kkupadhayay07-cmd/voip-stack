@@ -225,6 +225,18 @@ the media path.
   pins the winner for keepalives, request-URIs and RTP — a dead SRV primary
   costs one connect attempt, not the call.
 
+* **Registration & flow layer (RFC 5626/5627)**: the trunk UAC registers
+  with `Supported: outbound, gruu` and an instance-tagged Contact
+  (`+sip.instance` from `[trunk].instance_id`, `reg-id=1`). The registrar
+  detects the transport flow from the top Via, stores per-reg-id bindings,
+  synthesizes a pub-gruu (`sip:AOR;gr=<instance>`) per instance, and
+  answers with `Flow-Timer` + `Supported: outbound` on reliable transports.
+  A single `flow_loop` task owns the session afterwards: OPTIONS
+  keepalives, `Flow-Timer`-driven CRLF (TCP/TLS) / WS-Ping (WSS) flow
+  keep-alives, and re-REGISTER at half the granted expiry on the same
+  Call-ID — the binding never silently expires and dead flows surface
+  within one keep-alive interval.
+
 * **Build**: `cargo build --release`; pinned toolchain via
   `rust-toolchain.toml`; libopus is the only native dep and is optional.
 * **Container**: multi-stage Dockerfile (rust builder → slim runtime,

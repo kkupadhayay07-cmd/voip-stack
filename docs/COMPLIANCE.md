@@ -21,7 +21,7 @@ hardening (IP4/IP6 `o=`/`c=` address types picked from the local host
 literal, RFC 8843 BUNDLE group echo with the accepted mids), a
 concurrent-call load harness with percentile reporting, and RTP loss
 recovery + congestion feedback (RFC 4585 Generic NACK, RFC 4588 RTX,
-transport-cc); 561 tests green
+transport-cc) and SIP RFC 5626 Outbound + RFC 5627 GRUU; 571 tests green
 across 56 suites — **every audit finding at every severity is fixed**).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
@@ -47,8 +47,8 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC 8843 | BUNDLE (grouping) | **Done** (core) | `sdp`: `a=group:BUNDLE` + `a=mid` parsed into typed projections; the answer echoes the group with exactly the accepted mids in the offer group's order (§6.2/§7.1.1) — rejected (port 0) m-lines and accepted m-lines without a mid never join the group, an answer to an unbundled offer never grows a group; mid echo per accepted m-line. Single-transport reuse by the media engine (m-line demux by mid) is future work. |
 | RFC 8866 | SDP v2 | **Partial** | Parser/model cover `rtpmap`/`fmtp`, `ice-*`, `fingerprint`, `bundle`, `extmap`; answers emit IP4/IP6 connection types per the local literal (§4.4); full 8866 grammar validation not complete. |
 | RFC 2617/7616 | Digest auth | **Done** (server side) | `sip-core` helpers + registrar nonce store; `respond_to_challenge` used in tests/clients. |
-| RFC 6140 / 5627 | GRUU | **Planned** | Not started. |
-| RFC 5626 / 6223 | Outbound | **Planned** | Not started. |
+| RFC 6140 / 5627 | GRUU | **Done** (pub-gruu) | Registrar synthesizes a public GRUU (`sip:AOR;gr=<instance>`) for every contact registering `+sip.instance`, echoes it (quoted) in the 200 OK with `Supported: gruu`; the trunk UAC advertises the option tag. Quoted generic-params are parser round-trip stable (quote-aware param split). Not done: temp-gruu (temporary opaque GRUUs with lifetime), instance-aware proxy routing (a request to a GRUU forks to all of the user's contacts, not the targeted instance). |
+| RFC 5626 / 6223 | Outbound | **Done** (client + registrar) | Registrar: flow detection via the top Via transport, `+sip.instance`/`reg-id` bindings (per-reg-id de-registration, reg-id=0 → 400), `Flow-Timer` + `Supported: outbound` echo on reliable transports only. Trunk UAC: `Supported: outbound, gruu` on every REGISTER, instance-tagged Contact (stable `[trunk] instance_id` config, process-local generated otherwise), refresh at half the granted expiry on the same Call-ID, CRLF (TCP/TLS) / WS-Ping (WSS) flow keep-alives per `Flow-Timer`; 430 `Flow Failed` reason phrase available. Not done: STUN keep-alives over UDP flows, proxy-side flow tokens / 430 generation on flow loss, `Path` / Service-Route support. |
 | RFC 7118 | SIP over WS | **Done** | WS/WSS listeners wired in the `zrtc` daemon (WSS = WS over TLS); message layer handles text-frame streaming + Content-Length accumulation. |
 
 ## 2. Media transport
@@ -130,7 +130,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
   between 20–50 under CPU saturation); the release-build 8-core soak
   remains.
 * REMB, audio-band DTMF detection,
-  GRUU/Outbound, WebRTC data channels, mid-dialog RFC 3263 re-resolution.
+  WebRTC data channels, mid-dialog RFC 3263 re-resolution.
 * **RTCP non-mux addressing (RFC 3550 §11)**: the media pump is mux-only;
   peers that refuse `a=rtcp-mux` would address RTCP at the RTP port+1,
   which we never bind (their feedback would be lost). We now at least
@@ -149,7 +149,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **561 passing across 56 suites**.
+  `cargo test --workspace` → **571 passing across 56 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16 + §17.1/§17.3
   SRTCP AEAD), STUN (RFC 5769 §2.1/§2.2; MD5 long-term keys + MESSAGE-INTEGRITY
   against independent vectors), G.729 (bcg729 oracle), cross-decode by ffmpeg.

@@ -90,6 +90,17 @@ for TCP/TLS/WSS; a dead primary logs `trunk failover` and the next candidate
 takes the call), and the winning address is pinned for keepalives, request
 URIs and RTP. If every candidate fails, the error names each attempt.
 
+**RFC 5626 Outbound registration.** With `[trunk].register = true` the
+REGISTER advertises `Supported: outbound, gruu` and tags the Contact with
+`+sip.instance` + `reg-id=1`. Set `[trunk].instance_id` to a stable URN
+(e.g. `urn:uuid:0b1e…`) — Outbound semantics expect the instance to survive
+restarts; without it the daemon generates a process-local URN and logs a
+warning. When the registrar answers `Flow-Timer: N` over a reliable
+transport, the daemon keeps the flow alive every N seconds (double CRLF on
+TCP/TLS, a WebSocket Ping on WSS — no flow pings on UDP) and re-REGISTERs at
+half the granted expiry on the same Call-ID with an incrementing CSeq, so
+registrations never silently expire and dead flows are noticed.
+
 The UAC probe supports `--transport udp|tcp|tls|wss`, `--to`, `--from`,
 `--rtp-ms`, `--timeout-secs`.
 
@@ -221,8 +232,10 @@ configured bounds. Guidance:
    mounted config + real healthcheck.
 6. **SDP hardening** (rejected m-lines, port-0 answers, the RFC 3264 §6.1
    direction clamp, **IPv6 answer address types and RFC 8843 BUNDLE group
-   echo are done**), GRUU/Outbound,
-   NAPTR/SRV for carrier-grade signaling. (PRACK/100rel shipped — see
+   echo are done**) — and **GRUU/Outbound done** (RFC 5626 flow
+   keep-alives + registration refresh, RFC 5627 pub-gruu synthesis;
+   `NAPTR/SRV` shipped earlier), leaving data channels (SCTP) and
+   carrier-grade signaling extras on the extension list. (PRACK/100rel shipped — see
    `COMPLIANCE.md`. The external audit is fully closed at every severity —
    Critical, High and the complete P2 backlog — with regression tests;
    see `docs/BUG_AUDIT_2026-09.md`.)

@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 561 tests passing across 56 suites in 20 crates;
+**Current state: 571 tests passing across 56 suites in 20 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
@@ -21,7 +21,10 @@ finding is fixed with regression tests
 of the Task 39–42 media/DNS work fixed 1 critical + 5 major wire-level bugs
 before they could ship (transport-cc S-bit chunks, inter-arrival deltas,
 2-byte sequences, rtcp-mux advertisement, IPv6 trunk URIs, blocking DNS on
-async workers).**
+async workers). RFC 5626 Outbound + RFC 5627 GRUU are now implemented end to
+end (registrar-side flow detection / `Flow-Timer` / pub-gruu synthesis, and
+the trunk UAC's instance-tagged REGISTER with refresh + CRLF flow
+keep-alives).**
 
 ## Workspace layout
 
@@ -36,7 +39,7 @@ async workers).**
 | `crates/srtp` | RFC 3711 (AES-CM + HMAC-SHA1, KDF, replay window, ROC estimation) + RFC 7714 AES-GCM AEAD; validated against RFC 3711 B.2/B.3 and RFC 7714 §16 vectors | **Done** |
 | `crates/dtls` | DTLS-SRTP (RFC 5764/6347) via whitelisted OpenSSL: runtime self-signed ECDSA P-256 certs, RFC 8122 fingerprint pinning, use_srtp negotiation, RFC 5764 §4.2 key export, flight retransmission | **Done** |
 | `crates/ice` | RFC 5389 STUN codec (RFC 5769 vectors), RFC 8445 ICE agent (host/srflx/relay gathering, connectivity checks, nomination), RFC 5766 TURN server (long-term auth, permissions, Send/Data, ChannelBind) | **Done** |
-| `crates/registrar` | RFC 3261 §10 registrar: AoR bindings, Digest auth (401 challenge, one-time nonces), wildcard/expiry/CSeq consistency | **Done** |
+| `crates/registrar` | RFC 3261 §10 registrar: AoR bindings, Digest auth (401 challenge, one-time nonces), wildcard/expiry/CSeq consistency; RFC 5626 Outbound (instance/reg-id bindings, flow detection, `Flow-Timer`) and RFC 5627 pub-gruu synthesis | **Done** |
 | `crates/proxy` | Stateful proxy (RFC 3261 §16): routing, parallel forking, Record-Route (loose router), Via prepend/pop, CANCEL per §9.1, 483 Max-Forwards, NAT response routing (received/rport) | **Done** |
 | `crates/sbc` | Session border controller: CIDR ACL, token-bucket rate limiting, NAT latching, RFC 3581 rport, topology hiding (Call-ID remap + Contact rewrite) | **Done** |
 | `crates/media` | Windowed-sinc resampler (anti-alias, arbitrary ratios), N-way conference mixer (clip protection, mute/gain), RIFF/WAVE recorder, adaptive energy+ZCR VAD with hangover | **Done** |
@@ -46,7 +49,7 @@ async workers).**
 | `crates/api` | Control plane: REST (CDR queries/stats, campaigns, pacing), WebSocket event stream, Prometheus `/metrics`, health/readiness | **Done** |
 | `crates/observ` | In-process observability: Wireshark-openable pcap capture (SIP + RTP), human-readable per-call traces, per-leg media diag counters (rx/tx/lost/jitter/concealed) — everything correlated by SIP Call-ID | **Done** |
 | `crates/rfc3263` | RFC 3263 SIP server discovery: RFC 1035 DNS wire codec (compression-safe name reader, loop-proof pointers), NAPTR protocol selection (RFC 2915 S-flag), RFC 2782 SRV priority + weighted ordering, A/AAAA fallback, UDP with TC→TCP fallback — pure std, zero deps | **Done** |
-| `crates/zrtc` | The daemon: wires everything into one voice service — UDP/TCP/TLS/WSS SIP listeners, SBC → proxy → registrar, B2BUA + loopback sink, outbound trunk (IP / Digest / Bearer / mTLS, RFC 3263 NAPTR/SRV discovery with connection-time candidate failover), outbound originator, AI tap, REST API, observability. Config: `zrtc.toml` | **Done** |
+| `crates/zrtc` | The daemon: wires everything into one voice service — UDP/TCP/TLS/WSS SIP listeners, SBC → proxy → registrar, B2BUA + loopback sink, outbound trunk (IP / Digest / Bearer / mTLS, RFC 3263 NAPTR/SRV discovery with connection-time candidate failover; RFC 5626 registration refresh + CRLF/WS-ping flow keep-alives), outbound originator, AI tap, REST API, observability. Config: `zrtc.toml` | **Done** |
 
 ## Quick start
 
@@ -54,7 +57,7 @@ async workers).**
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 561 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 571 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -223,7 +226,9 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
    clamp, extras serialization, **IPv6 answer address types and RFC 8843
    BUNDLE group echo done**. RFC 3263 NAPTR/SRV server discovery — **done**
    (new `rfc3263` crate, live on the zrtc outbound trunk) with
-   **connection-time candidate failover done**; remaining: GRUU/Outbound.
+   **connection-time candidate failover done**; **GRUU/Outbound done ✅**
+   (RFC 5626 flow keep-alives + `Flow-Timer` + registration refresh, RFC 5627
+   pub-gruu synthesis end to end).
 
 ## Documentation
 

@@ -457,6 +457,13 @@ pub struct Trunk {
     /// OPTIONS keepalive interval in seconds; 0 disables keepalives.
     #[serde(default)]
     pub keepalive_secs: u64,
+    /// Stable `+sip.instance` URN for RFC 5626 Outbound registrations
+    /// (e.g. "urn:uuid:0b1e2d3c-..."). Generated per process when absent
+    /// and `register = true` (a warning is logged: Outbound semantics
+    /// expect the instance to survive restarts, so set this explicitly in
+    /// production).
+    #[serde(default)]
+    pub instance_id: Option<String>,
 }
 
 fn default_trunk_transport() -> String {

@@ -1,6 +1,8 @@
 //! Vendor trunk client: connects out to the provider over UDP/TCP/TLS,
-//! drives the startup REGISTER (with 401/407 auth), runs OPTIONS
-//! keepalives, and places calls (`zrtc call <e164>`).
+//! drives the startup REGISTER (with 401/407 auth), keeps the registration
+//! and the transport flow alive (OPTIONS keepalives, RFC 5626 CRLF/WS-ping
+//! flow keepalives driven by `Flow-Timer`, registration refreshes), and
+//! places calls (`zrtc call <e164>`).
 
 pub mod call;
 pub mod register;
@@ -31,6 +33,11 @@ pub struct Endpoint {
     pub aor: String,
     /// Contact for REGISTER (host part mirrors the daemon's sip.host).
     pub contact: String,
+    /// `+sip.instance` value (RFC 5626 §9.1), e.g.
+    /// `urn:uuid:0b1e2d...`. Taken from `[trunk] instance_id` when set;
+    /// otherwise generated per process (a warning is logged, since Outbound
+    /// semantics expect the instance to be stable across restarts).
+    pub instance: Option<String>,
     pub keepalive_secs: u64,
     /// Client identity for mTLS (tls_client_cert mode).
     pub identity: Option<crate::tls::TlsClientIdentity>,
@@ -78,12 +85,35 @@ impl Endpoint {
             .clone()
             .unwrap_or_else(|| format!("sip:{user}@{}", uri_host(&host)));
         let contact = format!("sip:{user}@{}", cfg.sip.host);
+        let instance = match t
+            .instance_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(id) => Some(id.to_string()),
+            None if t.register => {
+                // Outbound semantics expect a stable instance across
+                // restarts; without configuration we can only offer a
+                // process-local one (stale server-side bindings linger
+                // until expiry after a restart).
+                let urn = new_instance_urn();
+                tracing::warn!(
+                    "trunk register enabled without [trunk] instance_id: using a \
+                     process-local +sip.instance ({urn}) — set instance_id for \
+                     stable RFC 5626 Outbound semantics across restarts"
+                );
+                Some(urn)
+            }
+            None => None,
+        };
         Ok(Endpoint {
             target,
             targets,
             transport,
             aor,
             contact,
+            instance,
             keepalive_secs: t.keepalive_secs,
             identity: if transport == uac::Transport::Tls && t.tls_cert_path.is_some() {
                 Some(crate::tls::TlsClientIdentity {
@@ -306,6 +336,7 @@ pub(crate) fn request(
     contact: bool,
     extra: &[(String, String)],
 ) -> Result<sip_core::message::Request, String> {
+    let is_register = method == Method::Register;
     let mut b = RequestBuilder::new(method, SipUri::parse(uri).map_err(|e| e.to_string())?)
         .via(ep.transport.kind(), via, Some(&sip_core::ids::new_branch()))
         .from(&format!("<{}>;tag={from_tag}", ep.aor))
@@ -317,7 +348,23 @@ pub(crate) fn request(
         .cseq(cseq)
         .header("Max-Forwards", "70");
     if contact {
-        b = b.contact(&format!("<{}>", ep.contact));
+        // REGISTER contacts carry the Outbound binding identity (RFC 5626
+        // §9): `+sip.instance` + `reg-id`. reg-id is fixed at 1 — one
+        // registration flow per trunk process. Dialog-forming requests
+        // (INVITE et al.) keep the bare contact; +sip.instance is a
+        // REGISTER-level parameter.
+        if is_register {
+            if let Some(inst) = &ep.instance {
+                b = b.contact(&format!(
+                    "<{}>;+sip.instance=\"{inst}\";reg-id=1",
+                    ep.contact
+                ));
+            } else {
+                b = b.contact(&format!("<{}>", ep.contact));
+            }
+        } else {
+            b = b.contact(&format!("<{}>", ep.contact));
+        }
     }
     for (name, value) in extra {
         b = b.header(name, value);
@@ -341,8 +388,150 @@ pub(crate) async fn recv_response(
     }
 }
 
-/// Long-running OPTIONS keepalive toward the trunk. Every tick asks the
-/// auth mode for credential headers (`on_keepalive`), then sends OPTIONS.
+/// Generates a `urn:uuid:` instance identifier (RFC 5626 §9.1 wants a URN;
+/// a random v4-shaped UUID from the OS RNG is sufficient and needs no extra
+/// dependency). Hand-rolled hex formatting keeps zrtc on its existing deps.
+fn new_instance_urn() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!(
+        "urn:uuid:{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// Long-running flow maintenance for a REGISTERED trunk (RFC 5626):
+/// - OPTIONS keepalives every `keepalive_secs` (as before),
+/// - flow keep-alives every `Flow-Timer` seconds over the reliable
+///   transport (double CRLF on TCP/TLS, WebSocket Ping on WSS),
+/// - registration refreshes at half the granted expiry (same Call-ID,
+///   incrementing CSeq — keeps the registrar's binding upsert keyed).
+///
+/// All three timers share the one session; the earliest deadline wins.
+pub(crate) async fn flow_loop(
+    mut sess: uac::Session,
+    ep: Endpoint,
+    mut auth: Box<dyn TrunkAuth>,
+    mut flow: register::Flow,
+) {
+    let ka_secs = ep.keepalive_secs.max(1);
+    tracing::info!(
+        "trunk flow loop: REGISTER refresh every {}s, flow keep-alive every {}s, \
+         OPTIONS keepalive every {ka_secs}s",
+        flow.refresh_interval_secs(),
+        flow.flow_timer
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "off".into())
+    );
+    let mut ka_at = tokio::time::Instant::now() + Duration::from_secs(ka_secs);
+    let mut ping_at = flow
+        .flow_timer
+        .map(|t| tokio::time::Instant::now() + Duration::from_secs(t.max(1)));
+    let mut refresh_at =
+        tokio::time::Instant::now() + Duration::from_secs(flow.refresh_interval_secs());
+    loop {
+        let next = [Some(ka_at), ping_at, Some(refresh_at)]
+            .iter()
+            .flatten()
+            .copied()
+            .min()
+            .unwrap_or_else(tokio::time::Instant::now);
+        tokio::time::sleep_until(next).await;
+        let now = tokio::time::Instant::now();
+        if now >= refresh_at {
+            match register::refresh(&mut sess, &ep, auth.as_mut(), &mut flow).await {
+                Ok(()) => {
+                    refresh_at = tokio::time::Instant::now()
+                        + Duration::from_secs(flow.refresh_interval_secs());
+                    // A server may rotate the Flow-Timer between refreshes.
+                    ping_at = flow
+                        .flow_timer
+                        .map(|t| tokio::time::Instant::now() + Duration::from_secs(t.max(1)));
+                }
+                Err(e) => {
+                    // Keep trying on the same cadence; auth/network hiccups
+                    // must not take the whole loop down.
+                    tracing::warn!("trunk REGISTER refresh failed: {e}");
+                    refresh_at = now + Duration::from_secs(flow.refresh_interval_secs());
+                }
+            }
+        }
+        if now >= ping_at.unwrap_or(now) {
+            if let Some(t) = flow.flow_timer {
+                if let Err(e) = sess.send_flow_keepalive().await {
+                    tracing::warn!("trunk flow keep-alive failed: {e}");
+                } else {
+                    tracing::debug!("trunk flow keep-alive sent (every {t}s)");
+                }
+                ping_at = Some(now + Duration::from_secs(t.max(1)));
+            } else {
+                ping_at = None;
+            }
+        }
+        if now >= ka_at {
+            keepalive_options(&mut sess, &ep, auth.as_mut()).await;
+            ka_at = now + Duration::from_secs(ka_secs);
+        }
+    }
+}
+
+/// One OPTIONS keepalive round (extracted from the old keepalive_loop so
+/// the flow loop can share it).
+async fn keepalive_options(sess: &mut uac::Session, ep: &Endpoint, auth: &mut dyn TrunkAuth) {
+    let uri = ep.keepalive_uri();
+    let mut ctx = KeepaliveCtx {
+        uri: uri.clone(),
+        headers: Vec::new(),
+    };
+    auth.on_keepalive(&mut ctx);
+    let req = match request(
+        Method::Options,
+        &uri,
+        ep,
+        &sess.via(),
+        &new_call_id("zrtc-ka"),
+        1,
+        &new_tag(),
+        None,
+        false,
+        &ctx.headers,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("trunk keepalive build failed: {e}");
+            return;
+        }
+    };
+    if let Err(e) = sess.send_msg(&SipMessage::Request(req)).await {
+        tracing::warn!("trunk keepalive send failed: {e}");
+        return;
+    }
+    match tokio::time::timeout(Duration::from_secs(2), recv_response(sess)).await {
+        Ok(Ok(resp)) => {
+            tracing::debug!("trunk keepalive OPTIONS -> {}", resp.code);
+            if resp.code == 401 || resp.code == 407 {
+                // Vendor started challenging keepalives mid-flight.
+                let www = resp.headers.get("WWW-Authenticate").map(str::to_string);
+                let proxy = resp.headers.get("Proxy-Authenticate").map(str::to_string);
+                let _ = auth.on_challenge(resp.code, www.as_deref(), proxy.as_deref());
+            }
+        }
+        Ok(Err(e)) => tracing::warn!("trunk keepalive recv failed: {e}"),
+        Err(_) => tracing::warn!("trunk keepalive: no response within 2s"),
+    }
+}
+
+/// Long-running OPTIONS keepalive toward the trunk (unregistered trunks:
+/// no flow, no refresh). Every tick asks the auth mode for credential
+/// headers (`on_keepalive`), then sends OPTIONS.
 pub(crate) async fn keepalive_loop(
     mut sess: uac::Session,
     ep: Endpoint,
@@ -350,51 +539,9 @@ pub(crate) async fn keepalive_loop(
 ) {
     let secs = ep.keepalive_secs.max(1);
     tracing::info!("trunk keepalive: OPTIONS every {secs}s to {}", ep.target);
-    let mut tick = tokio::time::interval(Duration::from_secs(secs));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        tick.tick().await;
-        let uri = ep.keepalive_uri();
-        let mut ctx = KeepaliveCtx {
-            uri: uri.clone(),
-            headers: Vec::new(),
-        };
-        auth.on_keepalive(&mut ctx);
-        let req = match request(
-            Method::Options,
-            &uri,
-            &ep,
-            &sess.via(),
-            &new_call_id("zrtc-ka"),
-            1,
-            &new_tag(),
-            None,
-            false,
-            &ctx.headers,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("trunk keepalive build failed: {e}");
-                continue;
-            }
-        };
-        if let Err(e) = sess.send_msg(&SipMessage::Request(req)).await {
-            tracing::warn!("trunk keepalive send failed: {e}");
-            continue;
-        }
-        match tokio::time::timeout(Duration::from_secs(2), recv_response(&mut sess)).await {
-            Ok(Ok(resp)) => {
-                tracing::debug!("trunk keepalive OPTIONS -> {}", resp.code);
-                if resp.code == 401 || resp.code == 407 {
-                    // Vendor started challenging keepalives mid-flight.
-                    let www = resp.headers.get("WWW-Authenticate").map(str::to_string);
-                    let proxy = resp.headers.get("Proxy-Authenticate").map(str::to_string);
-                    let _ = auth.on_challenge(resp.code, www.as_deref(), proxy.as_deref());
-                }
-            }
-            Ok(Err(e)) => tracing::warn!("trunk keepalive recv failed: {e}"),
-            Err(_) => tracing::warn!("trunk keepalive: no response within 2s"),
-        }
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+        keepalive_options(&mut sess, &ep, auth.as_mut()).await;
     }
 }
 
@@ -509,6 +656,7 @@ mod tests {
             transport,
             aor: "sip:trunk@127.0.0.1".into(),
             contact: "sip:trunk@127.0.0.1".into(),
+            instance: None,
             keepalive_secs: 0,
             identity: None,
         }

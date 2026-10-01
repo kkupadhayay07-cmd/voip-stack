@@ -165,8 +165,13 @@ impl Param {
 
 impl fmt::Display for Param {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Re-quote any value that is not a legal RFC 3261 `token`. The
+        // angle brackets matter in practice: `+sip.instance="<urn:uuid:..>"`
+        // parses to `<urn:uuid:..>` and MUST be emitted quoted again — an
+        // unquoted `<` is not a generic-param value and strict peers
+        // (RFC 5626/5627 implementations) reject the header outright.
         match &self.value {
-            Some(v) if v.is_empty() || v.contains([';', ',', '?', '"']) => {
+            Some(v) if v.is_empty() || v.contains([';', ',', '?', '"', '<', '>']) => {
                 write!(f, "{}=\"{}\"", self.name, v)
             }
             Some(v) => write!(f, "{}={}", self.name, v),
@@ -432,12 +437,43 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Splits `s` on `sep` occurring OUTSIDE double-quoted strings (RFC 3261
+/// generic-param: a quoted-string value may contain `;`, `,` …). Backslash
+/// escapes inside quotes are honored; a never-closed quote keeps consuming
+/// to the end (defensive on malformed input).
+fn split_outside_quotes(s: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (i, ch) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            c if c == sep && !in_quotes => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
 fn parse_params(s: &str) -> Result<Vec<Param>> {
     let mut params = Vec::new();
     if s.is_empty() {
         return Ok(params);
     }
-    for part in s.split(';') {
+    // Quote-aware split: `pub-gruu="sip:x@y;gr=urn:..."` must survive as
+    // ONE parameter (a blind split(';') produced a phantom `gr` param and
+    // destroyed the GRUU value).
+    for part in split_outside_quotes(s, ';') {
         if part.is_empty() {
             continue;
         }
@@ -693,6 +729,44 @@ mod tests {
         assert!(SipUri::parse("sip:@").is_err());
         assert!(SipUri::parse("sip:alice@[2001:db8::x]").is_err());
         assert!(SipUri::parse("sip:alice@example.com:notaport").is_err());
+    }
+
+    #[test]
+    fn instance_and_gruu_params_roundtrip_quoted() {
+        // RFC 5626 §9.1 / RFC 5627: `+sip.instance` carries a URN and is
+        // emitted as a quoted string. A parse→serialize cycle must keep it
+        // quoted (an unquoted `<` is not a legal generic-param value).
+        let n =
+            NameAddr::parse("<sip:alice@example.com>;+sip.instance=\"<urn:uuid:f81d>\";reg-id=1")
+                .expect("instance contact parses");
+        let out = n.to_string();
+        assert!(
+            out.contains("+sip.instance=\"<urn:uuid:f81d>\""),
+            "instance stays quoted: {out}"
+        );
+        assert!(out.contains("reg-id=1"));
+        assert_eq!(
+            NameAddr::parse(&out).expect("re-parse").params,
+            n.params,
+            "params survive the roundtrip unchanged"
+        );
+        // `gr` (GRUU URI param) keeps its unquoted form both ways.
+        let g = SipUri::parse("sip:alice@example.com;gr=urn:uuid:f81d").unwrap();
+        assert_eq!(
+            g.to_string(),
+            "sip:alice@example.com;gr=urn:uuid:f81d",
+            "gr round-trips verbatim"
+        );
+        // pub-gruu values contain `;`, so they must re-quote as well.
+        let p = NameAddr::parse(
+            "<sip:alice@example.com>;pub-gruu=\"sip:alice@example.com;gr=urn:uuid:f81d\"",
+        )
+        .expect("pub-gruu contact parses");
+        let pout = p.to_string();
+        assert!(
+            pout.contains("pub-gruu=\"sip:alice@example.com;gr=urn:uuid:f81d\""),
+            "pub-gruu stays quoted: {pout}"
+        );
     }
 
     #[test]

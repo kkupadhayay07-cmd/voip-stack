@@ -106,7 +106,7 @@ System: Rewrites system prompt based on past failed calls.
 │ STT · LLM · TTS · VAD · Barge-in · Fallbacks · <200ms P95        │
 ├──────────────────────────────────────────────────────────────────┤
 │ L2 · TELEPHONY  <- we are here, ~50% done                        │
-│ Real trunk [done] · WebRTC hardening [done] · Dialer [done]      │
+│ Real trunk · WebRTC hardening · Dialer · GRUU/Outbound [done]    │
 │ Postgres CDR + release/8-core soak [pending] · M1 verified [x]   │
 ├──────────────────────────────────────────────────────────────────┤
 │ L1 · FOUNDATION — complete (M1 verified: 400+ gate, release)     │

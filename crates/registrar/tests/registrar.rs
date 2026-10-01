@@ -417,3 +417,234 @@ fn wire_roundtrip() {
         _ => panic!("expected response"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// RFC 5626 Outbound / RFC 5627 GRUU
+// ---------------------------------------------------------------------------
+
+/// REGISTER over a reliable transport with `Supported: outbound, gruu` and
+/// an instance-tagged Contact.
+fn outbound_register_req(
+    aor: &str,
+    contact: &str,
+    instance: &str,
+    reg_id: u32,
+    expires: u32,
+) -> sip_core::Request {
+    let uri = format!("sip:{aor}");
+    RequestBuilder::new(Method::Register, SipUri::parse(&uri).unwrap())
+        .via(TransportKind::Tcp, "10.0.0.9:5060", Some("z9hG4bKout"))
+        .from(&format!("<{uri}>;tag=rout"))
+        .to(&format!("<{uri}>"))
+        .call_id(Some("cid-out-1"))
+        .cseq(1)
+        .contact(&format!(
+            "<{contact}>;+sip.instance=\"{instance}\";reg-id={reg_id}"
+        ))
+        .header("Supported", "outbound, gruu")
+        .header("Expires", &expires.to_string())
+        .build()
+}
+
+// RFC 5626 §4.2 + RFC 5627 §4.2/§4.3: a TCP REGISTER advertising Outbound
+// with an instance-tagged contact gets Flow-Timer + Supported echo, the
+// Contact is echoed with instance/reg-id/pub-gruu, and the binding stores
+// the flow identity.
+#[test]
+fn outbound_tcp_registration_echoes_instance_gruu_and_flow_timer() {
+    let mut reg = Registrar::new(RegistrarConfig {
+        flow_timer_secs: 120,
+        ..RegistrarConfig::default()
+    });
+    let instance = "urn:uuid:11111111-2222-3333-4444-555555555555";
+    let req = outbound_register_req(
+        "webrtc@example.com",
+        "sip:webrtc@10.0.0.9:5060",
+        instance,
+        1,
+        300,
+    );
+    let resp = reg.process(&req, "10.0.0.9:5060").unwrap();
+    assert_eq!(resp.code, 200);
+
+    // Flow-Timer demanded from the client (keep the connection alive).
+    assert_eq!(resp.headers.get("Flow-Timer"), Some("120"));
+    // Supported echo covers exactly what we negotiated/handle.
+    let supported = resp.headers.get("Supported").unwrap_or("");
+    assert!(
+        supported.contains("outbound"),
+        "Supported echo: {supported}"
+    );
+    assert!(supported.contains("gruu"), "GRUU advertised: {supported}");
+
+    // Contact echo: instance (quoted), reg-id, pub-gruu (quoted, contains ;).
+    let contacts = resp.headers.get_all("Contact");
+    assert_eq!(contacts.len(), 1);
+    let c = contacts[0];
+    assert!(
+        c.contains("+sip.instance=\"urn:uuid:11111111-2222-3333-4444-555555555555\""),
+        "instance echoed: {c}"
+    );
+    assert!(c.contains("reg-id=1"), "reg-id echoed: {c}");
+    assert!(
+        c.contains(
+            "pub-gruu=\"sip:webrtc@example.com;gr=urn:uuid:11111111-2222-3333-4444-555555555555\""
+        ),
+        "pub-gruu synthesized from AOR + instance: {c}"
+    );
+    assert!(c.contains("expires="));
+
+    // Binding state.
+    let b = &reg.bindings("sip:webrtc@example.com")[0];
+    assert_eq!(b.instance.as_deref(), Some(instance));
+    assert_eq!(b.reg_id, 1);
+    assert!(b.flow, "TCP registration is a flow");
+    assert_eq!(
+        b.pub_gruu.as_deref(),
+        Some("sip:webrtc@example.com;gr=urn:uuid:11111111-2222-3333-4444-555555555555")
+    );
+
+    // The 200 OK wire form is a parse→serialize fixed point (the quoted
+    // instance/pub-gruu params must not degrade across a hop).
+    let wire = sip_core::serialize(&SipMessage::Response(resp.clone()));
+    match sip_core::parse_message(&wire).unwrap() {
+        SipMessage::Response(r) => {
+            let reparsed_contacts = r.headers.get_all("Contact").to_vec();
+            assert_eq!(
+                reparsed_contacts,
+                contacts.to_vec(),
+                "Contact echo is wire-stable"
+            );
+            assert_eq!(r.headers.get("Flow-Timer"), Some("120"));
+        }
+        _ => panic!("expected response"),
+    }
+}
+
+// A UDP REGISTER advertising Outbound is NOT a flow registration: no
+// Flow-Timer (RFC 5626 §5.1 flow keep-alives apply to TCP-based
+// transports), no Outbound echo, binding.flow stays false.
+#[test]
+fn udp_registration_does_not_negotiate_outbound() {
+    let mut reg = Registrar::new(RegistrarConfig::default());
+    let instance = "urn:uuid:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let uri = "sip:lan@example.com";
+    let req = RequestBuilder::new(Method::Register, SipUri::parse(uri).unwrap())
+        .via(TransportKind::Udp, "10.0.0.9:5060", Some("z9hG4bKlan"))
+        .from(&format!("<{uri}>;tag=rlan"))
+        .to(&format!("<{uri}>"))
+        .call_id(Some("cid-lan-1"))
+        .cseq(1)
+        .contact(&format!(
+            "<sip:lan@10.0.0.9>;+sip.instance=\"{instance}\";reg-id=1"
+        ))
+        .header("Supported", "outbound, gruu")
+        .build();
+    let resp = reg.process(&req, "10.0.0.9:5060").unwrap();
+    assert_eq!(resp.code, 200);
+    assert_eq!(
+        resp.headers.get("Flow-Timer"),
+        None,
+        "UDP has no flow to manage"
+    );
+    assert_eq!(resp.headers.get("Supported"), None);
+    // GRUU still synthesized (instance present) — GRUU is independent of
+    // the flow layer.
+    let b = &reg.bindings("sip:lan@example.com")[0];
+    assert!(!b.flow);
+    assert!(b.pub_gruu.is_some());
+}
+
+// RFC 5626 §4.2: two reg-ids under one instance are distinct bindings
+// (one per client flow); de-registering one with Expires: 0 leaves the
+// other alive.
+#[test]
+fn two_reg_ids_are_distinct_and_deregister_is_scoped() {
+    let mut reg = Registrar::new(RegistrarConfig::default());
+    let instance = "urn:uuid:11111111-2222-3333-4444-555555555555";
+    let r1 = outbound_register_req(
+        "multi@example.com",
+        "sip:multi@10.0.0.9:5060",
+        instance,
+        1,
+        300,
+    );
+    let resp1 = reg.process(&r1, "10.0.0.9:5060").unwrap();
+    assert_eq!(resp1.code, 200);
+    // Same Call-ID would collide with binding 1; a second flow uses its
+    // own Call-ID.
+    let uri = "sip:multi@example.com";
+    let r2 = RequestBuilder::new(Method::Register, SipUri::parse(uri).unwrap())
+        .via(TransportKind::Tcp, "10.0.0.9:5061", Some("z9hG4bKout2"))
+        .from(&format!("<{uri}>;tag=rout2"))
+        .to(&format!("<{uri}>"))
+        .call_id(Some("cid-out-2"))
+        .cseq(1)
+        .contact(&format!(
+            "<sip:multi@10.0.0.9:5060>;+sip.instance=\"{instance}\";reg-id=2"
+        ))
+        .header("Supported", "outbound")
+        .build();
+    let resp2 = reg.process(&r2, "10.0.0.9:5061").unwrap();
+    assert_eq!(resp2.code, 200);
+    assert_eq!(
+        reg.bindings("sip:multi@example.com").len(),
+        2,
+        "reg-id 1 and 2 are separate flows"
+    );
+
+    // De-register reg-id 1 only.
+    let dereg = RequestBuilder::new(Method::Register, SipUri::parse(uri).unwrap())
+        .via(TransportKind::Tcp, "10.0.0.9:5060", Some("z9hG4bKout"))
+        .from(&format!("<{uri}>;tag=rout"))
+        .to(&format!("<{uri}>"))
+        .call_id(Some("cid-out-1"))
+        .cseq(2)
+        .contact(&format!(
+            "<sip:multi@10.0.0.9:5060>;+sip.instance=\"{instance}\";reg-id=1"
+        ))
+        .header("Expires", "0")
+        .build();
+    let resp = reg.process(&dereg, "10.0.0.9:5060").unwrap();
+    assert_eq!(resp.code, 200);
+    let left = reg.bindings("sip:multi@example.com");
+    assert_eq!(left.len(), 1, "only reg-id 2 survives");
+    assert_eq!(left[0].reg_id, 2);
+}
+
+// RFC 5626 §9.4: reg-id = 0 is a protocol violation → 400.
+#[test]
+fn reg_id_zero_is_rejected() {
+    let mut reg = Registrar::new(RegistrarConfig::default());
+    let uri = "sip:zero@example.com";
+    let req = RequestBuilder::new(Method::Register, SipUri::parse(uri).unwrap())
+        .via(TransportKind::Tcp, "10.0.0.9:5060", Some("z9hG4bKz"))
+        .from(&format!("<{uri}>;tag=rz"))
+        .to(&format!("<{uri}>"))
+        .call_id(Some("cid-zero"))
+        .cseq(1)
+        .contact("<sip:zero@10.0.0.9>;+sip.instance=\"<urn:uuid:z>\";reg-id=0")
+        .build();
+    let resp = reg.process(&req, "10.0.0.9:5060").unwrap();
+    assert_eq!(resp.code, 400);
+}
+
+// The q value is now echoed on the response Contact (RFC 3261 §10.2.8 —
+// the registrar must return the registered preference).
+#[test]
+fn q_value_is_echoed_in_200_ok() {
+    let mut reg = Registrar::new(RegistrarConfig::default());
+    let uri = "sip:q@example.com";
+    let req = RequestBuilder::new(Method::Register, SipUri::parse(uri).unwrap())
+        .via(TransportKind::Udp, "10.0.0.9:5060", Some("z9hG4bKq"))
+        .from(&format!("<{uri}>;tag=rq"))
+        .to(&format!("<{uri}>"))
+        .call_id(Some("cid-q"))
+        .cseq(1)
+        .contact("<sip:q@10.0.0.9>;q=0.5")
+        .build();
+    let resp = reg.process(&req, "10.0.0.9:5060").unwrap();
+    assert_eq!(resp.code, 200);
+    let c = resp.headers.get_all("Contact")[0];
+    assert!(c.contains("q=0.5"), "q echoed: {c}");
+}
