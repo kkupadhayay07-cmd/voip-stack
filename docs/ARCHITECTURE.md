@@ -39,7 +39,7 @@ this repository's code.
 
 ## 2. Crate graph
 
-### 2.1 Current tree (as built — 20 crates)
+### 2.1 Current tree (as built — 21 crates)
 
 ```text
    ops/assembly ┌─────────────┐  ┌──────────────┐
@@ -74,14 +74,24 @@ this repository's code.
         ┌───────┴────┐   └─────────────┘   │ media · cdr · dialer ·       │
         │    sdp     │                     │ ai-bridge (AudioSocket/WS)   │
         │ offer/answer│                    └──────────────────────────────┘
-        └────────────┘
+        └────────────┘   data channels  ┌──────────────────────────────┐
+                         (engine only,  │            sctp              │
+        (attaches over  no I/O)         │ CRC32c wire codec, cookie    │
+        DTLS via the    ┌───────────────│ handshake, TSN/SACK, T3-RTX, │
+        packet seam)                    │ DCEP channels, FORWARD-TSN   │
+                                        └──────────────────────────────┘
 ```
 
-Dependency direction is strictly downward: `sdp` and `codecs` are leaves;
+Dependency direction is strictly downward: `sdp`, `codecs` and `sctp` are
+leaves (`sctp`'s only dependency is `sha2`/`hmac` for the state-cookie MAC);
 `rtp` depends on codec traits; `sip-core` and `sip-tx` depend on nothing in
 the workspace (`sip-tx` consumes only `sip-core` types); `observ` and `api`
 observe rather than participate in media. No cycles, no cross-cutting
-"common" crate — shared types live in the layer that owns them.
+"common" crate — shared types live in the layer that owns them. The `sctp`
+engine, like `ice`/`dtls`/`srtp`, is a library layer awaiting the B2BUA
+WebRTC leg: it speaks packets in/out through a seam (`handle_packet` /
+`drain_outbound`) so the RFC 8261 DTLS encapsulation — and only that —
+belongs to the future caller.
 
 ### 2.2 Target architecture (Phases 1–6)
 
@@ -89,7 +99,7 @@ observe rather than participate in media. No cycles, no cross-cutting
 |-------|--------|-------|
 | Protocol core | `sip-core` (messages → transactions → dialogs), `sip-tx` (§17 state machines), `sdp` | 1 |
 | Transport | UDP/TCP/TLS/WS/WSS inside the `zrtc` daemon (message-layer framing in `sip-core`) | 1–2 |
-| Media transport | `rtp` (packets, jitter buffer, DTMF), `srtp`, `dtls`, `ice` (+STUN/TURN) | 1–2 |
+| Media transport | `rtp` (packets, jitter buffer, DTMF), `srtp`, `dtls`, `ice` (+STUN/TURN), `sctp` (data-channel engine) | 1–2 |
 | Codecs | `codecs` (G.711/G.722/G.729/Opus/L16/CN/PLC/resample) | 1 |
 | Roles | `b2bua`, `registrar`, `proxy`, `sbc` | 1, 3 |
 | Media services | `media` (mix, record, transcode, VAD) | 4 |
@@ -198,7 +208,28 @@ with the S-bit (bit 14) selecting symbol size, and inter-arrival recv
 deltas the sender accumulates. Pumps enable only what the leg's SDP
 negotiation allows — unnegotiated legs stay RTCP-silent.
 
-### 5.3 Control & observability
+### 5.3 Data channels (library layer — not yet attached to a call)
+
+The `sctp` crate holds the full data-channel protocol engine with NO
+transport attached: `SctpEndpoint::handle_packet(bytes)` consumes one SCTP
+packet and `drain_outbound()` yields the response packets — the caller
+wraps each in a DTLS application record (RFC 8261) over the ICE channel.
+Inside: CRC32c-checked chunk codec, four-way cookie handshake (server
+cookie = HMAC-SHA256 over the handshake state, stale cookies refresh from
+the retained INIT), TSN window with gap-block SACKs, T3-RTX with RFC 6298
+RTO, fragmentation + ordered/unordered reassembly, RFC 8832 DCEP channel
+establishment (OPEN rides the ordered pipeline; stream-id parity: INIT
+sender odd, responder even), RFC 3758 partial reliability with
+FORWARD-TSN, graceful SHUTDOWN and ABORT. All timers are caller-driven
+(`poll_timeout` + `on_timeout(now)`), so the engine is testable on a
+virtual clock — the lossy-loopback suite pins gap recovery, PR
+abandonment, forged cookies and the timer ordering that prevents a
+retransmission of an expired message. Until the ICE/DTLS/SRTP leg is
+wired into the B2BUA, the SDP engine answers `m=application` offers with
+port 0 (RFC 3264 §6) so the negotiation never promises a channel the
+media pump cannot serve.
+
+### 5.4 Control & observability
 
 CDR events are emitted on unbounded channels from call engines and drained by
 a single writer task (one record per call, persisted via the `cdr` store).

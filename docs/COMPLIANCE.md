@@ -21,8 +21,10 @@ hardening (IP4/IP6 `o=`/`c=` address types picked from the local host
 literal, RFC 8843 BUNDLE group echo with the accepted mids), a
 concurrent-call load harness with percentile reporting, and RTP loss
 recovery + congestion feedback (RFC 4585 Generic NACK, RFC 4588 RTX,
-transport-cc) and SIP RFC 5626 Outbound + RFC 5627 GRUU; 574 tests green
-across 56 suites — **every audit finding at every severity is fixed**).
+transport-cc) and SIP RFC 5626 Outbound + RFC 5627 GRUU, and WebRTC data
+classes end to end at the protocol layer (RFC 9260/4960 SCTP engine,
+RFC 8832 DCEP, RFC 3758 FORWARD-TSN in the `sctp` crate); 614 tests green
+across 59 suites — **every audit finding at every severity is fixed**).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
@@ -74,6 +76,9 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC 5766 | TURN server | **Done** (core) | Allocation (long-term MD5 auth), refresh, CreatePermission, Send/Data indications, ChannelBind; per-allocation relay sockets pumped concurrently; permission enforcement on both paths. TCP allocations, ReservationToken and mobility not implemented. |
 | RFC 5766 | TURN client | **Done** | Agent-side allocation flow: 401 → credentials → verified response (MD5 long-term key pinned by independent known vectors), plus the unauthenticated path with idempotent re-Allocate per RFC 5766 §6.2; used for relay candidate gathering. |
 | RFC 7983 | Demultiplexing STUN/DTLS/RTP | **Partial** | First-byte classification in the ICE agent; DTLS records classified (0-3) and passed to the DTLS layer by the assembly. |
+| RFC 9260/4960 | SCTP (data-channel transport) | **Done** (engine subset) | `sctp` crate: common header with CRC32c (pinned entry-for-entry to the RFC 9260 Appendix A reference table + the CRC-32/ISCSI check value), four-way handshake with an HMAC-SHA256-protected state cookie (stale-cookie refresh from the retained INIT, forged cookies silently discarded), verification-tag rules (INIT vtag 0, T-bit reflected ABORT/SHUTDOWN-COMPLETE), TSN window with gap-block SACKs + duplicate reporting, T3-RTX with RFC 6298 RTO (Karn's rule), cwnd slow start/CA + peer a_rwnd flow control, message fragmentation, ordered/unordered reassembly (unordered delivers on arrival; TSN contiguity gates only ordered delivery), HEARTBEAT/ACK, graceful SHUTDOWN (deferred until outstanding acked) + ABORT. Timer-handler ordering is pinned by a regression test (the lifetime sweep runs before T3 so an expired message can never be retransmitted). Transport-agnostic packet seam (`handle_packet`/`drain_outbound`); not implemented: multi-homing, restart, RFC 5061 re-config, RFC 6525 stream reset, ECN, unknown-chunk ERROR reports (skip-class honored). |
+| RFC 8832 | DCEP (data channel establishment) | **Done** (protocol layer) | `sctp::dcep`: DATA_CHANNEL_OPEN/ACK with all three reliability classes (reliable, max-retransmits, max-packet-lifetime) × ordered/unordered (0x00–0x02, 0x80–0x82), the single-byte ACK, UTF-8 label/protocol, OPEN dispatched through the ordered pipeline so stream sequence numbers stay consistent, duplicate OPEN → protocol-violation ABORT, stream-id parity per §6 (association initiator odd, responder even — pinned by test). Channels carry the reliability policy into the association's send path. |
+| RFC 3758 | PR-SCTP (partial reliability) | **Done** (engine layer) | `sctp::assoc`: sender-side abandonment for both policies (max-retransmits counts per T3 fire; max-packet-lifetime swept by first-send age) with whole-message abandonment granularity, FORWARD-TSN emission only up to the point where everything below is abandoned/acked (ordered streams carry one (SID, SSN) skip entry per abandoned stream, never re-reported), receiver-side advance (out-of-order purge below the point, ordered-SSN skip, partial-run discard), and PR degrades to reliable automatically when the peer did not advertise FORWARD-TSN support (RFC 3758 §3.1). |
 
 ## 3. Codecs
 
@@ -130,7 +135,14 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
   between 20–50 under CPU saturation); the release-build 8-core soak
   remains.
 * REMB, audio-band DTMF detection,
-  WebRTC data channels, mid-dialog RFC 3263 re-resolution.
+  mid-dialog RFC 3263 re-resolution.
+* **WebRTC data-channel wiring**: the complete protocol engine exists
+  (`sctp` crate — SCTP + DCEP + FORWARD-TSN, transport-agnostic packet seam
+  ready for RFC 8261 DTLS encapsulation) and SDP answers reject
+  `m=application` offers port-0 honestly; what remains is wiring the
+  ICE/DTLS/SRTP media leg into the B2BUA so a browser association can
+  actually ride it (the `m=application` rejection keeps the negotiation
+  truthful until then).
 * **RTCP non-mux addressing (RFC 3550 §11)**: the media pump is mux-only;
   peers that refuse `a=rtcp-mux` would address RTCP at the RTP port+1,
   which we never bind (their feedback would be lost). We now at least
@@ -151,7 +163,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **574 passing across 56 suites**.
+  `cargo test --workspace` → **614 passing across 59 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16 + §17.1/§17.3
   SRTCP AEAD), STUN (RFC 5769 §2.1/§2.2; MD5 long-term keys + MESSAGE-INTEGRITY
   against independent vectors), G.729 (bcg729 oracle), cross-decode by ffmpeg.

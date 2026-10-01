@@ -1,0 +1,720 @@
+//! SCTP wire format: common header, chunk TLV codec ([RFC 9260] §3.1/§3.3).
+//!
+//! All integers are big-endian. Chunk bodies are padded to 4-byte boundaries
+//! with zero octets; the chunk `length` field includes the 4-byte chunk
+//! header but not the padding.
+//!
+//! [RFC 9260]: https://datatracker.ietf.org/doc/html/rfc9260
+
+use crate::crc32c;
+
+/// Chunk types (RFC 9260 §3.3.1).
+pub const CT_DATA: u8 = 0;
+pub const CT_INIT: u8 = 1;
+pub const CT_INIT_ACK: u8 = 2;
+pub const CT_SACK: u8 = 3;
+pub const CT_HEARTBEAT: u8 = 4;
+pub const CT_HEARTBEAT_ACK: u8 = 5;
+pub const CT_ABORT: u8 = 6;
+pub const CT_SHUTDOWN: u8 = 7;
+pub const CT_SHUTDOWN_ACK: u8 = 8;
+pub const CT_ERROR: u8 = 9;
+pub const CT_COOKIE_ECHO: u8 = 10;
+pub const CT_COOKIE_ACK: u8 = 11;
+pub const CT_SHUTDOWN_COMPLETE: u8 = 14;
+/// RFC 3758 FORWARD-TSN (chunk types ≥ 0xC0 are "skip and report" class).
+pub const CT_FORWARD_TSN: u8 = 0xC0;
+
+/// Parameter types (RFC 9260 §3.3.2.1, RFC 5061).
+pub const PT_HEARTBEAT_INFO: u16 = 1;
+pub const PT_IPV4: u16 = 5;
+pub const PT_IPV6: u16 = 6;
+pub const PT_COOKIE_PRESERVATIVE: u16 = 7;
+/// State Cookie — same numeric value as the cookie-preservative, but only
+/// legal inside INIT-ACK (context disambiguates).
+pub const PT_STATE_COOKIE: u16 = 7;
+pub const PT_SUPPORTED_ADDR_TYPES: u16 = 9;
+pub const PT_ECN: u16 = 0x8000;
+/// RFC 5061 Supported Extensions — carries the FORWARD-TSN chunk type to
+/// signal PR-SCTP support (RFC 3758 §3.1).
+pub const PT_SUPPORTED_EXTENSIONS: u16 = 0x8008;
+
+/// Cause codes for ABORT/ERROR (RFC 9260 §3.3.10).
+pub const CAUSE_UNRECOGNIZED_CHUNK: u16 = 6;
+
+/// DATA chunk flag bits.
+pub const FLAG_DATA_E: u8 = 0x01; // end of fragmented user message
+pub const FLAG_DATA_B: u8 = 0x02; // begin of fragmented user message
+pub const FLAG_DATA_U: u8 = 0x04; // unordered
+/// RFC 7053 SACK-IMMEDIATELY (we always SACK immediately; parsed for fidelity).
+pub const FLAG_DATA_I: u8 = 0x08;
+
+/// ABORT / SHUTDOWN-COMPLETE T-bit: the verification tag in the packet is
+/// the peer's own tag (reflected), not ours.
+pub const FLAG_T: u8 = 0x01;
+
+/// One SACK gap-ack block: TSN range `cum_tsn + start ..= cum_tsn + end`
+/// (offsets are ≥ 1 per RFC 9260 §3.3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SackBlock {
+    pub start: u16,
+    pub end: u16,
+}
+
+/// A raw parameter TLV (context-dependent typing is done by the caller).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawParam {
+    pub ptype: u16,
+    pub value: Vec<u8>,
+}
+
+/// DATA chunk (§3.3.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataChunk {
+    pub tsn: u32,
+    pub stream: u16,
+    pub ssn: u16,
+    pub ppid: u32,
+    pub begin: bool,
+    pub end: bool,
+    pub unordered: bool,
+    /// RFC 7053 SACK-IMMEDIATELY bit.
+    pub immediate_sack: bool,
+    pub payload: Vec<u8>,
+}
+
+/// INIT / INIT-ACK chunk (§3.3.2/§3.3.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitChunk {
+    pub initiate_tag: u32,
+    pub a_rwnd: u32,
+    pub os: u16,
+    pub mis: u16,
+    pub initial_tsn: u32,
+    pub params: Vec<RawParam>,
+}
+
+impl InitChunk {
+    pub fn param(&self, ptype: u16) -> Option<&[u8]> {
+        self.params
+            .iter()
+            .find(|p| p.ptype == ptype)
+            .map(|p| p.value.as_slice())
+    }
+}
+
+/// SACK chunk (§3.3.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SackChunk {
+    pub cum_tsn: u32,
+    pub a_rwnd: u32,
+    pub gaps: Vec<SackBlock>,
+    pub dups: Vec<u32>,
+}
+
+/// Parsed chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Chunk {
+    Data(DataChunk),
+    Init(InitChunk),
+    InitAck(InitChunk),
+    Sack(SackChunk),
+    Heartbeat {
+        info: Vec<u8>,
+    },
+    HeartbeatAck {
+        info: Vec<u8>,
+    },
+    Abort {
+        /// Raw cause TLVs (each already parsed out).
+        causes: Vec<RawParam>,
+        reflected: bool,
+    },
+    Error {
+        causes: Vec<RawParam>,
+    },
+    Shutdown {
+        cum_tsn: u32,
+    },
+    ShutdownAck,
+    ShutdownComplete {
+        reflected: bool,
+    },
+    CookieEcho {
+        cookie: Vec<u8>,
+    },
+    CookieAck,
+    ForwardTsn {
+        new_cum_tsn: u32,
+        /// Per-stream skips (sid, highest abandoned ssn) for ordered streams.
+        streams: Vec<(u16, u16)>,
+    },
+    /// Unrecognized chunk, preserved verbatim so the association can honor
+    /// the RFC 9260 §3.3.1 report rules.
+    Unknown {
+        ctype: u8,
+        flags: u8,
+        body: Vec<u8>,
+    },
+}
+
+impl Chunk {
+    pub fn chunk_type(&self) -> u8 {
+        match self {
+            Chunk::Data(_) => CT_DATA,
+            Chunk::Init(_) => CT_INIT,
+            Chunk::InitAck(_) => CT_INIT_ACK,
+            Chunk::Sack(_) => CT_SACK,
+            Chunk::Heartbeat { .. } => CT_HEARTBEAT,
+            Chunk::HeartbeatAck { .. } => CT_HEARTBEAT_ACK,
+            Chunk::Abort { .. } => CT_ABORT,
+            Chunk::Error { .. } => CT_ERROR,
+            Chunk::Shutdown { .. } => CT_SHUTDOWN,
+            Chunk::ShutdownAck => CT_SHUTDOWN_ACK,
+            Chunk::ShutdownComplete { .. } => CT_SHUTDOWN_COMPLETE,
+            Chunk::CookieEcho { .. } => CT_COOKIE_ECHO,
+            Chunk::CookieAck => CT_COOKIE_ACK,
+            Chunk::ForwardTsn { .. } => CT_FORWARD_TSN,
+            Chunk::Unknown { ctype, .. } => *ctype,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SctpError {
+    #[error("packet shorter than the 12-byte common header")]
+    TooShort,
+    #[error("checksum mismatch")]
+    BadChecksum,
+    #[error("malformed chunk: {0}")]
+    BadChunk(&'static str),
+    #[error("message too large ({0} bytes > local max)")]
+    MessageTooLarge(usize),
+    #[error("send buffer exhausted")]
+    SendBufferFull,
+    #[error("association is not in a state that allows this operation ({0})")]
+    WrongState(&'static str),
+    #[error("stream {0} is not an open data channel")]
+    UnknownStream(u16),
+}
+
+pub(crate) fn pad4(n: usize) -> usize {
+    (n + 3) & !3
+}
+
+fn be16(b: &[u8], at: usize) -> Result<u16, SctpError> {
+    b.get(at..at + 2)
+        .map(|s| u16::from_be_bytes([s[0], s[1]]))
+        .ok_or(SctpError::TooShort)
+}
+
+fn be32(b: &[u8], at: usize) -> Result<u32, SctpError> {
+    b.get(at..at + 4)
+        .map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+        .ok_or(SctpError::TooShort)
+}
+
+/// A parsed SCTP packet: common header fields + chunks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SctpPacket {
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub vtag: u32,
+    pub chunks: Vec<Chunk>,
+}
+
+/// Parse an SCTP packet. `verify_checksum` enforces the CRC32c (the
+/// association always does; tests of malformed hand-built vectors may pass
+/// `false` when the vector predates the checksum patch step).
+pub fn parse_packet(buf: &[u8], verify_checksum: bool) -> Result<SctpPacket, SctpError> {
+    if buf.len() < 12 {
+        return Err(SctpError::TooShort);
+    }
+    if verify_checksum && !crc32c::validate_packet(buf, 8) {
+        return Err(SctpError::BadChecksum);
+    }
+    let src_port = be16(buf, 0)?;
+    let dst_port = be16(buf, 2)?;
+    let vtag = be32(buf, 4)?;
+
+    let mut chunks = Vec::new();
+    let mut pos = 12usize;
+    while pos + 4 <= buf.len() {
+        let ctype = buf[pos];
+        let flags = buf[pos + 1];
+        let clen = be16(buf, pos + 2)? as usize;
+        if clen < 4 {
+            return Err(SctpError::BadChunk("chunk length < 4"));
+        }
+        if pos + clen > buf.len() {
+            return Err(SctpError::BadChunk("chunk length exceeds packet"));
+        }
+        let body = &buf[pos + 4..pos + clen];
+        let chunk = parse_chunk(ctype, flags, body)?;
+        chunks.push(chunk);
+        pos += pad4(clen);
+    }
+    // Trailing < 4 bytes are padding remnants — ignored per RFC 9260 §3.3.1.
+
+    Ok(SctpPacket {
+        src_port,
+        dst_port,
+        vtag,
+        chunks,
+    })
+}
+
+fn parse_chunk(ctype: u8, flags: u8, body: &[u8]) -> Result<Chunk, SctpError> {
+    match ctype {
+        CT_DATA => {
+            if body.len() < 12 {
+                return Err(SctpError::BadChunk("DATA body < 12"));
+            }
+            let payload = body[12..].to_vec();
+            Ok(Chunk::Data(DataChunk {
+                tsn: be32(body, 0)?,
+                stream: be16(body, 4)?,
+                ssn: be16(body, 6)?,
+                ppid: be32(body, 8)?,
+                begin: flags & FLAG_DATA_B != 0,
+                end: flags & FLAG_DATA_E != 0,
+                unordered: flags & FLAG_DATA_U != 0,
+                immediate_sack: flags & FLAG_DATA_I != 0,
+                payload,
+            }))
+        }
+        CT_INIT | CT_INIT_ACK => {
+            if body.len() < 16 {
+                return Err(SctpError::BadChunk("INIT body < 16"));
+            }
+            let params = parse_params(&body[16..])?;
+            let init = InitChunk {
+                initiate_tag: be32(body, 0)?,
+                a_rwnd: be32(body, 4)?,
+                os: be16(body, 8)?,
+                mis: be16(body, 10)?,
+                initial_tsn: be32(body, 12)?,
+                params,
+            };
+            Ok(if ctype == CT_INIT {
+                Chunk::Init(init)
+            } else {
+                Chunk::InitAck(init)
+            })
+        }
+        CT_SACK => {
+            if body.len() < 12 {
+                return Err(SctpError::BadChunk("SACK body < 12"));
+            }
+            let cum_tsn = be32(body, 0)?;
+            let a_rwnd = be32(body, 4)?;
+            let num_gaps = be16(body, 8)? as usize;
+            let num_dups = be16(body, 10)? as usize;
+            if body.len() < 12 + num_gaps * 4 + num_dups * 4 {
+                return Err(SctpError::BadChunk("SACK blocks exceed body"));
+            }
+            let mut gaps = Vec::with_capacity(num_gaps);
+            for i in 0..num_gaps {
+                let at = 12 + i * 4;
+                gaps.push(SackBlock {
+                    start: be16(body, at)?,
+                    end: be16(body, at + 2)?,
+                });
+            }
+            let mut dups = Vec::with_capacity(num_dups);
+            for i in 0..num_dups {
+                dups.push(be32(body, 12 + num_gaps * 4 + i * 4)?);
+            }
+            Ok(Chunk::Sack(SackChunk {
+                cum_tsn,
+                a_rwnd,
+                gaps,
+                dups,
+            }))
+        }
+        CT_HEARTBEAT | CT_HEARTBEAT_ACK => {
+            let params = parse_params(body)?;
+            let info = params
+                .iter()
+                .find(|p| p.ptype == PT_HEARTBEAT_INFO)
+                .map(|p| p.value.clone())
+                .ok_or(SctpError::BadChunk("HEARTBEAT without info param"))?;
+            Ok(if ctype == CT_HEARTBEAT {
+                Chunk::Heartbeat { info }
+            } else {
+                Chunk::HeartbeatAck { info }
+            })
+        }
+        CT_ABORT => Ok(Chunk::Abort {
+            causes: parse_params(body)?,
+            reflected: flags & FLAG_T != 0,
+        }),
+        CT_ERROR => Ok(Chunk::Error {
+            causes: parse_params(body)?,
+        }),
+        CT_SHUTDOWN => {
+            if body.len() < 4 {
+                return Err(SctpError::BadChunk("SHUTDOWN body < 4"));
+            }
+            Ok(Chunk::Shutdown {
+                cum_tsn: be32(body, 0)?,
+            })
+        }
+        CT_SHUTDOWN_ACK => Ok(Chunk::ShutdownAck),
+        CT_SHUTDOWN_COMPLETE => Ok(Chunk::ShutdownComplete {
+            reflected: flags & FLAG_T != 0,
+        }),
+        CT_COOKIE_ECHO => Ok(Chunk::CookieEcho {
+            cookie: body.to_vec(),
+        }),
+        CT_COOKIE_ACK => Ok(Chunk::CookieAck),
+        CT_FORWARD_TSN => {
+            if body.len() < 4 {
+                return Err(SctpError::BadChunk("FORWARD-TSN body < 4"));
+            }
+            let new_cum_tsn = be32(body, 0)?;
+            let n = (body.len() - 4) / 4;
+            let mut streams = Vec::with_capacity(n);
+            for i in 0..n {
+                let at = 4 + i * 4;
+                streams.push((be16(body, at)?, be16(body, at + 2)?));
+            }
+            Ok(Chunk::ForwardTsn {
+                new_cum_tsn,
+                streams,
+            })
+        }
+        _ => Ok(Chunk::Unknown {
+            ctype,
+            flags,
+            body: body.to_vec(),
+        }),
+    }
+}
+
+/// Parse a padded sequence of parameter TLVs.
+pub fn parse_params(mut buf: &[u8]) -> Result<Vec<RawParam>, SctpError> {
+    let mut out = Vec::new();
+    while buf.len() >= 4 {
+        let ptype = be16(buf, 0)?;
+        let plen = be16(buf, 2)? as usize;
+        if plen < 4 || plen > buf.len() {
+            return Err(SctpError::BadChunk("param length invalid"));
+        }
+        out.push(RawParam {
+            ptype,
+            value: buf[4..plen].to_vec(),
+        });
+        buf = &buf[pad4(plen)..];
+    }
+    Ok(out)
+}
+
+/// Encode a parameter TLV with zero padding to the 4-byte boundary.
+pub fn encode_param(ptype: u16, value: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(&ptype.to_be_bytes());
+    out.extend_from_slice(&((value.len() + 4) as u16).to_be_bytes());
+    out.extend_from_slice(value);
+    out.resize(out.len() + pad4(value.len() + 4) - (value.len() + 4), 0);
+}
+
+/// Encode one chunk (header + body + zero padding) into `out`.
+pub fn encode_chunk(ctype: u8, flags: u8, body: &[u8], out: &mut Vec<u8>) {
+    let start = out.len();
+    out.extend_from_slice(&ctype.to_be_bytes());
+    out.extend_from_slice(&flags.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes()); // patched below
+    out.extend_from_slice(body);
+    let clen = out.len() - start;
+    out.resize(out.len() + pad4(clen) - clen, 0);
+    out[start + 2..start + 4].copy_from_slice(&(clen as u16).to_be_bytes());
+}
+
+/// Encode a full SCTP packet: common header, chunks, checksum patched in.
+pub fn encode_packet(src_port: u16, dst_port: u16, vtag: u32, chunks: &[Chunk]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1400);
+    buf.extend_from_slice(&src_port.to_be_bytes());
+    buf.extend_from_slice(&dst_port.to_be_bytes());
+    buf.extend_from_slice(&vtag.to_be_bytes());
+    buf.extend_from_slice(&0u32.to_be_bytes()); // checksum placeholder
+
+    for chunk in chunks {
+        encode_chunk_into(chunk, &mut buf);
+    }
+
+    let csum = crc32c::packet_checksum(&buf);
+    buf[8..12].copy_from_slice(&csum.to_be_bytes());
+    buf
+}
+
+fn encode_chunk_into(chunk: &Chunk, out: &mut Vec<u8>) {
+    match chunk {
+        Chunk::Data(d) => {
+            let mut flags = 0u8;
+            if d.end {
+                flags |= FLAG_DATA_E;
+            }
+            if d.begin {
+                flags |= FLAG_DATA_B;
+            }
+            if d.unordered {
+                flags |= FLAG_DATA_U;
+            }
+            if d.immediate_sack {
+                flags |= FLAG_DATA_I;
+            }
+            let mut body = Vec::with_capacity(12 + d.payload.len());
+            body.extend_from_slice(&d.tsn.to_be_bytes());
+            body.extend_from_slice(&d.stream.to_be_bytes());
+            body.extend_from_slice(&d.ssn.to_be_bytes());
+            body.extend_from_slice(&d.ppid.to_be_bytes());
+            body.extend_from_slice(&d.payload);
+            encode_chunk(CT_DATA, flags, &body, out);
+        }
+        Chunk::Init(i) => encode_init_like(CT_INIT, i, out),
+        Chunk::InitAck(i) => encode_init_like(CT_INIT_ACK, i, out),
+        Chunk::Sack(s) => {
+            let mut body = Vec::with_capacity(12 + s.gaps.len() * 4 + s.dups.len() * 4);
+            body.extend_from_slice(&s.cum_tsn.to_be_bytes());
+            body.extend_from_slice(&s.a_rwnd.to_be_bytes());
+            body.extend_from_slice(&(s.gaps.len() as u16).to_be_bytes());
+            body.extend_from_slice(&(s.dups.len() as u16).to_be_bytes());
+            for g in &s.gaps {
+                body.extend_from_slice(&g.start.to_be_bytes());
+                body.extend_from_slice(&g.end.to_be_bytes());
+            }
+            for d in &s.dups {
+                body.extend_from_slice(&d.to_be_bytes());
+            }
+            encode_chunk(CT_SACK, 0, &body, out);
+        }
+        Chunk::Heartbeat { info } => {
+            let mut body = Vec::new();
+            encode_param(PT_HEARTBEAT_INFO, info, &mut body);
+            encode_chunk(CT_HEARTBEAT, 0, &body, out);
+        }
+        Chunk::HeartbeatAck { info } => {
+            let mut body = Vec::new();
+            encode_param(PT_HEARTBEAT_INFO, info, &mut body);
+            encode_chunk(CT_HEARTBEAT_ACK, 0, &body, out);
+        }
+        Chunk::Abort { causes, reflected } => {
+            let mut body = Vec::new();
+            for c in causes {
+                encode_param(c.ptype, &c.value, &mut body);
+            }
+            let flags = if *reflected { FLAG_T } else { 0 };
+            encode_chunk(CT_ABORT, flags, &body, out);
+        }
+        Chunk::Error { causes } => {
+            let mut body = Vec::new();
+            for c in causes {
+                encode_param(c.ptype, &c.value, &mut body);
+            }
+            encode_chunk(CT_ERROR, 0, &body, out);
+        }
+        Chunk::Shutdown { cum_tsn } => {
+            encode_chunk(CT_SHUTDOWN, 0, &cum_tsn.to_be_bytes(), out);
+        }
+        Chunk::ShutdownAck => encode_chunk(CT_SHUTDOWN_ACK, 0, &[], out),
+        Chunk::ShutdownComplete { reflected } => {
+            let flags = if *reflected { FLAG_T } else { 0 };
+            encode_chunk(CT_SHUTDOWN_COMPLETE, flags, &[], out);
+        }
+        Chunk::CookieEcho { cookie } => {
+            encode_chunk(CT_COOKIE_ECHO, 0, cookie, out);
+        }
+        Chunk::CookieAck => encode_chunk(CT_COOKIE_ACK, 0, &[], out),
+        Chunk::ForwardTsn {
+            new_cum_tsn,
+            streams,
+        } => {
+            let mut body = Vec::with_capacity(4 + streams.len() * 4);
+            body.extend_from_slice(&new_cum_tsn.to_be_bytes());
+            for (sid, ssn) in streams {
+                body.extend_from_slice(&sid.to_be_bytes());
+                body.extend_from_slice(&ssn.to_be_bytes());
+            }
+            encode_chunk(CT_FORWARD_TSN, 0, &body, out);
+        }
+        Chunk::Unknown { ctype, flags, body } => {
+            encode_chunk(*ctype, *flags, body, out);
+        }
+    }
+}
+
+fn encode_init_like(ctype: u8, i: &InitChunk, out: &mut Vec<u8>) {
+    let mut body = Vec::with_capacity(16 + i.params.len() * 8);
+    body.extend_from_slice(&i.initiate_tag.to_be_bytes());
+    body.extend_from_slice(&i.a_rwnd.to_be_bytes());
+    body.extend_from_slice(&i.os.to_be_bytes());
+    body.extend_from_slice(&i.mis.to_be_bytes());
+    body.extend_from_slice(&i.initial_tsn.to_be_bytes());
+    for p in &i.params {
+        encode_param(p.ptype, &p.value, &mut body);
+    }
+    encode_chunk(ctype, 0, &body, out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hand-built INIT packet (wire form written byte by byte, checksum is
+    /// the only computed field — pinned by the CRC32c module tests).
+    #[test]
+    fn hand_built_init_parses_field_for_field() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0xDEAD_BEEFu32.to_be_bytes()); // initiate tag
+        body.extend_from_slice(&128_000u32.to_be_bytes()); // a_rwnd
+        body.extend_from_slice(&1024u16.to_be_bytes()); // OS
+        body.extend_from_slice(&1024u16.to_be_bytes()); // MIS
+        body.extend_from_slice(&4711u32.to_be_bytes()); // initial TSN
+                                                        // Supported Extensions param (0x8008) carrying FORWARD-TSN (0xC0).
+        encode_param(PT_SUPPORTED_EXTENSIONS, &[CT_FORWARD_TSN], &mut body);
+
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&5000u16.to_be_bytes());
+        pkt.extend_from_slice(&5000u16.to_be_bytes());
+        pkt.extend_from_slice(&0u32.to_be_bytes()); // vtag 0 for INIT
+        pkt.extend_from_slice(&0u32.to_be_bytes()); // checksum placeholder
+        encode_chunk(CT_INIT, 0, &body, &mut pkt);
+        let csum = crc32c::packet_checksum(&pkt);
+        pkt[8..12].copy_from_slice(&csum.to_be_bytes());
+
+        let p = parse_packet(&pkt, true).expect("hand-built INIT must parse");
+        assert_eq!(p.src_port, 5000);
+        assert_eq!(p.dst_port, 5000);
+        assert_eq!(p.vtag, 0);
+        assert_eq!(p.chunks.len(), 1);
+        match &p.chunks[0] {
+            Chunk::Init(i) => {
+                assert_eq!(i.initiate_tag, 0xDEAD_BEEF);
+                assert_eq!(i.a_rwnd, 128_000);
+                assert_eq!(i.os, 1024);
+                assert_eq!(i.mis, 1024);
+                assert_eq!(i.initial_tsn, 4711);
+                assert_eq!(
+                    i.param(PT_SUPPORTED_EXTENSIONS),
+                    Some(&[CT_FORWARD_TSN][..])
+                );
+            }
+            other => panic!("expected INIT, got {other:?}"),
+        }
+    }
+
+    /// Hand-built SACK with gap blocks + duplicates, byte-layout pinned.
+    #[test]
+    fn hand_built_sack_round_layout() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&100u32.to_be_bytes()); // cum
+        body.extend_from_slice(&64_000u32.to_be_bytes()); // a_rwnd
+        body.extend_from_slice(&2u16.to_be_bytes()); // 2 gap blocks
+        body.extend_from_slice(&1u16.to_be_bytes()); // 1 dup
+        body.extend_from_slice(&3u16.to_be_bytes()); // gap start (cum+3)
+        body.extend_from_slice(&5u16.to_be_bytes()); // gap end (cum+5)
+        body.extend_from_slice(&9u16.to_be_bytes());
+        body.extend_from_slice(&11u16.to_be_bytes());
+        body.extend_from_slice(&102u32.to_be_bytes()); // dup
+
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&1u16.to_be_bytes());
+        pkt.extend_from_slice(&2u16.to_be_bytes());
+        pkt.extend_from_slice(&77u32.to_be_bytes());
+        pkt.extend_from_slice(&0u32.to_be_bytes());
+        encode_chunk(CT_SACK, 0, &body, &mut pkt);
+        let csum = crc32c::packet_checksum(&pkt);
+        pkt[8..12].copy_from_slice(&csum.to_be_bytes());
+
+        let p = parse_packet(&pkt, true).unwrap();
+        match &p.chunks[0] {
+            Chunk::Sack(s) => {
+                assert_eq!(s.cum_tsn, 100);
+                assert_eq!(s.a_rwnd, 64_000);
+                assert_eq!(
+                    s.gaps,
+                    vec![
+                        SackBlock { start: 3, end: 5 },
+                        SackBlock { start: 9, end: 11 }
+                    ]
+                );
+                assert_eq!(s.dups, vec![102]);
+            }
+            other => panic!("expected SACK, got {other:?}"),
+        }
+    }
+
+    /// Unknown chunk types follow the RFC 9260 §3.3.1 action rules via the
+    /// raw pass-through variant; 4-byte alignment of trailing chunks holds.
+    #[test]
+    fn unknown_chunk_passthrough_and_padding() {
+        // An unknown chunk of body length 3 → padded to 8 total, then a valid
+        // COOKIE_ACK (empty body, length 4) must still parse.
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&1u16.to_be_bytes());
+        pkt.extend_from_slice(&2u16.to_be_bytes());
+        pkt.extend_from_slice(&0u32.to_be_bytes());
+        pkt.extend_from_slice(&0u32.to_be_bytes());
+        // unknown type 0x7F (class 01: stop+report), length 7, 3 body bytes.
+        encode_chunk(0x7F, 0, &[1, 2, 3], &mut pkt);
+        encode_chunk(CT_COOKIE_ACK, 0, &[], &mut pkt);
+        let csum = crc32c::packet_checksum(&pkt);
+        pkt[8..12].copy_from_slice(&csum.to_be_bytes());
+
+        let p = parse_packet(&pkt, true).unwrap();
+        assert_eq!(p.chunks.len(), 2);
+        assert_eq!(p.chunks[0].chunk_type(), 0x7F);
+        assert_eq!(p.chunks[1], Chunk::CookieAck);
+    }
+
+    #[test]
+    fn checksum_corruption_is_rejected() {
+        let pkt = encode_packet(1, 2, 3, &[Chunk::CookieAck]);
+        let mut corrupted = pkt.clone();
+        corrupted[13] ^= 0x08;
+        assert!(matches!(
+            parse_packet(&corrupted, true),
+            Err(SctpError::BadChecksum)
+        ));
+        assert!(parse_packet(&pkt, true).is_ok());
+    }
+
+    #[test]
+    fn truncated_packet_errors() {
+        assert_eq!(parse_packet(&[0u8; 11], false), Err(SctpError::TooShort));
+        // Chunk length beyond packet bounds.
+        let mut pkt = vec![0u8; 16];
+        pkt[12] = CT_COOKIE_ACK;
+        pkt[14..16].copy_from_slice(&40u16.to_be_bytes());
+        assert!(parse_packet(&pkt, false).is_err());
+    }
+
+    #[test]
+    fn data_chunk_flags_survive_encode_parse() {
+        let d = DataChunk {
+            tsn: 9,
+            stream: 3,
+            ssn: 7,
+            ppid: 51,
+            begin: true,
+            end: true,
+            unordered: true,
+            immediate_sack: true,
+            payload: b"hi".to_vec(),
+        };
+        let pkt = encode_packet(5000, 5000, 42, &[Chunk::Data(d.clone())]);
+        let p = parse_packet(&pkt, true).unwrap();
+        assert_eq!(p.chunks[0], Chunk::Data(d));
+    }
+
+    #[test]
+    fn forward_tsn_layout() {
+        let f = Chunk::ForwardTsn {
+            new_cum_tsn: 500,
+            streams: vec![(2, 9), (4, 11)],
+        };
+        let pkt = encode_packet(1, 1, 1, std::slice::from_ref(&f));
+        let p = parse_packet(&pkt, true).unwrap();
+        assert_eq!(p.chunks[0], f);
+    }
+}

@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 574 tests passing across 56 suites in 20 crates;
+**Current state: 614 tests passing across 59 suites in 21 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
@@ -21,10 +21,12 @@ finding is fixed with regression tests
 of the Task 39–42 media/DNS work fixed 1 critical + 5 major wire-level bugs
 before they could ship (transport-cc S-bit chunks, inter-arrival deltas,
 2-byte sequences, rtcp-mux advertisement, IPv6 trunk URIs, blocking DNS on
-async workers). RFC 5626 Outbound + RFC 5627 GRUU are now implemented end to
+async workers). RFC 5626 Outbound + RFC 5627 GRUU are implemented end to
 end (registrar-side flow detection / `Flow-Timer` / pub-gruu synthesis, and
 the trunk UAC's instance-tagged REGISTER with refresh + CRLF flow
-keep-alives).**
+keep-alives), and WebRTC data channels now have a complete protocol engine:
+RFC 9260/4960 SCTP (CRC32c wire codec, cookie handshake, T3-RTX, SACK gap
+recovery) + RFC 8832 DCEP + RFC 3758 FORWARD-TSN in the new `sctp` crate.**
 
 ## Workspace layout
 
@@ -48,7 +50,8 @@ keep-alives).**
 | `crates/ai-bridge` | AI bridge: AudioSocket TCP framing (UUID/AUDIO/DTMF/TERMINATE), WebSocket media tap, VAD events (SpeechStart/End), **barge-in** detection, ≤ 20 ms added latency | **Done** |
 | `crates/api` | Control plane: REST (CDR queries/stats, campaigns, pacing), WebSocket event stream, Prometheus `/metrics`, health/readiness | **Done** |
 | `crates/observ` | In-process observability: Wireshark-openable pcap capture (SIP + RTP), human-readable per-call traces, per-leg media diag counters (rx/tx/lost/jitter/concealed) — everything correlated by SIP Call-ID | **Done** |
-| `crates/rfc3263` | RFC 3263 SIP server discovery: RFC 1035 DNS wire codec (compression-safe name reader, loop-proof pointers), NAPTR protocol selection (RFC 2915 S-flag), RFC 2782 SRV priority + weighted ordering, A/AAAA fallback, UDP with TC→TCP fallback — pure std, zero deps | **Done** |
+| `crates/rfc3263` | RFC 3263 SIP server discovery: RFC 1035 DNS wire codec (compression-safe name reader, loop-proof pointers), NAPTR protocol selection (RFC 2915 S-flag), RFC 2782 SRV priority + weighted ordering, A/AAAA fallback, UDP with TC→TCP fallback + RFC 5452 bailiwick filtering — pure std, zero deps | **Done** |
+| `crates/sctp` | WebRTC data-channel engine: RFC 9260/4960 SCTP core subset (CRC32c pinned to the RFC 9260 reference table, four-way handshake with HMAC-protected cookie, TSN window + gap-block SACKs, T3-RTX with RFC 6298 RTO, cwnd slow start/CA + a_rwnd flow control, fragmentation, ordered/unordered reassembly), RFC 8832 DCEP channel establishment (stream-id parity per §6), RFC 3758 partial reliability (max-retransmits + max-packet-lifetime with FORWARD-TSN), graceful SHUTDOWN/ABORT; transport-agnostic packet seam for RFC 8261 DTLS encapsulation | **Done** |
 | `crates/zrtc` | The daemon: wires everything into one voice service — UDP/TCP/TLS/WSS SIP listeners, SBC → proxy → registrar, B2BUA + loopback sink, outbound trunk (IP / Digest / Bearer / mTLS, RFC 3263 NAPTR/SRV discovery with connection-time candidate failover; RFC 5626 registration refresh + CRLF/WS-ping flow keep-alives), outbound originator, AI tap, REST API, observability. Config: `zrtc.toml` | **Done** |
 
 ## Quick start
@@ -57,7 +60,7 @@ keep-alives).**
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 574 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 614 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -124,6 +127,19 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
 * **Consistency**: per-leg diag counters, per-call traces and CDRs
   (`concealed_events`, `packets_lost`) come from the same pump counters —
   verified equal in the demo.
+* **SCTP data channels (`sctp`)**: the CRC32c is pinned entry-for-entry to
+  the RFC 9260 Appendix A reference table (plus the CRC-32/ISCSI check
+  value), INIT/SACK wire forms are hand-built byte vectors, and the
+  association runs on a virtual clock in a lossy client↔server loopback —
+  four-way cookie handshake (lost COOKIE-ECHO recovered by T1), ordered
+  streams hold delivery behind gaps while unordered channels deliver
+  through them, max-retransmits and max-packet-lifetime messages are
+  abandoned with FORWARD-TSN and later ordered messages skip the SSN, the
+  state cookie rejects a wrong HMAC, and graceful SHUTDOWN defers until
+  everything outstanding is acknowledged. The loopback also caught a real
+  race: T3-RTX fired before the lifetime sweep in the same timer pass and
+  resurrected an expired message — timer handlers are now ordered so
+  abandonment always precedes retransmission.
 * **P2 audit sweep**: RTP/RTCP demux survives SRTCP auth trailers (no %4
   misroute), `push_via` prepends to the stack top, non-2xx ACK mirrors a
   single top Via and keeps the Route set (§17.1.1.2), non-INVITE server tx
@@ -220,8 +236,10 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
    **and sender-side transport-cc ✅** (outbound ext stamping + feedback
    correlation into per-leg stats) **and wire-format audit ✅** (S-bit
    chunks, inter-arrival deltas, 2-byte sequences, rtcp-mux offered per
-   RFC 5761, RR-prefixed compounds + SDES CNAME per RFC 3550); remaining:
-   data channels (SCTP).
+   RFC 5761, RR-prefixed compounds + SDES CNAME per RFC 3550) **and data
+   channels ✅** (new `sctp` crate: RFC 9260/4960 + RFC 8832 DCEP +
+   RFC 3758 FORWARD-TSN, transport-agnostic for RFC 8261); remaining:
+   wire the ICE/DTLS/SRTP leg into the B2BUA so browsers connect.
 5. SDP hardening — rejected m-lines, port-0 offers, RFC 3264 §6.1 direction
    clamp, extras serialization, **IPv6 answer address types and RFC 8843
    BUNDLE group echo done**. RFC 3263 NAPTR/SRV server discovery — **done**

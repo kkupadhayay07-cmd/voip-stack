@@ -1,0 +1,12 @@
+[package]
+name = "sctp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SCTP data-channel engine: RFC 9260/4960 core subset (CRC32c wire codec, four-way handshake with cookie, DATA/SACK, T3-RTX, ordered/unordered reassembly), RFC 8832 DCEP channel establishment, RFC 3758 partial reliability (FORWARD-TSN) — transport-agnostic packet seam for RFC 8261 DTLS encapsulation"
+
+[dependencies]
+thiserror = { workspace = true }
+# State-cookie MAC (server role); the wire codec is pure std.
+sha2 = { workspace = true }
+hmac = "0.12"

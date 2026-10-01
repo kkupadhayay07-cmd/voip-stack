@@ -21,6 +21,7 @@ members = [
     "crates/zrtc",
     "crates/observ",
     "crates/rfc3263",
+    "crates/sctp",
 ]
 
 [workspace.package]
@@ -65,6 +66,7 @@ proxy = { path = "crates/proxy" }
 registrar = { path = "crates/registrar" }
 observ = { path = "crates/observ" }
 rfc3263 = { path = "crates/rfc3263" }
+sctp = { path = "crates/sctp" }
 
 [profile.release]
 lto = "thin"

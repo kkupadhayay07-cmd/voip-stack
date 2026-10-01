@@ -226,15 +226,18 @@ configured bounds. Guidance:
    feedback) **and B2BUA RTCP plumbing ✅ live on every media leg**
    (periodic SR/RR, NACK answer from a 512-packet retransmission window +
    NACK ask on jitter-buffer gaps, 200 ms transport-cc arrival feedback
-   when the extmap is negotiated); remaining: data channels (SCTP),
-   sender-side transport-cc extension attach.
+   when the extmap is negotiated) **and data channels ✅ shipped in the
+   `sctp` crate** (RFC 9260/4960 association engine + RFC 8832 DCEP +
+   RFC 3758 FORWARD-TSN, transport-agnostic for RFC 8261 DTLS
+   encapsulation); remaining: wiring the ICE/DTLS/SRTP leg into the B2BUA
+   (until then `m=application` offers are answered port-0 honestly).
 5. **Container entrypoint** — wire `zrtc` as the image entrypoint with a
    mounted config + real healthcheck.
 6. **SDP hardening** (rejected m-lines, port-0 answers, the RFC 3264 §6.1
    direction clamp, **IPv6 answer address types and RFC 8843 BUNDLE group
    echo are done**) — and **GRUU/Outbound done** (RFC 5626 flow
    keep-alives + registration refresh, RFC 5627 pub-gruu synthesis;
-   `NAPTR/SRV` shipped earlier), leaving data channels (SCTP) and
+   `NAPTR/SRV` shipped earlier), leaving the B2BUA WebRTC leg and
    carrier-grade signaling extras on the extension list. (PRACK/100rel shipped — see
    `COMPLIANCE.md`. The external audit is fully closed at every severity —
    Critical, High and the complete P2 backlog — with regression tests;

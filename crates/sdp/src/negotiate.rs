@@ -713,6 +713,38 @@ a=ssrc:3520455752 cname:xyz\r\n";
     }
 
     #[test]
+    fn answer_rejects_data_channel_mline_until_webrtc_leg_exists() {
+        // An m=application offer (RFC 8841) cannot be honored yet: the media
+        // pump is RTP-only and the ICE/DTLS/SRTP leg is not wired, so the
+        // stream must be rejected with port 0 (RFC 3264 §6) — same rule the
+        // "offer what the pump actually does" lesson requires. The rejection
+        // preserves the m-line verbatim (proto + formats) so a future
+        // WebRTC leg can negotiate it.
+        let offer_str = "v=0\r\n\
+            o=- 1 1 IN IP4 1.2.3.4\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 1.2.3.4\r\n\
+            m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+            a=sctp-port:5000\r\n\
+            a=max-message-size:262144\r\n\
+            m=audio 5000 RTP/AVP 0\r\n";
+        let offer = parse(offer_str).unwrap();
+        // One caps slot per m-line: the second (audio caps vs m=application)
+        // kind-mismatches, which is what produces the port-0 rejection.
+        let answer = answer_session(&offer, &[caps_audio(), caps_audio()]).unwrap();
+        assert_eq!(answer.medias.len(), 2);
+        let app = &answer.medias[0];
+        assert_eq!(app.media, "application");
+        assert_eq!(app.proto, "UDP/DTLS/SCTP");
+        assert_eq!(app.port, 0);
+        assert_eq!(app.formats, vec!["webrtc-datachannel".to_string()]);
+        // The audio stream is answered normally and keeps its position.
+        assert_eq!(answer.medias[1].media, "audio");
+        assert_eq!(answer.medias[1].port, caps_audio().port);
+    }
+
+    #[test]
     fn answer_rejects_unsupported_media() {
         let offer_str = CHROMIUM_LIKE_OFFER.replace("m=audio", "m=video");
         let offer = parse(&offer_str).unwrap();

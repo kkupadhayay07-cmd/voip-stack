@@ -89,7 +89,7 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **574 passing** across 56 suites, `clippy -D warnings`
+`cargo test --workspace` → **614 passing** across 59 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
 **The external audit is fully closed**: every finding at every severity —
@@ -182,3 +182,30 @@ The two DNS residues deferred by the Task 43 self-audit are fixed in
   TC flag is no longer observable.
 
 Net: **574 tests / 56 suites** (was 571) — rfc3263 33→36.
+
+
+# Self-audit of the Task 46 SCTP engine (2026-09)
+
+The `sctp` crate was written with the Task 43 lesson applied from the start:
+every codec path is pinned by hand-built byte vectors (not self-roundtrips),
+the CRC32c is validated entry-for-entry against the RFC 9260 Appendix A
+reference table plus the CRC-32/ISCSI check value, and the association runs
+in a lossy virtual-clock loopback. Findings caught DURING this build — all
+fixed before commit:
+
+| # | Finding | Severity | Fix |
+|---|---------|----------|-----|
+| T1 | **Timer-order race**: with a collapsed RTO (loopback RTT sample → rto_min), T3-RTX fired BEFORE the RFC 3758 lifetime sweep in the same `on_timeout` pass and retransmitted a message whose packet-lifetime had just expired — the receiver delivered a message the sender believed abandoned | **Major** | Timer handlers reordered (T1 → lifetime sweep → T3 → heartbeat) so abandonment always precedes retransmission; the max-lifetime loopback test pins the order |
+| T2 | **DCEP bypassed SSN accounting**: the receiver dispatched DCEP messages by PPID before the ordered pipeline, so a DATA_CHANNEL_OPEN never advanced the stream's expected SSN and the first user message on the channel parked forever (ordered deadlock) | **Major** | DCEP rides the ordered reassembly pipeline and dispatches at delivery time; SSN parity restored; stream-parity + reliable-message tests cover it |
+| T3 | **Unordered delivery gated on TSN contiguity**: unordered messages waited for the cumulative TSN to advance (a lost predecessor blocked them) — RFC 9260 §6.6 requires immediate unordered delivery | **Major** | Unordered chunks feed the reassembler on arrival; TSN contiguity gates only ordered delivery; the unordered-gap test pins it |
+| T4 | **MTU budget double-counted the common header**: chunk `size` included the 12-byte packet header, making a full-size fragmented chunk unschedulable (12 + size > MTU forever) | Minor | `size` = chunk wire size (16 + payload); fragmentation budget `mtu − 28` unchanged; fragmentation test covers a full-size chunk stream |
+| T5 | **State cookie magic was 7 bytes, not 8** — every cookie field read back shifted by one octet, so the server silently dropped every valid COOKIE-ECHO | Minor (found by unit probe) | 8-byte `SCTPCK01` magic; cookie build/parse roundtrip probe added |
+
+Also fixed during the wave: T1-COOKIE retransmission was verified against a
+dropped COOKIE-ECHO (recovers on the next T1 fire), and `m=application`
+offers are answered port-0 (RFC 3264 §6) in the SDP engine until the
+ICE/DTLS/SRTP leg exists — pinned by a new `sdp` test so the negotiation
+never claims a data channel the media pump cannot serve.
+
+Net: **614 tests / 59 suites** (was 574/56) — sctp +39 (20 lib + 19
+loopback), sdp +1.
