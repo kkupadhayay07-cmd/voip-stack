@@ -10,11 +10,53 @@ use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::wire::{encode_query, parse_response, DnsError, Message};
+use crate::wire::{encode_query, parse_response, DnsError, Message, Record};
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1000);
 /// UDP is tried twice (initial + one retransmission) before giving up.
 const UDP_ATTEMPTS: usize = 2;
+/// RFC 1035 §2.3.4 suggests 512 B for UDP; we allow 4096. A datagram that
+/// FILLS this buffer was cut off locally (the network delivered more than
+/// we will read) — the response must be retried over TCP even though we
+/// cannot see the server's TC flag anymore.
+const UDP_BUF: usize = 4096;
+
+/// Outcome of one UDP query exchange.
+#[derive(Debug)]
+enum UdpRecv {
+    /// A well-formed, ID-matched response arrived.
+    Answer(Message),
+    /// The response was cut off locally (datagram filled the receive
+    /// buffer): retry over TCP instead of parsing a partial answer.
+    RetryTcp,
+    /// No matching response within the deadline (retransmit or give up).
+    Timeout,
+}
+
+/// Case-insensitive bailiwick test (RFC 5452): `owner` is the queried
+/// name itself or a subdomain of it. Trailing dots are ignored.
+fn in_bailiwick(owner: &str, qname: &str) -> bool {
+    let o = owner.trim_end_matches('.').to_ascii_lowercase();
+    let q = qname.trim_end_matches('.').to_ascii_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    o == q || o.ends_with(&format!(".{q}"))
+}
+
+/// Drops every record whose owner name is outside the queried name's
+/// bailiwick (RFC 5452 §5.4 — records must be in-scope for the question;
+/// a forged response may not inject names from other zones).
+fn filter_bailiwick(msg: &mut Message, qname: &str) {
+    msg.records.retain(|r| {
+        let owner = match r {
+            Record::Srv(s) => &s.name,
+            Record::Naptr(n) => &n.name,
+            Record::A { name, .. } | Record::Aaaa { name, .. } | Record::Other { name, .. } => name,
+        };
+        in_bailiwick(owner, qname)
+    });
+}
 
 /// Monotonic query-id source: a process-wide xorshift state seeded once
 /// from the clock and advanced atomically, so concurrent resolvers neither
@@ -60,15 +102,29 @@ impl DnsClient {
     pub fn query(&self, qname: &str, qtype: u16) -> Result<Message, DnsError> {
         let id = next_query_id();
         let packet = encode_query(id, qname, qtype)?;
-        let msg = self.query_udp(id, &packet)?;
+        // RFC 5452: every record in the answer is constrained to the
+        // bailiwick of the queried name (exact owner or a subdomain of it);
+        // anything else is out-of-scope data that a spoofed/misbehaving
+        // response must not inject into our resolution.
+        let mut msg = match self.query_udp(id, &packet)? {
+            UdpRecv::Answer(m) => m,
+            UdpRecv::RetryTcp => {
+                let mut m = self.query_tcp(id, &packet)?;
+                filter_bailiwick(&mut m, qname);
+                return Ok(m);
+            }
+            UdpRecv::Timeout => return Err(DnsError::Timeout),
+        };
         if msg.truncated {
-            self.query_tcp(id, &packet)
-        } else {
-            Ok(msg)
+            let mut m = self.query_tcp(id, &packet)?;
+            filter_bailiwick(&mut m, qname);
+            return Ok(m);
         }
+        filter_bailiwick(&mut msg, qname);
+        Ok(msg)
     }
 
-    fn query_udp(&self, id: u16, packet: &[u8]) -> Result<Message, DnsError> {
+    fn query_udp(&self, id: u16, packet: &[u8]) -> Result<UdpRecv, DnsError> {
         // Bind by the server's address family: resolv.conf may hand us an
         // IPv6 nameserver, and an AF_INET socket cannot connect() to one.
         let bind = if self.server.is_ipv4() {
@@ -81,32 +137,42 @@ impl DnsClient {
         sock.set_write_timeout(Some(self.timeout))?;
         for _ in 0..UDP_ATTEMPTS {
             sock.send(packet)?;
-            if let Some(msg) = self.recv_matching_udp(&sock, id)? {
-                return Ok(msg);
+            match self.recv_matching_udp(&sock, id)? {
+                UdpRecv::Answer(msg) => return Ok(UdpRecv::Answer(msg)),
+                UdpRecv::RetryTcp => return Ok(UdpRecv::RetryTcp),
+                UdpRecv::Timeout => {} // Timeout with no matching response: retransmit.
             }
-            // Timeout with no matching response: retransmit.
         }
-        Err(DnsError::Timeout)
+        Ok(UdpRecv::Timeout)
     }
 
     /// Waits up to `timeout`, discarding malformed, non-response (QR bit
     /// clear — a spoofed/reflected QUERY is not an answer) and
     /// mismatched-ID datagrams (late answers to a previous query are not
-    /// answers).
-    fn recv_matching_udp(&self, sock: &UdpSocket, id: u16) -> Result<Option<Message>, DnsError> {
+    /// answers). A datagram that fills the receive buffer is reported as
+    /// [`UdpRecv::RetryTcp`] BEFORE parsing — a locally cut-off response
+    /// may still parse cleanly, and accepting its partial record set would
+    /// be silently wrong (RFC 5452 mindset: distrust the datagram).
+    fn recv_matching_udp(&self, sock: &UdpSocket, id: u16) -> Result<UdpRecv, DnsError> {
         let deadline = Instant::now() + self.timeout;
-        let mut buf = [0u8; 4096];
+        let mut buf = vec![0u8; UDP_BUF];
         loop {
             let now = Instant::now();
             if now >= deadline {
-                return Ok(None);
+                return Ok(UdpRecv::Timeout);
             }
             sock.set_read_timeout(Some(deadline - now))?;
             match sock.recv(&mut buf) {
                 Ok(n) => {
+                    if n == buf.len() {
+                        // Locally truncated: the real datagram is at least
+                        // this big, so we are reading a cut-off copy. TCP
+                        // is the authoritative fallback (RFC 1035 §4.2.2).
+                        return Ok(UdpRecv::RetryTcp);
+                    }
                     if let Ok(msg) = parse_response(&buf[..n]) {
                         if msg.is_response && msg.id == id {
-                            return Ok(Some(msg));
+                            return Ok(UdpRecv::Answer(msg));
                         }
                     }
                     // Malformed, non-response or foreign datagram: keep waiting.
@@ -117,7 +183,7 @@ impl DnsClient {
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) =>
                 {
-                    return Ok(None);
+                    return Ok(UdpRecv::Timeout);
                 }
                 Err(e) => return Err(DnsError::from(e)),
             }
@@ -414,10 +480,10 @@ mod tests {
         sender.send(&right).unwrap();
 
         let client = DnsClient::new("127.0.0.1:53".parse().unwrap(), Duration::from_secs(2));
-        let msg = client
-            .recv_matching_udp(&client_sock, 0xBBBB)
-            .unwrap()
-            .expect("matching answer within timeout");
+        let msg = match client.recv_matching_udp(&client_sock, 0xBBBB).unwrap() {
+            UdpRecv::Answer(m) => m,
+            other => panic!("expected a matching answer, got {other:?}"),
+        };
         assert_eq!(msg.id, 0xBBBB);
         assert!(matches!(&msg.records[0], crate::wire::Record::Srv(s)
             if s.target == "pbx.example.net"));
@@ -506,5 +572,143 @@ mod tests {
         assert_eq!(msg.records.len(), 1);
         assert!(matches!(&msg.records[0], crate::wire::Record::A { .. }));
         dns.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod bailiwick_tests {
+    use super::fake::FakeDns;
+    use super::*;
+    use crate::wire::canned::{response, Rr};
+    use crate::wire::{QTYPE_A, QTYPE_SRV};
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+
+    fn routes(qname: &str, qtype: u16, answers: &[(&str, Rr)]) -> HashMap<(String, u16), Vec<u8>> {
+        let mut m = HashMap::new();
+        m.insert(
+            (qname.to_string(), qtype),
+            response(0, qname, qtype, answers),
+        );
+        m
+    }
+
+    // RFC 5452: a record owned by a name OUTSIDE the queried zone must not
+    // leak into the resolution — a forged response cannot plant an address
+    // for another zone this way. The in-bailiwick record (and case-insensitive
+    // owner match) survives.
+    #[test]
+    fn out_of_bailiwick_records_are_dropped() {
+        let dns = FakeDns::spawn(
+            routes(
+                "sip.example.com",
+                QTYPE_A,
+                &[
+                    ("evil.example.net", Rr::A(Ipv4Addr::new(6, 6, 6, 6))),
+                    (
+                        "evil.example.com.attacker.io",
+                        Rr::A(Ipv4Addr::new(7, 7, 7, 7)),
+                    ),
+                    ("SIP.EXAMPLE.com", Rr::A(Ipv4Addr::new(1, 2, 3, 4))),
+                ],
+            ),
+            None,
+        );
+        let msg = DnsClient::new(dns.addr, Duration::from_millis(500))
+            .query("sip.example.com", QTYPE_A)
+            .expect("query");
+        dns.shutdown();
+        assert_eq!(
+            msg.records.len(),
+            1,
+            "only the in-bailiwick record survives"
+        );
+        match &msg.records[0] {
+            Record::A { name, addr, .. } => {
+                assert_eq!(name.as_str(), "SIP.EXAMPLE.com", "owner preserved verbatim");
+                assert_eq!(*addr, Ipv4Addr::new(1, 2, 3, 4));
+            }
+            other => panic!("expected A record, got {other:?}"),
+        }
+    }
+
+    // Strict query-name bailiwick: an ADDITIONAL-section A record for the
+    // SRV target (`sipserver.example.com`) is NOT a subdomain of the
+    // queried name (`_sip._tcp.example.com`) and is dropped. That is safe
+    // BY DESIGN — the resolver never trusts additional-section addresses:
+    // every SRV target is resolved through its own dedicated A/AAAA query
+    // (`Resolver::lookup_ips`), whose own bailiwick check passes.
+    #[test]
+    fn strict_bailiwick_drops_additional_section_target_addresses() {
+        let dns = FakeDns::spawn(
+            routes(
+                "_sip._tcp.example.com",
+                QTYPE_SRV,
+                &[
+                    (
+                        "_sip._tcp.example.com",
+                        Rr::Srv {
+                            priority: 1,
+                            weight: 2,
+                            port: 5060,
+                            target: "sipserver.example.com".into(),
+                            ttl: 300,
+                        },
+                    ),
+                    ("sipserver.example.com", Rr::A(Ipv4Addr::new(10, 0, 0, 7))),
+                ],
+            ),
+            None,
+        );
+        let msg = DnsClient::new(dns.addr, Duration::from_millis(500))
+            .query("_sip._tcp.example.com", QTYPE_SRV)
+            .expect("query");
+        dns.shutdown();
+        assert_eq!(
+            msg.records.len(),
+            1,
+            "only the SRV itself survives; the target A is re-queried explicitly: {:?}",
+            msg.records
+        );
+        assert!(matches!(&msg.records[0], Record::Srv(_)));
+    }
+
+    // A UDP datagram that fills the 4096-byte receive buffer is locally
+    // truncated even if the server never set TC. The cut-off message could
+    // parse cleanly and silently yield a PARTIAL record set — the client
+    // must retry over TCP instead (RFC 1035 §4.2.2).
+    #[test]
+    fn locally_truncated_udp_falls_back_to_tcp() {
+        // >4096 bytes of UDP answer with TC=0 (150 A records ≈ 4.8 KB).
+        let many: Vec<(&str, Rr)> = (0..150)
+            .map(|i| {
+                (
+                    "sip.example.com",
+                    Rr::A(Ipv4Addr::new(10, (i / 256) as u8, i as u8, 1)),
+                )
+            })
+            .collect();
+        let r = routes("sip.example.com", QTYPE_A, &many);
+        // The REAL answer, served over TCP only.
+        let tcp = response(
+            0,
+            "sip.example.com",
+            QTYPE_A,
+            &[("sip.example.com", Rr::A(Ipv4Addr::new(1, 2, 3, 4)))],
+        );
+        let dns = FakeDns::spawn(r, Some(tcp));
+        let msg = DnsClient::new(dns.addr, Duration::from_millis(1500))
+            .query("sip.example.com", QTYPE_A)
+            .expect("query");
+        dns.shutdown();
+        assert_eq!(
+            msg.records.len(),
+            1,
+            "TCP fallback replaced the locally-truncated UDP answer"
+        );
+        match &msg.records[0] {
+            Record::A { addr, .. } => assert_eq!(*addr, Ipv4Addr::new(1, 2, 3, 4)),
+            other => panic!("expected A record, got {other:?}"),
+        }
     }
 }

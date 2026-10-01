@@ -89,7 +89,7 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **571 passing** across 56 suites, `clippy -D warnings`
+`cargo test --workspace` → **574 passing** across 56 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
 **The external audit is fully closed**: every finding at every severity —
@@ -128,8 +128,9 @@ code before acting (same rule as the external audit). Fixed in this commit:
 
 * Non-mux RTCP port (port+1) listener — we advertise rtcp-mux instead;
   strict non-mux peers remain unsupported (COMPLIANCE §5).
-* DNS bailiwick (owner-name) filtering of response records; TCP fallback on
-  locally-truncated UDP datagrams without the server TC flag.
+* ~~DNS bailiwick (owner-name) filtering of response records; TCP fallback on
+  locally-truncated UDP datagrams without the server TC flag~~ — FIXED in
+  Task 45 (see the DNS hardening note below; workspace 571→574).
 * RTP destination from the SDP answer's `c=` line (split signaling/media
   hosts) — pre-existing, now documented in COMPLIANCE §5.
 * RTCP BYE on media teardown; `nacks_tx` counts FCI entries (documented).
@@ -162,3 +163,22 @@ value is echoed in the 200 OK (RFC 3261 §10.2.8), and the dead
 Net: **571 tests / 56 suites** (was 561) — 10 new tests (sip-core +1,
 registrar +5, zrtc +4 incl. an end-to-end TCP flow test driving the real
 flow loop against a fake registrar).
+
+# DNS hardening closed (2026-09, Task 45)
+
+The two DNS residues deferred by the Task 43 self-audit are fixed in
+`crates/rfc3263/src/client.rs`, each pinned by a new test:
+
+* **Bailiwick filtering (RFC 5452)**: `DnsClient::query` drops every record
+  whose owner is neither the queried name nor a subdomain of it
+  (case-insensitive, trailing-dot normalized). Strict query-name rule —
+  additional-section addresses for SRV targets are dropped BY DESIGN and
+  safely: the resolver never trusts piggybacked data, it re-resolves every
+  target via a dedicated A/AAAA query whose own bailiwick check passes.
+* **Local-truncation TCP fallback (RFC 1035 §4.2.2)**: a UDP datagram that
+  fills the 4096 B receive buffer is treated as locally truncated BEFORE
+  parsing — a cut-off response may parse cleanly and silently yield a
+  partial record set — and is retried over TCP even though the server's
+  TC flag is no longer observable.
+
+Net: **574 tests / 56 suites** (was 571) — rfc3263 33→36.
