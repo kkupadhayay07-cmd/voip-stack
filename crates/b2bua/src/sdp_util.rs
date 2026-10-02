@@ -254,9 +254,12 @@ pub struct WebrtcOfferCaps {
 /// `dc` (RFC 8841): when `Some`, an `m=application UDP/DTLS/SCTP
 /// webrtc-datachannel` m-line is appended AFTER the audio m-line, carrying
 /// the same ICE/DTLS transport block (one agent, one socket) plus the
-/// `a=sctp-port` / `a=max-message-size` attributes. Like every construction
-/// path here, the transport rides RAW attributes — the typed fields are
-/// parse-side mirrors only (the Task 50 lesson).
+/// `a=sctp-port` / `a=max-message-size` attributes. The bundled shape is
+/// completed per RFC 8843/5888: both m-lines carry `a=mid` (`0` / `1`) and
+/// the session carries `a=group:BUNDLE 0 1` — one transport, exactly how
+/// the engine runs it. Like every construction path here, the transport
+/// rides RAW attributes — the typed fields are parse-side mirrors only
+/// (the Task 50 lesson).
 pub fn build_webrtc_offer(
     host: &str,
     port: u16,
@@ -298,9 +301,21 @@ pub fn build_webrtc_offer(
             .push(Attribute::new("candidate", Some(bare.to_owned())));
     }
     if let Some(dc) = dc {
+        // RFC 8843/5888: group the two m-lines onto the one transport the
+        // engine actually runs — mids on both m-lines, a session-level
+        // `a=group:BUNDLE 0 1`, and the typed `Session.bundle` mirror.
+        m.attributes.push(Attribute::new("mid", Some("0".into())));
+        m.mid = Some("0".into());
+        session
+            .attributes
+            .push(Attribute::new("group", Some("BUNDLE 0 1".into())));
+        session.bundle = Some(sdp::types::BundleGroup {
+            mids: vec!["0".into(), "1".into()],
+        });
         // RFC 8841 data-channel offer. Same transport block as the audio
         // m-line (the ICE/DTLS transport is shared), raw attributes only.
         let mut attrs = Vec::new();
+        attrs.push(Attribute::new("mid", Some("1".into())));
         attrs.push(Attribute::new("sctp-port", Some(dc.sctp_port.to_string())));
         attrs.push(Attribute::new(
             "max-message-size",
@@ -334,7 +349,7 @@ pub fn build_webrtc_offer(
             rtcp_fb: Default::default(),
             direction: None,
             rtcp_mux: false,
-            mid: None,
+            mid: Some("1".into()),
             ptime: None,
             maxptime: None,
             // Typed mirrors, kept in sync with the raw attributes above.
@@ -616,6 +631,8 @@ mod tests {
         );
         let text = offer.serialize();
         assert!(!text.contains("m=application"), "{text}");
+        assert!(!text.contains("a=group"), "{text}");
+        assert!(!text.contains("a=mid:"), "{text}");
     }
 
     #[test]
@@ -648,6 +665,10 @@ mod tests {
         // agent, one socket — the raw-attributes rule applies to this
         // m-line too).
         assert_eq!(text.matches("a=setup:actpass").count(), 2, "{text}");
+        // RFC 8843/5888: mids on both m-lines + the session-level group.
+        assert!(text.contains("a=group:BUNDLE 0 1\r\n"), "{text}");
+        assert!(text.contains("a=mid:0\r\n"), "{text}");
+        assert!(text.contains("a=mid:1\r\n"), "{text}");
         assert_eq!(text.matches("a=fingerprint:sha-256 ").count(), 2, "{text}");
         assert_eq!(text.matches("a=ice-ufrag:ufr7").count(), 2, "{text}");
         assert_eq!(text.matches("a=candidate:1 1 UDP").count(), 2, "{text}");
@@ -658,6 +679,13 @@ mod tests {
             text,
             "webrtc dc offer roundtrip not stable"
         );
+        // The typed mirrors ride along: the session group and both mids.
+        assert_eq!(
+            parsed.bundle.as_ref().map(|g| g.mids.join(" ")),
+            Some("0 1".into())
+        );
+        assert_eq!(parsed.medias[0].mid.as_deref(), Some("0"));
+        assert_eq!(parsed.medias[1].mid.as_deref(), Some("1"));
         let app = &parsed.medias[1];
         assert_eq!(app.media, "application");
         assert_eq!(app.proto, "UDP/DTLS/SCTP");
@@ -685,5 +713,8 @@ mod tests {
             "{ans_text}"
         );
         assert!(ans_text.contains("a=sctp-port:5000"), "{ans_text}");
+        // RFC 8843 §6.2: a bundling answerer echoes the group with the
+        // accepted mids, in offer order.
+        assert!(ans_text.contains("a=group:BUNDLE 0 1\r\n"), "{ans_text}");
     }
 }

@@ -47,9 +47,10 @@ plain-caller bridge with the full CDR trail; a downstream that answers plain
 — one engine per binary): the RFC 8841 mirror policy — when the caller
 offered an `m=application` m-line AND the route dials WebRTC, the leg-B
 offer carries the same `m=application UDP/DTLS/SCTP webrtc-datachannel`
-block (own `a=sctp-port`/`a=max-message-size`, same transport attributes;
-wire form pinned by sdp_util unit tests incl. a parse→serialize fixed
-point) — the mirror loopback proves BOTH legs' associations come up with
+block (own `a=sctp-port`/`a=max-message-size`, same transport attributes,
+`a=mid:0`/`a=mid:1` + session-level `a=group:BUNDLE 0 1` per RFC 8843/5888;
+wire form pinned by sdp_util unit tests incl. a parse→serialize fixed point;
+the caller's bundled offer gets its group echoed by the leg-A answer) — the mirror loopback proves BOTH legs' associations come up with
 role-correct parity (leg B: the callee is the DTLS client → SCTP initiator
 opening EVEN stream 0; leg A: the B2BUA is the DTLS client opening even,
 the mini caller as DTLS server opens ODD stream 1 — RFC 8832 §5.1/§6),

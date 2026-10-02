@@ -263,6 +263,14 @@ pub async fn run_webrtc_callee_dc(
                             );
                             assert_eq!(app.setup, Some(sdp::types::SetupRole::Actpass));
                             assert!(app.fingerprint.is_some() && app.ice_ufrag.is_some());
+                            // RFC 8843/5888: the bundled offer groups both
+                            // m-lines with mids.
+                            assert_eq!(app.mid.as_deref(), Some("1"));
+                            assert_eq!(m.mid.as_deref(), Some("0"));
+                            assert_eq!(
+                                offer.bundle.as_ref().map(|g| g.mids.join(" ")),
+                                Some("0 1".into())
+                            );
 
                             let remote_cands: Vec<ice::candidate::Candidate> = m
                                 .ice_candidates
@@ -611,6 +619,7 @@ pub async fn run_webrtc_caller_dc(engine_addr: SocketAddr, call_id: &str) -> Cal
          s=webrtc-leg-b-dc\r\n\
          c=IN IP4 127.0.0.1\r\n\
          t=0 0\r\n\
+         a=group:BUNDLE 0 1\r\n\
          m=audio {caller_port} UDP/TLS/RTP/SAVPF 0 101\r\n\
          a=rtpmap:0 PCMU/8000\r\n\
          a=rtpmap:101 telephone-event/8000\r\n\
@@ -866,6 +875,13 @@ pub async fn run_webrtc_caller_dc(engine_addr: SocketAddr, call_id: &str) -> Cal
             }
         }
     }
+
+    // RFC 8843 §6.2: the leg-A answer echoes the caller's BUNDLE group
+    // with the accepted mids, in offer order.
+    assert!(
+        answer_sdp.contains("a=group:BUNDLE 0 1\r\n"),
+        "answer must echo the BUNDLE group: {answer_sdp}"
+    );
 
     CallerResult {
         answer_sdp,

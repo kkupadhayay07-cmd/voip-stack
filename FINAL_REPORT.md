@@ -210,6 +210,6 @@ PPID-50 wire bug found and fixed, SCTP+SRTP coexistence loopback test)**;
 `setup:actpass` downstream, ICE controlling, DTLS server/client per the
 answer's `a=setup`, SRTP-only media, plain answers rejected 503, both DTLS
 roles integration-tested)**.
-Remaining: dialog-layer extraction, RFC 8843 BUNDLE group offer on leg B, RFC 8831 stream reset (explicit DATA_CHANNEL_CLOSE),
+Remaining: dialog-layer extraction, RFC 8831 stream reset (explicit DATA_CHANNEL_CLOSE),
 release-mode soak on 8-core hardware (M2), Postgres CDR backend — see
 README "Roadmap (next)".

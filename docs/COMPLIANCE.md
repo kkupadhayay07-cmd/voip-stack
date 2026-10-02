@@ -50,7 +50,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC 3581 | rport / Symmetric RTP | **Done** | SBC marks `rport` on requests and routes responses via received/rport; NAT latch table maps contact → source. |
 | RFC 4028 | Session timers | **Done** | B2BUA, both legs: `Min-SE`/422 floor on inbound INVITEs, `Session-Expires`+`refresher` negotiation mirrored end-to-end on the 200s, half-interval refresh re-INVITEs (no-change offer), in-dialog UPDATE refresh, expiry teardown with BYEs on both legs, 422-retry with the peer's `Min-SE`, tag-checked in-dialog re-INVITE/UPDATE routing (481/491/488). |
 | RFC 4566 | SDP | **Done** | `sdp` crate: strict positioned-error parser + canonical serializer; session extras (`u=/e=/p=/k=/z=`) serialize with their `typ=` prefixes. |
-| RFC 8843 | BUNDLE (grouping) | **Done** (core) | `sdp`: `a=group:BUNDLE` + `a=mid` parsed into typed projections; the answer echoes the group with exactly the accepted mids in the offer group's order (§6.2/§7.1.1) — rejected (port 0) m-lines and accepted m-lines without a mid never join the group, an answer to an unbundled offer never grows a group; mid echo per accepted m-line. Single-transport reuse by the media engine (m-line demux by mid) is future work. |
+| RFC 8843 | BUNDLE (grouping) | **Done** (core) | `sdp`: `a=group:BUNDLE` + `a=mid` parsed into typed projections; the answer echoes the group with exactly the accepted mids in the offer group's order (§6.2/§7.1.1) — rejected (port 0) m-lines and accepted m-lines without a mid never join the group, an answer to an unbundled offer never grows a group; mid echo per accepted m-line. The B2BUA's leg-B WebRTC offer is now itself bundled when it carries the data channel (RFC 8841 mirror policy): `a=mid:0`/`a=mid:1` on the two m-lines and a session-level `a=group:BUNDLE 0 1` — the shape the answerer side already echoed (wire-pinned by sdp_util unit tests and the mirror-loopback integration test). Single-transport reuse by the media engine (m-line demux by mid) is future work. |
 | RFC 8866 | SDP v2 | **Partial** | Parser/model cover `rtpmap`/`fmtp`, `ice-*`, `fingerprint`, `bundle`, `extmap`; answers emit IP4/IP6 connection types per the local literal (§4.4); full 8866 grammar validation not complete. |
 | RFC 2617/7616 | Digest auth | **Done** (server side) | `sip-core` helpers + registrar nonce store; `respond_to_challenge` used in tests/clients. |
 | RFC 6140 / 5627 | GRUU | **Done** (pub-gruu) | Registrar synthesizes a public GRUU (`sip:AOR;gr=<instance>`) for every contact registering `+sip.instance`, echoes it (quoted) in the 200 OK with `Supported: gruu`; the trunk UAC advertises the option tag. Quoted generic-params are parser round-trip stable (quote-aware param split). Not done: temp-gruu (temporary opaque GRUUs with lifetime), instance-aware proxy routing (a request to a GRUU forks to all of the user's contacts, not the targeted instance). |
@@ -167,9 +167,9 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
   DTLS (RFC 8261) with the association role and RFC 8832 §5.1/§6 stream
   parity following the negotiated DTLS role, DCEP channels open across the
   B2BUA and messages echo (fragmentation included) while media flows; a
-  callee that declines the m-line keeps the call audio-only. Remaining:
-  trickle ICE, RFC 8843 BUNDLE group OFFER (we echo BUNDLE; a leg-B
-  two-m-line offer does not yet carry a group line), RFC 8831 stream reset
+  callee that declines the m-line keeps the call audio-only, and the leg-B
+  offer is bundled per RFC 8843/5888 (`a=mid` on both m-lines +
+  `a=group:BUNDLE 0 1`). Remaining: trickle ICE, RFC 8831 stream reset
   (`DATA_CHANNEL_CLOSE` → SSE), data-channel application semantics beyond
   echo (a real messaging API is engine-level today).
 * **RTCP non-mux addressing (RFC 3550 §11)**: the media pump is mux-only;

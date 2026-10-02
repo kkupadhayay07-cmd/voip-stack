@@ -45,8 +45,10 @@ downstream too when the caller offered one (RFC 8841 mirror policy on
 engine's association role and RFC 8832 §5.1/§6 stream parity (DTLS client
 even / server odd — a self-roundtrip had pinned the parity inverted; the
 RFC cross-check caught it) follow the negotiated DTLS role, a callee that
-declines the m-line keeps the call audio-only, and integration tests cover
-the mirror loopback and the decline path.**
+declines the m-line keeps the call audio-only, the bundled offer carries
+`a=mid` on both m-lines plus the session-level `a=group:BUNDLE 0 1`
+(RFC 8843/5888 — one transport, exactly how the engine runs it), and
+integration tests cover the mirror loopback and the decline path.**
 
 ## Workspace layout
 
@@ -292,10 +294,12 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
    `a=sctp-port` feeds the engine, the association role + RFC 8832 stream
    parity follow the DTLS role — the inverted parity was caught by an RFC
    cross-check and pinned by wire tests — and a port-0 answer keeps the
-   call audio-only; mirror-loopback + decline integration tests ship).
-   Remaining: RFC 8843 BUNDLE group OFFER (we echo BUNDLE but a leg-B
-   two-m-line offer does not yet carry a group line), RFC 8831 stream
-   reset (`DATA_CHANNEL_CLOSE` → SSE) for explicit channel close.
+   call audio-only; mirror-loopback + decline integration tests ship)
+   **and the leg-B offer is bundled ✅** (RFC 8843/5888: `a=mid:0/1` on the
+   two m-lines + session-level `a=group:BUNDLE 0 1`; a bundling callee's
+   answer echoes the group — pinned by the mirror-loopback test).
+   Remaining: RFC 8831 stream reset (`DATA_CHANNEL_CLOSE` → SSE) for
+   explicit channel close.
 5. SDP hardening — rejected m-lines, port-0 offers, RFC 3264 §6.1 direction
    clamp, extras serialization, **IPv6 answer address types and RFC 8843
    BUNDLE group echo done**. RFC 3263 NAPTR/SRV server discovery — **done**

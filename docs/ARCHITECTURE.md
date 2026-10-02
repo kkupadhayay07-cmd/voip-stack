@@ -290,7 +290,9 @@ whole path, including a fragmented 2000 B message.
 Task 51 extends the seam to the OFFERER leg: when the caller offered an
 `m=application` m-line AND the route dials WebRTC, the leg-B offer carries
 the mirrored RFC 8841 block (own `a=sctp-port`/`a=max-message-size`, the
-same ICE/DTLS transport attributes), and after the callee answers the leg-B
+same ICE/DTLS transport attributes) bundled per RFC 8843/5888 (`a=mid:0/1`,
+session-level `a=group:BUNDLE 0 1` — one transport, as the engine runs it),
+and after the callee answers the leg-B
 establishment spawns a second engine on that leg's DTLS association — its
 SCTP role (and stream parity) following the DTLS role the callee's
 `a=setup` picked (callee `active` → the B2BUA is the DTLS server and the
