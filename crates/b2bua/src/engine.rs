@@ -140,6 +140,10 @@ struct Leg {
     /// (RFC 8261). Present only when the offer carried an
     /// `m=application UDP/DTLS/SCTP` m-line and the leg came up.
     dc: Option<datachan::DataChannelHandle>,
+    /// DTLS-record forwarder staged between data-channel engine spawn and
+    /// pump start: the pump forwards inbound RFC 7983 DTLS records (20–63)
+    /// to the engine. Consumed into the leg's `PumpConfig.dtls_tx`.
+    dtls_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 /// The PRACK a leg last sent for a reliable 1xx, kept as exact wire bytes
@@ -178,6 +182,11 @@ struct Call {
     /// `m=application` data channel — the data-channel engine spawns on the
     /// established DTLS transport in `confirm_leg_a`.
     a_dc_port: Option<u16>,
+    /// The offer we put on leg B carried an `m=application` data channel
+    /// (the caller offered one AND the route dials WebRTC — the mirror
+    /// policy). The leg-B establishment spawns the engine when the callee
+    /// accepts it.
+    b_dc_offered: bool,
     /// The offer we put on leg B (resent for no-change refreshes and
     /// 422 retries).
     b_offer: String,
@@ -219,6 +228,7 @@ impl Call {
             a_out_tx: None,
             a_answer,
             a_dc_port: None,
+            b_dc_offered: false,
             b_offer,
             b_se: None,
             a_rel: None,
@@ -1187,6 +1197,14 @@ impl B2bua {
                 .as_ref()
                 .map(|w| w.offer_transport())
                 .expect("webrtc route prepared a transport");
+            // RFC 8841 mirror policy: data channels are offered downstream
+            // when the caller offered one AND the route dials WebRTC — the
+            // B2BUA terminates (echoes) channels per leg, so a caller that
+            // never offered one gets an audio-only WebRTC dial.
+            let b_dc = dc_offer.then_some(sdp::DataChannelCaps {
+                sctp_port: sdp_util::SCTP_PORT,
+                max_message_size: sdp_util::MAX_MESSAGE_SIZE,
+            });
             sdp_util::build_webrtc_offer(
                 &self.cfg.media_host,
                 b_port,
@@ -1198,6 +1216,7 @@ impl B2bua {
                     fingerprint: t.fingerprint,
                     candidates: t.candidates,
                 },
+                b_dc,
             )
             .serialize()
         } else {
@@ -1292,6 +1311,10 @@ impl B2bua {
         // the leg negotiated WebRTC (the SDP layer answers application
         // m-lines only on webrtc legs) — the establishment spawns the engine.
         call.a_dc_port = dc_offer.then_some(remote_sctp_port);
+        // ...and the same capability is mirrored into the leg-B offer when
+        // the route dials WebRTC (set below, after the route is known —
+        // here it is: `target_route` was resolved above).
+        call.b_dc_offered = dc_offer && target_route.webrtc;
         call.a_rel = a_rel;
         let leg_a = Leg {
             call_id: call_id.clone(),
@@ -1312,6 +1335,7 @@ impl B2bua {
             crypto: None,
             media_remote: None,
             dc: None,
+            dtls_tx: None,
         };
         call.leg_a = Some(leg_a);
         call.a_tx = Some(a_tx);
@@ -1336,6 +1360,7 @@ impl B2bua {
             crypto: None,
             media_remote: None,
             dc: None,
+            dtls_tx: None,
         });
         b_to_a.insert(b_call_id, call_id.clone());
         self.cdr
@@ -1386,39 +1411,49 @@ impl B2bua {
             };
             LegTimers::new(se.max(self.cfg.session_timer_min_se), role)
         });
-        let b_answer_media: Option<sdp::types::MediaDescription> =
-            match sdp::parse::parse(&String::from_utf8_lossy(&resp.body)) {
-                Ok(answer_sdp) => {
-                    // The audio m-line drives both the pump plan and (on a
-                    // `webrtc` route) the ICE/DTLS establishment.
-                    let media = answer_sdp
-                        .medias
-                        .iter()
-                        .find(|m| m.media == "audio")
-                        .cloned();
-                    b.plan = stream_plans(&answer_sdp).into_iter().next();
-                    media
-                }
-                Err(e) => {
-                    tracing::warn!(call_id = %a_id, "bad SDP from B: {e}");
-                    if let Some(a) = &call.leg_a {
-                        if let Some(invite) = &a.invite {
-                            let fail = sip_core::builder::respond_to(
-                                invite,
-                                503,
-                                "Service Unavailable",
-                                Vec::new(),
-                                None,
-                            );
-                            let _ = sock
-                                .send_to(&serialize(&SipMessage::Response(fail)), a.remote_sip)
-                                .await;
-                        }
+        let (b_answer_media, b_dc_answer): (
+            Option<sdp::types::MediaDescription>,
+            Option<sdp::types::MediaDescription>,
+        ) = match sdp::parse::parse(&String::from_utf8_lossy(&resp.body)) {
+            Ok(answer_sdp) => {
+                // The audio m-line drives both the pump plan and (on a
+                // `webrtc` route) the ICE/DTLS establishment.
+                let media = answer_sdp
+                    .medias
+                    .iter()
+                    .find(|m| m.media == "audio")
+                    .cloned();
+                // RFC 8841: the answer's application m-line (when we
+                // offered one) carries the callee's SCTP port for the
+                // data-channel engine.
+                let dc = answer_sdp
+                    .medias
+                    .iter()
+                    .find(|m| m.media == "application" && m.proto == "UDP/DTLS/SCTP")
+                    .cloned();
+                b.plan = stream_plans(&answer_sdp).into_iter().next();
+                (media, dc)
+            }
+            Err(e) => {
+                tracing::warn!(call_id = %a_id, "bad SDP from B: {e}");
+                if let Some(a) = &call.leg_a {
+                    if let Some(invite) = &a.invite {
+                        let fail = sip_core::builder::respond_to(
+                            invite,
+                            503,
+                            "Service Unavailable",
+                            Vec::new(),
+                            None,
+                        );
+                        let _ = sock
+                            .send_to(&serialize(&SipMessage::Response(fail)), a.remote_sip)
+                            .await;
                     }
-                    teardown(calls, b_to_a, a_id, "bad SDP from leg B", Some(503));
-                    return;
                 }
-            };
+                teardown(calls, b_to_a, a_id, "bad SDP from leg B", Some(503));
+                return;
+            }
+        };
         if let Some(b) = call.leg_b.as_ref() {
             let cseq = resp.headers.cseq().map(|c| c.seq).unwrap_or(1);
             self.send_ack(sock, b, cseq);
@@ -1437,6 +1472,47 @@ impl B2bua {
             };
             match established {
                 Ok(est) => {
+                    // Data channels on leg B (RFC 8841/8261): spawn the
+                    // engine when we offered a channel and the callee
+                    // accepted it — the association role follows our DTLS
+                    // role (the callee's `a=setup` choice). Otherwise the
+                    // DTLS association has nothing left to carry and the
+                    // documented lifecycle drops it.
+                    let b_dc_wanted = call.b_dc_offered;
+                    let mut dc_handle = None;
+                    let mut dc_dtls_tx = None;
+                    if b_dc_wanted {
+                        match b_dc_answer.as_ref().filter(|m| m.port != 0) {
+                            Some(dc_m) => {
+                                let remote_sctp_port = dc_m
+                                    .attributes
+                                    .iter()
+                                    .find(|a| a.name == "sctp-port")
+                                    .and_then(|a| a.value.as_deref())
+                                    .and_then(|v| v.parse::<u16>().ok())
+                                    .unwrap_or(datachan::DEFAULT_SCTP_PORT);
+                                let (dtls_tx, dtls_rx) = tokio::sync::mpsc::unbounded_channel();
+                                dc_handle = Some(datachan::spawn(
+                                    datachan::DataChannelConfig {
+                                        remote_sctp_port,
+                                        we_are_dtls_client: est.we_are_dtls_client,
+                                        ..datachan::DataChannelConfig::default()
+                                    },
+                                    est.dtls,
+                                    est.socket.clone(),
+                                    est.remote,
+                                    dtls_rx,
+                                ));
+                                dc_dtls_tx = Some(dtls_tx);
+                            }
+                            None => {
+                                tracing::info!(
+                                    call_id = %a_id,
+                                    "callee declined the data channel; audio-only leg B"
+                                );
+                            }
+                        }
+                    }
                     if let Some(b) = call.leg_b.as_mut() {
                         tracing::info!(
                             call_id = %a_id,
@@ -1447,9 +1523,9 @@ impl B2bua {
                         b.rtp = Some(est.socket);
                         b.media_remote = Some(est.remote);
                         b.crypto = Some(est.crypto);
+                        b.dc = dc_handle;
+                        b.dtls_tx = dc_dtls_tx;
                     }
-                    // `est.dtls` drops here: no data channel was offered
-                    // on leg B, the association has nothing left to carry.
                 }
                 Err(e) => {
                     tracing::warn!(call_id = %a_id, "leg B WebRTC establishment failed: {e}");
@@ -1697,9 +1773,11 @@ impl B2bua {
                             nack: pb.rtcp_fb_nack,
                             twcc_ext: pb.twcc_ext_id,
                             rtcp_interval_ms: 5_000,
-                            // Leg B today offers no data channel: no DTLS seam.
-                            // (A WebRTC leg still drops inbound DTLS records.)
-                            dtls_tx: None,
+                            // RFC 7983 DTLS records → the leg-B data-channel
+                            // engine when one was negotiated (the mirror
+                            // policy offered the m-line and the callee
+                            // accepted); otherwise None drops them.
+                            dtls_tx: call.leg_b.as_mut().and_then(|b| b.dtls_tx.take()),
                         };
                         // Cross-connect the pumps: A's decoded bridge PCM feeds
                         // B's encoder and vice versa.

@@ -111,6 +111,10 @@ pub struct EstablishedMedia {
     /// (SCTP packets, RFC 8261) flows through `send_app_data` /
     /// `recv_app_data`; dropping it closes the DTLS association.
     pub dtls: DtlsEndpoint,
+    /// Our DTLS role on this transport — keys the data-channel association
+    /// role and the RFC 8832 §5.1/§6 stream parity when an `m=application`
+    /// m-line was negotiated on the leg.
+    pub we_are_dtls_client: bool,
 }
 
 impl WebRtcMedia {
@@ -211,6 +215,8 @@ impl WebRtcMedia {
             // The DTLS association outlives the handshake: data channels
             // (RFC 8261) ride it from here on.
             dtls: self.dtls,
+            // The answerer is the DTLS client (`setup:active`, RFC 5763 §5).
+            we_are_dtls_client: true,
         })
     }
 }
@@ -331,9 +337,12 @@ impl WebRtcOffer {
             remote,
             socket: Arc::new(socket),
             crypto: CryptoPair { tx, rx },
-            // No data channel is offered on leg B, so the DTLS association
-            // has nothing left to carry — the documented lifecycle drops it.
+            // When a data channel was negotiated on this leg, the caller
+            // hands the live association to the SCTP engine (whose role —
+            // and RFC 8832 stream parity — follows this DTLS role);
+            // otherwise dropping it here is the documented lifecycle.
             dtls,
+            we_are_dtls_client: role == DtlsRole::Client,
         })
     }
 }

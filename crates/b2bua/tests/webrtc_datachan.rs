@@ -455,21 +455,22 @@ async fn webrtc_datachannel_over_dtls_loopback() {
         }
         sctp_out(&mut sctp, &mut caller_dtls, &caller_sock, pair.remote).await;
 
-        // Established → open the channel (responder: first EVEN id), then
-        // send the probe messages once the channel is acked.
+        // Established → open the channel (responder = DTLS server: first
+        // ODD id, RFC 8832 §5.1/§6), then send the probe messages once the
+        // channel is acked.
         if established && !opened {
             let stream = sctp
                 .open_data_channel("chat", "", ChannelType::Reliable, Instant::now())
                 .expect("open data channel once established");
             assert_eq!(
-                stream, 0,
-                "association responder uses even ids (RFC 8832 §6)"
+                stream, 1,
+                "association responder (DTLS server) uses odd ids (RFC 8832 §5.1/§6)"
             );
             opened = true;
         }
         if opened && !acked_streams.is_empty() && sent.is_empty() {
             for (ppid, data) in &tests {
-                sctp.send_message(0, *ppid, data.clone(), Instant::now())
+                sctp.send_message(1, *ppid, data.clone(), Instant::now())
                     .expect("send on the open channel");
                 sent.push((*ppid, data.clone()));
             }
@@ -478,7 +479,7 @@ async fn webrtc_datachannel_over_dtls_loopback() {
 
     assert!(established, "SCTP association never established");
     assert!(
-        acked_streams.contains(&0),
+        acked_streams.contains(&1),
         "peer must ack our DCEP OPEN: {acked_streams:?}"
     );
     assert_eq!(

@@ -240,8 +240,11 @@ configured bounds. Guidance:
    ICE controlling; DTLS server/client per the answer's `a=setup`;
    SRTP-only, plain answers rejected 503; both DTLS roles covered by
    integration tests);
-   remaining: data channels on leg B (the B2BUA does not yet offer
-   `m=application` downstream).
+   **and leg-B data channels ✅ shipped** (RFC 8841 mirror policy: the
+   caller's `m=application` offer is mirrored into the leg-B offer; the
+   engine's association role + RFC 8832 §5.1/§6 stream parity follow the
+   DTLS role — the previously inverted parity was caught by an RFC
+   cross-check; a port-0 answer keeps the call audio-only).
 5. **Container entrypoint** — wire `zrtc` as the image entrypoint with a
    mounted config + real healthcheck.
 6. **SDP hardening** (rejected m-lines, port-0 answers, the RFC 3264 §6.1

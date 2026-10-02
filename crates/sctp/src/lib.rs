@@ -14,8 +14,8 @@
 //! - [RFC 8832] Data Channel Establishment Protocol (DCEP):
 //!   `DATA_CHANNEL_OPEN` / `DATA_CHANNEL_ACK` with all three reliability
 //!   classes (reliable, max-retransmits, max-packet-lifetime) and the
-//!   out-of-order flag; stream-id parity per §6 (association initiator odd,
-//!   responder even)
+//!   out-of-order flag; stream-id parity per §5.1/§6 (DTLS client even,
+//!   DTLS server odd — the association initiator is the DTLS client)
 //! - [RFC 3758] partial reliability: sender-side abandonment
 //!   (max-retransmits *and* max-packet-lifetime) with FORWARD-TSN advance and
 //!   receiver-side stream-sequence skipping
@@ -75,8 +75,9 @@ pub use wire::{SackBlock, SctpError};
 /// Endpoint configuration (transport-agnostic).
 #[derive(Debug, Clone)]
 pub struct SctpConfig {
-    /// Association initiator (sent the INIT) when true. Governs stream-id
-    /// parity for outbound data channels (odd) per RFC 8832 §6.
+    /// Association initiator (sent the INIT). Expected to be the DTLS client
+    /// (RFC 8261 wiring): this also keys the RFC 8832 §5.1/§6 data-channel
+    /// stream parity — the initiator/DTLS client opens EVEN streams.
     pub is_client: bool,
     pub local_port: u16,
     pub remote_port: u16,

@@ -188,7 +188,8 @@ fn handshake_completes_both_roles() {
 fn stream_id_parity_per_rfc8832() {
     let mut h = Harness::new();
     h.handshake();
-    // Initiator (client) opens odd streams; responder (server) even.
+    // Initiator (client, the DTLS client per RFC 8261 wiring) opens EVEN
+    // streams; the responder (DTLS server) odd — RFC 8832 §5.1/§6.
     let c1 = h
         .client
         .open_data_channel("a", "", ChannelType::Reliable, h.now)
@@ -197,33 +198,123 @@ fn stream_id_parity_per_rfc8832() {
         .server
         .open_data_channel("srv", "", ChannelType::Reliable, h.now)
         .unwrap();
-    assert_eq!(c1, 1, "client (INIT sender) must use odd ids");
-    assert_eq!(s1, 0, "responder must use even ids");
+    assert_eq!(c1, 0, "client (INIT sender, DTLS client) must use even ids");
+    assert_eq!(s1, 1, "responder (DTLS server) must use odd ids");
     let c2 = h
         .client
         .open_data_channel("b", "", ChannelType::Reliable, h.now)
         .unwrap();
-    assert_eq!(c2, 3);
+    assert_eq!(c2, 2);
     h.drain_to_net();
     h.deliver_all();
     // Peer OPENs surfaced as events with labels intact.
     let se = h.take_server_events();
     assert!(se
         .iter()
-        .any(|e| matches!(e, SctpEvent::DataChannelOpen { stream: 1, label, .. } if label == "a")));
+        .any(|e| matches!(e, SctpEvent::DataChannelOpen { stream: 0, label, .. } if label == "a")));
     let ce = h.take_client_events();
     assert!(ce.iter().any(
-        |e| matches!(e, SctpEvent::DataChannelOpen { stream: 0, label, .. } if label == "srv")
+        |e| matches!(e, SctpEvent::DataChannelOpen { stream: 1, label, .. } if label == "srv")
     ));
-    // And the DCEP ACKs flow back (client gets the ack for its stream 1).
+    // And the DCEP ACKs flow back (client gets the ack for its stream 0).
     assert!(ce
         .iter()
-        .any(|e| matches!(e, SctpEvent::DataChannelAck { stream: 1 })));
+        .any(|e| matches!(e, SctpEvent::DataChannelAck { stream: 0 })));
     assert!(se
         .iter()
-        .any(|e| matches!(e, SctpEvent::DataChannelAck { stream: 0 })));
+        .any(|e| matches!(e, SctpEvent::DataChannelAck { stream: 1 })));
     assert!(h.client.channels().contains(&0));
     assert!(h.server.channels().contains(&1));
+}
+
+/// A DCEP OPEN on a stream whose parity does not match the sender's DTLS
+/// role violates RFC 8832 §5.1/§6: it must be dropped WITHOUT a
+/// DATA_CHANNEL_ACK (the RFC forbids acking an invalid OPEN), the channel
+/// must never register, and the association must stay up.
+#[test]
+fn dcep_open_on_wrong_parity_is_dropped() {
+    let mut h = Harness::new();
+    h.handshake();
+    assert!(h.client.is_established() && h.server.is_established());
+
+    // Hand-built OPEN as if the DTLS-client peer sent it on stream 1 (odd):
+    // the server expects its peer (DTLS client) to open EVEN streams, so
+    // this must be ignored.
+    let mut open_msg = Vec::new();
+    sctp::dcep::encode_open(
+        &sctp::dcep::DataChannelOpen {
+            label: "wrong-parity".into(),
+            protocol: "".into(),
+            channel_type: ChannelType::Reliable,
+            priority: 0,
+        },
+        &mut open_msg,
+    );
+    let bad = sctp::wire::encode_packet(
+        5000,
+        5000,
+        222, // the server's own initiate tag (what it expects on inbound)
+        &[Chunk::Data(sctp::wire::DataChunk {
+            tsn: 1000,
+            stream: 1,
+            ssn: 0,
+            ppid: sctp::dcep::PPID_DCEP,
+            begin: true,
+            end: true,
+            unordered: false,
+            immediate_sack: false,
+            payload: open_msg.clone(),
+        })],
+    );
+    let ev = h.server.handle_packet(&bad, h.now);
+    assert!(
+        !ev.iter()
+            .any(|e| matches!(e, SctpEvent::DataChannelOpen { .. })),
+        "wrong-parity OPEN must not surface: {ev:?}"
+    );
+    assert!(
+        !h.server.channels().contains(&1),
+        "wrong-parity OPEN must not register a channel"
+    );
+    assert!(h.server.is_established(), "association must survive");
+    // No DCEP ACK may leave the server for the dropped OPEN.
+    h.drain_to_net();
+    for (_, pkt) in &h.net {
+        let parsed = parse_packet(pkt, false).unwrap();
+        for chunk in parsed.chunks {
+            if let Chunk::Data(d) = chunk {
+                assert_ne!(
+                    d.ppid,
+                    sctp::dcep::PPID_DCEP,
+                    "an invalid OPEN must never be acked"
+                );
+            }
+        }
+    }
+
+    // The correctly-paritied OPEN (even, from the DTLS client) is accepted.
+    let good = sctp::wire::encode_packet(
+        5000,
+        5000,
+        222,
+        &[Chunk::Data(sctp::wire::DataChunk {
+            tsn: 1001,
+            stream: 0,
+            ssn: 0,
+            ppid: sctp::dcep::PPID_DCEP,
+            begin: true,
+            end: true,
+            unordered: false,
+            immediate_sack: false,
+            payload: open_msg,
+        })],
+    );
+    let ev = h.server.handle_packet(&good, h.now);
+    assert!(
+        ev.iter()
+            .any(|e| matches!(e, SctpEvent::DataChannelOpen { stream: 0, .. })),
+        "valid-parity OPEN must open the channel: {ev:?}"
+    );
 }
 
 #[test]
@@ -830,7 +921,10 @@ fn dcep_open_rides_ppid_50_per_rfc8832() {
         .client
         .open_data_channel("chat", "", ChannelType::Reliable, h.now)
         .unwrap();
-    assert_eq!(stream, 1, "association initiator uses odd ids");
+    assert_eq!(
+        stream, 0,
+        "association initiator (DTLS client) uses even ids"
+    );
     h.drain_to_net();
 
     let mut opens = 0;
@@ -853,7 +947,7 @@ fn dcep_open_rides_ppid_50_per_rfc8832() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, SctpEvent::DataChannelOpen { stream: 1, .. })),
+            .any(|e| matches!(e, SctpEvent::DataChannelOpen { stream: 0, .. })),
         "server must surface the peer's DCEP OPEN: {events:?}"
     );
 }
@@ -875,11 +969,11 @@ fn user_data_on_non_dcep_ppids_is_delivered() {
     assert!(h
         .take_client_events()
         .iter()
-        .any(|e| matches!(e, SctpEvent::DataChannelAck { stream: 1 })));
+        .any(|e| matches!(e, SctpEvent::DataChannelAck { stream: 0 })));
 
     for ppid in [51u32, 53, 60_000] {
         h.client
-            .send_message(1, ppid, vec![0x55; 40], h.now)
+            .send_message(0, ppid, vec![0x55; 40], h.now)
             .unwrap();
         h.drain_to_net();
         h.deliver_all();

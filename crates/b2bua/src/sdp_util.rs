@@ -250,12 +250,20 @@ pub struct WebrtcOfferCaps {
 /// plain audio offer upgraded to `UDP/TLS/RTP/SAVPF` with the ICE
 /// credentials/candidates, the DTLS fingerprint and `a=setup:actpass`
 /// (RFC 5763 §5 — the answer must pick `active` or `passive`).
+///
+/// `dc` (RFC 8841): when `Some`, an `m=application UDP/DTLS/SCTP
+/// webrtc-datachannel` m-line is appended AFTER the audio m-line, carrying
+/// the same ICE/DTLS transport block (one agent, one socket) plus the
+/// `a=sctp-port` / `a=max-message-size` attributes. Like every construction
+/// path here, the transport rides RAW attributes — the typed fields are
+/// parse-side mirrors only (the Task 50 lesson).
 pub fn build_webrtc_offer(
     host: &str,
     port: u16,
     codecs: &[CodecId],
     sess_id: u32,
     t: &WebrtcOfferCaps,
+    dc: Option<sdp::DataChannelCaps>,
 ) -> Session {
     let mut session = build_offer(host, port, codecs, sess_id);
     let m = &mut session.medias[0];
@@ -288,6 +296,61 @@ pub fn build_webrtc_offer(
         m.ice_candidates.push(bare.to_owned());
         m.attributes
             .push(Attribute::new("candidate", Some(bare.to_owned())));
+    }
+    if let Some(dc) = dc {
+        // RFC 8841 data-channel offer. Same transport block as the audio
+        // m-line (the ICE/DTLS transport is shared), raw attributes only.
+        let mut attrs = Vec::new();
+        attrs.push(Attribute::new("sctp-port", Some(dc.sctp_port.to_string())));
+        attrs.push(Attribute::new(
+            "max-message-size",
+            Some(dc.max_message_size.to_string()),
+        ));
+        attrs.push(Attribute::new("setup", Some("actpass".into())));
+        attrs.push(Attribute::new(
+            "fingerprint",
+            Some(format!("sha-256 {}", t.fingerprint)),
+        ));
+        attrs.push(Attribute::new("ice-ufrag", Some(t.ufrag.clone())));
+        attrs.push(Attribute::new("ice-pwd", Some(t.pwd.clone())));
+        for line in &t.candidates {
+            let bare = line.strip_prefix("a=").unwrap_or(line);
+            let bare = bare.strip_prefix("candidate:").unwrap_or(bare);
+            attrs.push(Attribute::new("candidate", Some(bare.to_owned())));
+        }
+        session.medias.push(MediaDescription {
+            media: "application".into(),
+            port,
+            port_count: 1,
+            proto: "UDP/DTLS/SCTP".into(),
+            formats: vec!["webrtc-datachannel".into()],
+            info: None,
+            connection: None,
+            bandwidths: Vec::new(),
+            attributes: attrs,
+            extras: Vec::new(),
+            rtpmaps: Default::default(),
+            fmtps: Default::default(),
+            rtcp_fb: Default::default(),
+            direction: None,
+            rtcp_mux: false,
+            mid: None,
+            ptime: None,
+            maxptime: None,
+            // Typed mirrors, kept in sync with the raw attributes above.
+            ice_ufrag: Some(t.ufrag.clone()),
+            ice_pwd: Some(t.pwd.clone()),
+            ice_options: None,
+            ice_candidates: Vec::new(),
+            fingerprint: Some(Fingerprint {
+                hash_func: "sha-256".to_owned(),
+                value: t.fingerprint.clone(),
+            }),
+            setup: Some(SetupRole::Actpass),
+            rtcp_addr: None,
+            extmaps: Vec::new(),
+            ssrcs: Vec::new(),
+        });
     }
     session
 }
@@ -468,6 +531,7 @@ mod tests {
                 fingerprint: vec!["AB"; 32].join(":"),
                 candidates: vec!["candidate:1 1 UDP 2130706431 127.0.0.1 31000 typ host".into()],
             },
+            None,
         );
         let text = offer.serialize();
         assert!(
@@ -513,6 +577,7 @@ mod tests {
                 fingerprint: vec!["CD"; 32].join(":"),
                 candidates: vec!["candidate:1 1 UDP 2130706431 127.0.0.1 31000 typ host".into()],
             },
+            None,
         );
         let parsed = sdp::parse::parse(&offer.serialize()).unwrap();
         let ans = answer(
@@ -532,5 +597,93 @@ mod tests {
         assert!(text.contains("UDP/TLS/RTP/SAVPF"), "{text}");
         assert!(text.contains("a=setup:active"), "{text}");
         assert!(text.contains("a=fingerprint:sha-256 EF:"), "{text}");
+    }
+
+    #[test]
+    fn webrtc_offer_without_dc_has_no_application_mline() {
+        let offer = build_webrtc_offer(
+            "127.0.0.1",
+            31000,
+            &[CodecId::Pcmu],
+            3,
+            &WebrtcOfferCaps {
+                ufrag: "ufr7".into(),
+                pwd: "pwdsixtysixcharsxxxxxpwdsixtysixcharsxxxxxpwdsixtysix".into(),
+                fingerprint: vec!["AB"; 32].join(":"),
+                candidates: vec!["candidate:1 1 UDP 2130706431 127.0.0.1 31000 typ host".into()],
+            },
+            None,
+        );
+        let text = offer.serialize();
+        assert!(!text.contains("m=application"), "{text}");
+    }
+
+    #[test]
+    fn webrtc_offer_with_dc_carries_the_rfc8841_block() {
+        let offer = build_webrtc_offer(
+            "127.0.0.1",
+            31000,
+            &[CodecId::Pcmu],
+            4,
+            &WebrtcOfferCaps {
+                ufrag: "ufr7".into(),
+                pwd: "pwdsixtysixcharsxxxxxpwdsixtysixcharsxxxxxpwdsixtysix".into(),
+                fingerprint: vec!["AB"; 32].join(":"),
+                candidates: vec!["candidate:1 1 UDP 2130706431 127.0.0.1 31000 typ host".into()],
+            },
+            Some(sdp::DataChannelCaps {
+                sctp_port: SCTP_PORT,
+                max_message_size: MAX_MESSAGE_SIZE,
+            }),
+        );
+        let text = offer.serialize();
+        // The RFC 8841 m-line with our own SCTP port and message cap...
+        assert!(
+            text.contains("m=application 31000 UDP/DTLS/SCTP webrtc-datachannel\r\n"),
+            "{text}"
+        );
+        assert!(text.contains("a=sctp-port:5000\r\n"), "{text}");
+        assert!(text.contains("a=max-message-size:262144\r\n"), "{text}");
+        // ...and the SAME transport block the audio m-line carries (one
+        // agent, one socket — the raw-attributes rule applies to this
+        // m-line too).
+        assert_eq!(text.matches("a=setup:actpass").count(), 2, "{text}");
+        assert_eq!(text.matches("a=fingerprint:sha-256 ").count(), 2, "{text}");
+        assert_eq!(text.matches("a=ice-ufrag:ufr7").count(), 2, "{text}");
+        assert_eq!(text.matches("a=candidate:1 1 UDP").count(), 2, "{text}");
+        // parse → serialize → parse is a fixed point.
+        let parsed = sdp::parse::parse(&text).unwrap();
+        assert_eq!(
+            parsed.serialize(),
+            text,
+            "webrtc dc offer roundtrip not stable"
+        );
+        let app = &parsed.medias[1];
+        assert_eq!(app.media, "application");
+        assert_eq!(app.proto, "UDP/DTLS/SCTP");
+        assert_eq!(app.setup, Some(SetupRole::Actpass));
+        assert_eq!(app.ice_ufrag.as_deref(), Some("ufr7"));
+        assert_eq!(app.fingerprint.as_ref().unwrap().hash_func, "sha-256");
+        // And our own answer engine accepts BOTH m-lines (the leg-A path
+        // with webrtc caps, reused for symmetry).
+        let ans = answer(
+            &parsed,
+            "127.0.0.1",
+            31001,
+            &[CodecId::Pcmu],
+            Some(WebrtcAnswerCaps {
+                ufrag: "ansu".into(),
+                pwd: "anspwdsixtysixcharsxxxxxanspwdsixtysixcharsxxxxxansp".into(),
+                fingerprint: vec!["EF"; 32].join(":"),
+                candidates: vec!["candidate:2 1 UDP 2130706431 127.0.0.1 31001 typ host".into()],
+            }),
+        )
+        .expect("webrtc dc offer self-answers");
+        let ans_text = ans.serialize();
+        assert!(
+            ans_text.contains("m=application 31001 UDP/DTLS/SCTP webrtc-datachannel"),
+            "{ans_text}"
+        );
+        assert!(ans_text.contains("a=sctp-port:5000"), "{ans_text}");
     }
 }

@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 639 tests passing across 67 suites in 21 crates;
+**Current state: 644 tests passing across 69 suites in 21 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
@@ -38,8 +38,15 @@ failing transport tears the call down with 503 instead of degrading —
 **and data channels ride
 the same established DTLS (RFC 8261): `m=application UDP/DTLS/SCTP` offers
 are answered per RFC 8841, DCEP channels open across the B2BUA, user
-messages (including fragmented ones) cross end to end, and an SCTP+SRTP
-loopback integration test proves media and data coexist on one socket.**
+messages (including fragmented ones) cross end to end, media and data
+demonstrably coexist on one socket — and the data channel is OFFERED
+downstream too when the caller offered one (RFC 8841 mirror policy on
+`webrtc` routes): the leg-B offer carries the `m=application` m-line, the
+engine's association role and RFC 8832 §5.1/§6 stream parity (DTLS client
+even / server odd — a self-roundtrip had pinned the parity inverted; the
+RFC cross-check caught it) follow the negotiated DTLS role, a callee that
+declines the m-line keeps the call audio-only, and integration tests cover
+the mirror loopback and the decline path.**
 
 ## Workspace layout
 
@@ -73,7 +80,7 @@ loopback integration test proves media and data coexist on one socket.**
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 639 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 644 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -279,9 +286,16 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
    **and offerer-side (leg B) WebRTC ✅** (`webrtc` routes dial SAVPF +
    `setup:actpass` downstream: ICE controlling, DTLS server/client per the
    answer's `a=setup`, SRTP-only, plain answers rejected 503; integration
-   tests cover both DTLS roles).
-   Remaining: data channels on leg B (the B2BUA does not yet offer
-   `m=application` downstream).
+   tests cover both DTLS roles)
+   **and data channels on leg B ✅** (RFC 8841 mirror policy: the caller's
+   `m=application` offer is mirrored into the leg-B offer, the callee's
+   `a=sctp-port` feeds the engine, the association role + RFC 8832 stream
+   parity follow the DTLS role — the inverted parity was caught by an RFC
+   cross-check and pinned by wire tests — and a port-0 answer keeps the
+   call audio-only; mirror-loopback + decline integration tests ship).
+   Remaining: RFC 8843 BUNDLE group OFFER (we echo BUNDLE but a leg-B
+   two-m-line offer does not yet carry a group line), RFC 8831 stream
+   reset (`DATA_CHANNEL_CLOSE` → SSE) for explicit channel close.
 5. SDP hardening — rejected m-lines, port-0 offers, RFC 3264 §6.1 direction
    clamp, extras serialization, **IPv6 answer address types and RFC 8843
    BUNDLE group echo done**. RFC 3263 NAPTR/SRV server discovery — **done**

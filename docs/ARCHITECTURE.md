@@ -263,8 +263,10 @@ chunk codec, four-way cookie handshake (server cookie = HMAC-SHA256 over
 the handshake state, stale cookies refresh from the retained INIT), TSN
 window with gap-block SACKs, T3-RTX with RFC 6298 RTO, fragmentation +
 ordered/unordered reassembly, RFC 8832 DCEP channel establishment (OPEN
-rides the ordered pipeline; stream-id parity: INIT sender odd, responder
-even; both DCEP messages ride PPID 50 — pinned by a wire test), RFC 3758
+rides the ordered pipeline; stream-id parity per §5.1/§6: the DTLS client
+opens EVEN streams, the DTLS server ODD — the initiator follows the DTLS
+role, and a wrong-parity inbound OPEN is dropped without an ACK; both DCEP
+messages ride PPID 50 — pinned by wire tests), RFC 3758
 partial reliability with FORWARD-TSN, graceful SHUTDOWN and ABORT. All
 timers are caller-driven (`poll_timeout` + `on_timeout(now)`), so the
 engine is testable on a virtual clock.
@@ -284,6 +286,16 @@ association initiator. Peer-opened channels are acknowledged in-band and
 received messages echo (the demo behavior; the API carries a send command
 for real applications). An SCTP+SRTP coexistence loopback test pins the
 whole path, including a fragmented 2000 B message.
+
+Task 51 extends the seam to the OFFERER leg: when the caller offered an
+`m=application` m-line AND the route dials WebRTC, the leg-B offer carries
+the mirrored RFC 8841 block (own `a=sctp-port`/`a=max-message-size`, the
+same ICE/DTLS transport attributes), and after the callee answers the leg-B
+establishment spawns a second engine on that leg's DTLS association — its
+SCTP role (and stream parity) following the DTLS role the callee's
+`a=setup` picked (callee `active` → the B2BUA is the DTLS server and the
+SCTP responder; `passive` → initiator). A port-0 answer keeps the call
+audio-only. Both legs' engines terminate (echo) channels independently.
 
 ### 5.5 Control & observability
 

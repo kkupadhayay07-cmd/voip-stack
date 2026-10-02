@@ -89,7 +89,7 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **639 passing** across 67 suites, `clippy -D warnings`
+`cargo test --workspace` → **644 passing** across 69 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
 **The external audit is fully closed**: every finding at every severity —
@@ -307,3 +307,24 @@ integration loopback:
 
 Net after Task 50: **639 tests / 67 suites** (was 634/64) — b2bua lib 40→42
 (offer-shape unit tests), +3 integration suites.
+
+## Task 51 — leg-B data channels: the RFC 8832 stream-parity rule had shipped INVERTED
+
+Wiring the data channel into the leg-B offer (RFC 8841 mirror policy) demanded
+one more DTLS-role case, and settling it honestly meant fetching the RFC text
+instead of trusting the engine's own test comments — which caught a wire-format
+defect that had shipped two tasks earlier and was PINNED by a test asserting
+the wrong rule with a spec citation.
+
+| ID | Finding | Severity | Fix |
+|----|---------|----------|-----|
+| P1 | The DCEP stream-id parity rule was inverted everywhere since Task 46: `is_client → odd streams`, and the Task 49 test asserted `responder == 0` with a comment citing "RFC 8832 §6". The actual RFC 8832 §5.1/§6 rule keys on the **DTLS role**: the DTLS client opens EVEN streams, the DTLS server ODD. Both self-roundtrip ends were our own engine (allocated odd/even from inverted bases), so no test could catch it — but a real browser would have ignored our DATA_CHANNEL_OPEN on the wrong parity (libwebrtc validates parity per role) | **Critical** (wire, interop blocker) | allocator base flipped (`is_client → 0`); `DataChannelConfig.we_are_dtls_client` added so the SCTP association initiator follows the DTLS role (RFC 8261 allows either side to initiate; libwebrtc convention = the DTLS client initiates); doc comments in `assoc.rs`/`dcep.rs`/`lib.rs` corrected; the parity test and the PPID-50 test re-pinned to the true rule; a new hand-built-wire test feeds the server an OPEN on a wrong-parity stream and asserts it is dropped without an ACK, no channel registers, and the association survives. Lesson re-confirmed: self-roundtrip CANNOT catch spec-constant bugs — only an external reference (RFC text, wire capture, real peer) can |
+| P2 | The wrong-parity OPEN originally had no receiver-side guard at all — an OPEN on an arbitrary stream was registered and acked | **Major** (spec) | `handle_dcep` validates parity before any state mutation (the Task 47 reject-before-consume lesson): a parity-violating OPEN is dropped WITHOUT the ACK RFC 8832 §5.1 forbids issuing; per-channel RFC 8831 stream reset is not implemented, so dropping (association stays up, the peer's reliable OPEN retransmission keeps hitting the guard) is the documented closest-spec action |
+| W1 | The first leg-B mirror loopback never established the association: the harness callee was now the SCTP INITIATOR but its queued INIT sat in `drain_outbound()` — the initiator must flush immediately (nothing inbound arrives to trigger the drain before the association exists) | **Major** (test harness) | the harness flushes right after endpoint construction and re-drains on a 200 ms tick; the engine's own `run()` already flushed at construction |
+| D1 | `build_webrtc_offer`'s dc parameter, the answer's application m-line parsing (`a=sctp-port` → `remote_sctp_port`), and the staged `dtls_tx` forwarder on `Leg` | Minor (wiring) | covered above; the engine spawns on `est.dtls` when the callee accepts (port ≠ 0) and logs an info + keeps audio when it declines |
+| D2 | The TESTING.md `b2bua` row had drifted 3 below its own header arithmetic (42 vs the real 45) — per-crate counts were bumped by feature tasks without re-deriving the aggregation | Minor (docs) | row corrected to the true aggregation (49 after this task); header totals were always computed from real output and stay authoritative |
+
+Net after Task 51: **644 tests / 69 suites** (was 639/67) — sctp +1
+(wrong-parity drop), b2bua +2 (sdp_util dc offer tests), +2 integration
+suites; suite inventory re-derived per crate (b2bua 42→49 corrected against
+its own header arithmetic).

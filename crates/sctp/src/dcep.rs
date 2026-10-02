@@ -12,9 +12,10 @@
 //! | 0x02  | partial: max packet lifetime       | lifetime in ms      |
 //! | +0x80 | same class, unordered              | same                |
 //!
-//! Stream-id parity (§6): the endpoint that *sent the INIT* (the association
-//! initiator) opens channels on odd stream ids (1, 3, …), the responder on
-//! even ids (0, 2, …). The OPEN MUST be the first user message on its stream.
+//! Stream-id parity (§5.1/§6): the side acting as the DTLS *client* (the
+//! association initiator in the RFC 8261 wiring) opens channels on EVEN
+//! stream ids (0, 2, …), the DTLS server on ODD ids (1, 3, …). The OPEN MUST
+//! be the first user message on its stream.
 //!
 //! [RFC 8832]: https://datatracker.ietf.org/doc/html/rfc8832
 

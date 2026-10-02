@@ -53,6 +53,10 @@ pub struct DataChannelConfig {
     /// The SCTP port the PEER's association listens on (from the offer's
     /// `a=sctp-port`, RFC 8841).
     pub remote_sctp_port: u16,
+    /// Our DTLS role on this transport. It drives the association role (the
+    /// DTLS client sends the INIT — RFC 8261 wiring) and, through it, the
+    /// RFC 8832 §5.1/§6 stream parity (the DTLS client opens EVEN streams).
+    pub we_are_dtls_client: bool,
     /// Largest message we accept (mirrors the SDP answer's
     /// `a=max-message-size`).
     pub max_message_size: usize,
@@ -63,6 +67,9 @@ impl Default for DataChannelConfig {
     fn default() -> Self {
         DataChannelConfig {
             remote_sctp_port: DEFAULT_SCTP_PORT,
+            // The leg-A answerer shape: we answered `setup:active`, so we
+            // are the DTLS client (RFC 5763 §5).
+            we_are_dtls_client: true,
             max_message_size: 256 * 1024,
             policy: MessagePolicy::Echo,
         }
@@ -145,10 +152,11 @@ async fn run(
     mut cmds: mpsc::UnboundedReceiver<DataCommand>,
     stats: Arc<DataChannelStats>,
 ) {
-    // The B2BUA is the DTLS client → it sends the INIT (association
-    // initiator, RFC 8832 §6 stream parity: odd for our channels).
+    // The association role follows the DTLS role (RFC 8261): the DTLS
+    // client sends the INIT — and opens EVEN streams, the DTLS server ODD
+    // ones (RFC 8832 §5.1/§6, enforced by the sctp engine's allocator).
     let sctp_cfg = SctpConfig {
-        is_client: true,
+        is_client: cfg.we_are_dtls_client,
         local_port: DEFAULT_SCTP_PORT,
         remote_port: cfg.remote_sctp_port,
         // Room for the DTLS/IP overhead over the wire (WebRTC-blessed MTU;
@@ -157,12 +165,17 @@ async fn run(
         max_message_size: cfg.max_message_size,
         ..SctpConfig::default()
     };
-    let mut sctp = match SctpEndpoint::new_client(sctp_cfg, Instant::now()) {
-        Ok(ep) => ep,
-        Err(e) => {
-            tracing::warn!("data channels: sctp endpoint init failed: {e}");
-            return;
+    let mut sctp = if cfg.we_are_dtls_client {
+        match SctpEndpoint::new_client(sctp_cfg, Instant::now()) {
+            Ok(ep) => ep,
+            Err(e) => {
+                tracing::warn!("data channels: sctp endpoint init failed: {e}");
+                return;
+            }
         }
+    } else {
+        // DTLS server: we wait for the peer's INIT (the responder role).
+        SctpEndpoint::new_server(sctp_cfg)
     };
     send_sctp(&mut dtls, &mut sctp, &socket, remote, &stats).await;
 

@@ -377,7 +377,10 @@ impl SctpEndpoint {
             rttvar: cfg.rto_initial / 2,
             cwnd,
             ssthresh: usize::MAX,
-            next_outbound_stream: if cfg.is_client { 1 } else { 0 },
+            // RFC 8832 §5.1/§6: the DTLS client opens EVEN streams, the DTLS
+            // server ODD ones. The association initiator is expected to be
+            // the DTLS client (RFC 8261 wiring), so it starts at 0.
+            next_outbound_stream: if cfg.is_client { 0 } else { 1 },
             cookie_key,
             local_tag,
             local_tsn,
@@ -745,6 +748,18 @@ impl SctpEndpoint {
     fn handle_dcep(&mut self, stream: u16, payload: &[u8], events: &mut Vec<SctpEvent>) {
         match dcep::parse(payload) {
             Ok(Some(open)) => {
+                // RFC 8832 §5.1/§6: the PEER opens EVEN streams when it is
+                // the DTLS client (we are the server) and ODD ones when it
+                // is the server. A parity-violating OPEN must not be acked;
+                // we cannot close the single channel per RFC 8831 (no
+                // stream-reset support), so it is dropped instead — the
+                // association stays up and the peer's reliable OPEN
+                // retransmissions keep hitting the same guard. Valid OPEN
+                // parity: even iff the peer is the DTLS client (= we are
+                // the association responder).
+                if (stream % 2 == 1) != self.cfg.is_client {
+                    return;
+                }
                 if self.channels.contains_key(&stream) {
                     // RFC 8832 §5.1: OPEN on a channel that already exists is
                     // a protocol violation.
@@ -992,8 +1007,8 @@ impl SctpEndpoint {
     // ------------------------------------------------------- data send
 
     /// Open a data channel (DCEP). Returns the SCTP stream id the channel
-    /// uses (odd for the association initiator, even for the responder —
-    /// RFC 8832 §6).
+    /// uses — EVEN for the association initiator / DTLS client, ODD for the
+    /// responder / DTLS server (RFC 8832 §5.1/§6).
     pub fn open_data_channel(
         &mut self,
         label: &str,
