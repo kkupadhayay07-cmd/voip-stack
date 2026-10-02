@@ -6,7 +6,7 @@ use crate::rel100::{self, Reliable1xx};
 use crate::sdp_util;
 use crate::timers::{self, LegTimers, Role, UasNegotiation};
 use crate::webrtc;
-use crate::{CdrEvent, Side};
+use crate::{datachan, CdrEvent, Side};
 use rand::Rng;
 use sdp::negotiate::{stream_plans, StreamPlan};
 use sip_core::builder::RequestBuilder;
@@ -120,6 +120,10 @@ struct Leg {
     /// UDP/TLS/RTP/SAVPF (leg A only today).  `rtp` is None until
     /// [`webrtc::WebRtcMedia::establish`] hands the agent socket over.
     webrtc: Option<webrtc::WebRtcMedia>,
+    /// Data-channel engine on this leg's established DTLS transport
+    /// (RFC 8261). Present only when the offer carried an
+    /// `m=application UDP/DTLS/SCTP` m-line and the leg came up.
+    dc: Option<datachan::DataChannelHandle>,
 }
 
 /// The PRACK a leg last sent for a reliable 1xx, kept as exact wire bytes
@@ -154,6 +158,10 @@ struct Call {
     a_out_tx: Option<ClientInviteTx>,
     /// SDP answer for leg A (sent with the 200).
     a_answer: String,
+    /// Remote SCTP port (RFC 8841) when the leg-A answer accepted an
+    /// `m=application` data channel — the data-channel engine spawns on the
+    /// established DTLS transport in `confirm_leg_a`.
+    a_dc_port: Option<u16>,
     /// The offer we put on leg B (resent for no-change refreshes and
     /// 422 retries).
     b_offer: String,
@@ -194,6 +202,7 @@ impl Call {
             a_tx: None,
             a_out_tx: None,
             a_answer,
+            a_dc_port: None,
             b_offer,
             b_se: None,
             a_rel: None,
@@ -963,15 +972,43 @@ impl B2bua {
         )
         .await;
 
-        // WebRTC detection (RFC 5763/5764): a UDP/TLS/RTP/SAVPF offer with
-        // a DTLS fingerprint and ICE credentials runs the leg over
-        // ICE → DTLS → SRTP instead of plaintext RTP.  On a WebRTC offer we
-        // do NOT bind a plain socket — the ICE agent's socket IS the media
-        // socket and its port goes into the answer.
-        let offer_media = offer.medias.first().cloned();
-        let webrtc_offer = offer_media
-            .as_ref()
-            .is_some_and(|m| m.proto == "UDP/TLS/RTP/SAVPF" && m.fingerprint.is_some());
+        // WebRTC detection (RFC 5763/5764): a secure-proto m-line —
+        // UDP/TLS/RTP/SAVPF media or UDP/DTLS/SCTP data channels (RFC 8841)
+        // — with a DTLS fingerprint (m-line or session level) runs the leg
+        // over ICE → DTLS → SRTP instead of plaintext RTP.  On a WebRTC
+        // offer we do NOT bind a plain socket — the ICE agent's socket IS
+        // the media socket and its port goes into the answer.
+        let webrtc_offer = offer.medias.iter().any(|m| {
+            (m.proto == "UDP/TLS/RTP/SAVPF" || m.proto == "UDP/DTLS/SCTP")
+                && (m.fingerprint.is_some() || offer.fingerprint.is_some())
+        });
+        // The media transport negotiates on the (first) RTP m-line; a pure
+        // data-channel offer falls back to the first m-line (an application
+        // m-line carries the same ICE/DTLS fields).
+        let offer_media = offer
+            .medias
+            .iter()
+            .find(|m| m.proto == "UDP/TLS/RTP/SAVPF")
+            .or_else(|| offer.medias.first())
+            .cloned();
+        // RFC 8841 data-channel negotiation: the offer's application m-line
+        // (and its `a=sctp-port`, defaulting per RFC 8841 §4.1 to 5000).
+        let dc_offer = offer
+            .medias
+            .iter()
+            .any(|m| m.media == "application" && m.proto == "UDP/DTLS/SCTP" && m.port != 0);
+        let remote_sctp_port = offer
+            .medias
+            .iter()
+            .filter(|m| m.media == "application")
+            .find_map(|m| {
+                m.attributes
+                    .iter()
+                    .find(|a| a.name == "sctp-port")
+                    .and_then(|a| a.value.as_deref())
+                    .and_then(|v| v.parse::<u16>().ok())
+            })
+            .unwrap_or(datachan::DEFAULT_SCTP_PORT);
         let (a_sock, a_webrtc, a_port) = if webrtc_offer {
             let m = offer_media.as_ref().expect("checked above");
             match webrtc::WebRtcMedia::prepare(m).await {
@@ -1041,7 +1078,11 @@ impl B2bua {
                 return;
             }
         };
-        let a_plan = stream_plans(&answer).into_iter().next();
+        // The codec-bearing plan (the audio m-line) drives the pump; with
+        // an application m-line first in the offer, plans[0] has no codec.
+        let a_plan = stream_plans(&answer)
+            .into_iter()
+            .find(|p| p.codec.is_some());
 
         let from = req.headers.get("From").unwrap_or("").to_string();
         let to = req.headers.get("To").unwrap_or("").to_string();
@@ -1175,6 +1216,10 @@ impl B2bua {
             .map(|c| c.seq.saturating_add(1))
             .unwrap_or(1);
         let mut call = Call::new(answer.serialize(), offer_b);
+        // The answer accepted the data channel iff the offer carried one and
+        // the leg negotiated WebRTC (the SDP layer answers application
+        // m-lines only on webrtc legs) — the establishment spawns the engine.
+        call.a_dc_port = dc_offer.then_some(remote_sctp_port);
         call.a_rel = a_rel;
         let leg_a = Leg {
             call_id: call_id.clone(),
@@ -1191,6 +1236,7 @@ impl B2bua {
             timer: leg_a_timer,
             last_prack: None,
             webrtc: a_webrtc,
+            dc: None,
         };
         call.leg_a = Some(leg_a);
         call.a_tx = Some(a_tx);
@@ -1211,6 +1257,7 @@ impl B2bua {
             timer: None,
             last_prack: None,
             webrtc: None,
+            dc: None,
         });
         b_to_a.insert(b_call_id, call_id.clone());
         self.cdr
@@ -1406,6 +1453,7 @@ impl B2bua {
         // tears the call down (488/BYE) instead of degrading.
         let mut a_crypto: Option<media::CryptoPair> = None;
         let mut a_pair_remote: Option<SocketAddr> = None;
+        let mut a_dtls_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>> = None;
         if let Some(a) = call.leg_a.as_mut() {
             if let Some(w) = a.webrtc.take() {
                 match w.establish().await {
@@ -1416,9 +1464,30 @@ impl B2bua {
                             "WebRTC leg up: ICE + DTLS({}) + SRTP",
                             est.crypto.tx.profile().dtls_name().unwrap_or("?")
                         );
-                        a.rtp = Some(est.socket);
+                        a.rtp = Some(est.socket.clone());
                         a_pair_remote = Some(est.remote);
                         a_crypto = Some(est.crypto);
+                        // Data channels ride the SAME DTLS association
+                        // (RFC 8261): hand the endpoint to the engine and
+                        // give the pump the DTLS-record forwarder.
+                        if let Some(remote_sctp_port) = call.a_dc_port {
+                            let (dtls_tx, dtls_rx) = tokio::sync::mpsc::unbounded_channel();
+                            let dc = datachan::spawn(
+                                datachan::DataChannelConfig {
+                                    remote_sctp_port,
+                                    ..datachan::DataChannelConfig::default()
+                                },
+                                est.dtls,
+                                est.socket.clone(),
+                                est.remote,
+                                dtls_rx,
+                            );
+                            a.dc = Some(dc);
+                            a_dtls_tx = Some(dtls_tx);
+                        }
+                        // Without a negotiated data channel the DTLS
+                        // association has nothing left to carry — dropping
+                        // it here is the documented lifecycle.
                     }
                     Err(e) => {
                         tracing::warn!(call_id = %a_id, "WebRTC establishment failed: {e}");
@@ -1470,6 +1539,9 @@ impl B2bua {
                             nack: pa.rtcp_fb_nack,
                             twcc_ext: pa.twcc_ext_id,
                             rtcp_interval_ms: 5_000,
+                            // RFC 7983 DTLS records → the data-channel
+                            // engine (None drops them, per the pump).
+                            dtls_tx: a_dtls_tx.take(),
                         };
                         let cfg_b = PumpConfig {
                             rx_codec: cb,
@@ -1481,6 +1553,8 @@ impl B2bua {
                             nack: pb.rtcp_fb_nack,
                             twcc_ext: pb.twcc_ext_id,
                             rtcp_interval_ms: 5_000,
+                            // Leg B is a plain RTP/AVP leg: no DTLS seam.
+                            dtls_tx: None,
                         };
                         // Cross-connect the pumps: A's decoded bridge PCM feeds
                         // B's encoder and vice versa.

@@ -224,9 +224,22 @@ pub fn build_offer(host: &str, port: u16, codecs: &[CodecId], sess_id: u32) -> S
     }
 }
 
+/// SCTP port the data-channel association answers with (RFC 8841
+/// `a=sctp-port`; the m= line port is the UDP/ICE transport port). Matches
+/// the `sctp::SctpConfig` default the data-channel engine runs with.
+pub const SCTP_PORT: u16 = 5000;
+/// `a=max-message-size` we answer with — mirrors the engine's
+/// `SctpConfig::default().max_message_size` (256 KiB).
+pub const MAX_MESSAGE_SIZE: u32 = 256 * 1024;
+
 /// Builds the answer for an inbound offer using local capabilities.
-/// `webrtc` carries the ICE/DTLS fields when the leg negotiated
-/// UDP/TLS/RTP/SAVPF (None on plain RTP/AVP legs).
+///
+/// Every m-line is answered positionally (RFC 3264 §6 — an m-line is never
+/// omitted): the FIRST audio m-line is accepted (port = `port`), the FIRST
+/// `m=application` UDP/DTLS/SCTP line is accepted as an RFC 8841 data
+/// channel ONLY when the leg negotiated WebRTC (`webrtc` present — SCTP
+/// rides the same ICE/DTLS transport), and every other m-line (second
+/// audio, video, exotic application transports) is rejected with port 0.
 pub fn answer(
     offer: &Session,
     host: &str,
@@ -234,11 +247,67 @@ pub fn answer(
     codecs: &[CodecId],
     webrtc: Option<WebrtcAnswerCaps>,
 ) -> Result<Session, NegotiateError> {
-    let mut caps = audio_caps(host, port, codecs);
-    if let Some(w) = webrtc {
-        w.apply(&mut caps);
-    }
-    answer_session(offer, &[caps])
+    let mut audio_taken = false;
+    let mut app_taken = false;
+    let caps: Vec<MediaCaps> = offer
+        .medias
+        .iter()
+        .map(|m| match m.media.as_str() {
+            "audio" if !audio_taken => {
+                audio_taken = true;
+                let mut caps = audio_caps(host, port, codecs);
+                if let Some(w) = webrtc.clone() {
+                    w.apply(&mut caps);
+                }
+                caps
+            }
+            "application" if !app_taken => {
+                app_taken = true;
+                let mut caps = MediaCaps::application(
+                    host,
+                    port,
+                    sdp::DataChannelCaps {
+                        sctp_port: SCTP_PORT,
+                        max_message_size: MAX_MESSAGE_SIZE,
+                    },
+                );
+                if let Some(w) = webrtc.clone() {
+                    w.apply(&mut caps);
+                }
+                caps
+            }
+            // Second audio m-line, video, or any application offer on a
+            // plain-RTP leg: build a kind-matching slot so answer_session
+            // rejects it with port 0 instead of a caps-count error.
+            "audio" => {
+                let mut caps = audio_caps(host, 0, codecs);
+                if let Some(w) = webrtc.clone() {
+                    w.apply(&mut caps);
+                }
+                caps
+            }
+            "application" => {
+                let mut caps = MediaCaps::application(
+                    host,
+                    0,
+                    sdp::DataChannelCaps {
+                        sctp_port: SCTP_PORT,
+                        max_message_size: MAX_MESSAGE_SIZE,
+                    },
+                );
+                if let Some(w) = webrtc.clone() {
+                    w.apply(&mut caps);
+                }
+                caps
+            }
+            other => {
+                let mut caps = MediaCaps::audio(host, 0, Vec::new());
+                caps.media = other.to_owned();
+                caps
+            }
+        })
+        .collect();
+    answer_session(offer, &caps)
 }
 
 /// Extracts the (codec-name, clock, channels) and payload type the plan uses.

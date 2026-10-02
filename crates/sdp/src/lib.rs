@@ -15,8 +15,8 @@ pub mod parse;
 pub mod types;
 
 pub use negotiate::{
-    answer_direction, answer_session, stream_plans, CodecCap, IceCreds, MediaCaps, NegotiateError,
-    StreamPlan,
+    answer_direction, answer_session, stream_plans, CodecCap, DataChannelCaps, IceCreds, MediaCaps,
+    NegotiateError, StreamPlan,
 };
 pub use parse::{parse, SdpError, SdpErrorKind};
 pub use types::{

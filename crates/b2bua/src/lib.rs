@@ -50,6 +50,7 @@
 //! CDR events are emitted for every leg transition and call termination on an
 //! [`tokio::sync::mpsc::UnboundedSender`].
 
+pub mod datachan;
 pub mod engine;
 pub mod media;
 pub mod rel100;

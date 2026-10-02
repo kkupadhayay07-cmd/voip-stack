@@ -814,3 +814,79 @@ fn sack_a_rwnd_discounts_undelivered_bytes() {
         "a_rwnd must discount the undelivered payload bytes"
     );
 }
+
+/// RFC 8832 §5.1 wire-form pin: DATA_CHANNEL_OPEN rides PPID 50
+/// (WEBRTC_DCEP) — not 51. A real peer dispatches on the spec value and
+/// silently ignores anything else, so a wrong PPID is invisible to a
+/// self-roundtrip test (the Task 43 lesson): the emitted chunk itself is
+/// inspected here.
+#[test]
+fn dcep_open_rides_ppid_50_per_rfc8832() {
+    let mut h = Harness::new();
+    h.handshake();
+    assert!(h.client.is_established());
+
+    let stream = h
+        .client
+        .open_data_channel("chat", "", ChannelType::Reliable, h.now)
+        .unwrap();
+    assert_eq!(stream, 1, "association initiator uses odd ids");
+    h.drain_to_net();
+
+    let mut opens = 0;
+    for (_, pkt) in &h.net {
+        let parsed = parse_packet(pkt, false).unwrap();
+        for chunk in parsed.chunks {
+            if let Chunk::Data(d) = chunk {
+                if d.ppid == sctp::dcep::PPID_DCEP {
+                    assert_eq!(d.stream, stream);
+                    assert_eq!(d.payload[0], sctp::dcep::MSG_OPEN);
+                    opens += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(opens, 1, "exactly one DATA chunk carries the DCEP OPEN");
+    // Deliver it: the server must open the channel and ack in-band.
+    h.deliver_all();
+    let events = h.take_server_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SctpEvent::DataChannelOpen { stream: 1, .. })),
+        "server must surface the peer's DCEP OPEN: {events:?}"
+    );
+}
+
+/// A user message whose PPID is NOT the DCEP value must be delivered as a
+/// user message — the PPID-51 dispatch bug would have swallowed RFC 8831
+/// string data (PPID 51) into the DCEP path forever.
+#[test]
+fn user_data_on_non_dcep_ppids_is_delivered() {
+    let mut h = Harness::new();
+    h.handshake();
+    h.client
+        .open_data_channel("chat", "", ChannelType::Reliable, h.now)
+        .unwrap();
+    h.drain_to_net();
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all(); // ack crosses back
+    assert!(h
+        .take_client_events()
+        .iter()
+        .any(|e| matches!(e, SctpEvent::DataChannelAck { stream: 1 })));
+
+    for ppid in [51u32, 53, 60_000] {
+        h.client
+            .send_message(1, ppid, vec![0x55; 40], h.now)
+            .unwrap();
+        h.drain_to_net();
+        h.deliver_all();
+    }
+    let got = msgs(&h.take_server_events());
+    assert_eq!(got.len(), 3, "every user message must arrive");
+    for (i, (_, data)) in got.iter().enumerate() {
+        assert_eq!(data, &vec![0x55; 40], "message {i} payload intact");
+    }
+}

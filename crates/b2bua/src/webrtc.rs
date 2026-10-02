@@ -74,7 +74,8 @@ pub struct WebRtcMedia {
     dtls: DtlsEndpoint,
 }
 
-/// An established transport: pump-ready socket + SRTP sessions.
+/// An established transport: pump-ready socket + SRTP sessions + the live
+/// DTLS association (the RFC 8261 seam for SCTP data channels).
 pub struct EstablishedMedia {
     /// The remote address ICE nominated (the pump's send target).
     pub remote: SocketAddr,
@@ -83,6 +84,10 @@ pub struct EstablishedMedia {
     /// SRTP sessions keyed from the DTLS handshake (we were the DTLS
     /// client, so the client key material protects our outbound stream).
     pub crypto: CryptoPair,
+    /// The DTLS endpoint, still alive post-handshake. Application data
+    /// (SCTP packets, RFC 8261) flows through `send_app_data` /
+    /// `recv_app_data`; dropping it closes the DTLS association.
+    pub dtls: DtlsEndpoint,
 }
 
 impl WebRtcMedia {
@@ -179,6 +184,9 @@ impl WebRtcMedia {
             remote,
             socket: Arc::new(socket),
             crypto: CryptoPair { tx, rx },
+            // The DTLS association outlives the handshake: data channels
+            // (RFC 8261) ride it from here on.
+            dtls: self.dtls,
         })
     }
 }

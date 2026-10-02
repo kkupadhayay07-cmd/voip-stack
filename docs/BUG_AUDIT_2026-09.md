@@ -89,7 +89,7 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **628 passing** across 63 suites, `clippy -D warnings`
+`cargo test --workspace` → **634 passing** across 64 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
 **The external audit is fully closed**: every finding at every severity —
@@ -266,3 +266,27 @@ second engine — the 488-rejection test lives in its own test binary.
 
 Net after Task 48: **628 tests / 63 suites** (was 626/61) — b2bua +2
 integration tests + 2 new suites (`webrtc_leg`, `webrtc_reject`).
+
+## Task 49 — data channels over DTLS: the integration test caught a real spec bug
+
+The `webrtc_datachan` loopback (mini WebRTC caller: ICE controlling, DTLS
+server, SCTP responder) opened a channel and sent user messages — and every
+message vanished. The root cause was NOT in the new wiring: **the sctp
+engine's DCEP OPEN rode PPID 51 while RFC 8832 §5.1 puts both DCEP messages
+(DATA_CHANNEL_OPEN and DATA_CHANNEL_ACK) on PPID 50** — a Task 46 defect of
+exactly the Task 43 "self-consistent wire form" class: every roundtrip test
+passed because both ends agreed on the wrong value, while a real browser's
+PPID-50 OPEN would have been treated as user data and dropped (and our OPEN
+would have been ignored by every peer). Fixed (`PPID_DCEP = 50`) and pinned
+two ways:
+
+| # | Finding | Severity | Fix |
+|---|---------|----------|-----|
+| P1 | DCEP OPEN emitted with PPID 51 (RFC 8832 §5.1: PPID 50 for BOTH DCEP messages) — interoperability-fatal, invisible to self-roundtrips | **Critical** (interop) | `PPID_DCEP = 50`; regression test parses the emitted DATA chunk and asserts PPID 50 + the 0x03 OPEN marker (the Task 43 lesson applied: inspect the wire, never trust a roundtrip) |
+| P2 | User messages whose PPID collided with the (wrong) DCEP dispatch were silently swallowed — my test picked PPID 51 (the RFC 8831 "WebRTC String" PPID) for user data and the engine dispatched it into the DCEP parser | **Major** (interop) | DCEP dispatch now keys on PPID 50 only; regression test sends RFC 8831 PPIDs 51/53/60000 and asserts delivery as user messages |
+| D1 | `dtls` post-handshake app-data reads truncated a datagram to the caller's buffer with no error (the queue transport's `read` copies `min(len)`), and OpenSSL does NOT fragment app-data writes to the handshake MTU — a peer record can legitimately exceed one MTU; a truncated record fails its MAC and is dropped silently | **Major** (integration — found by my own first-draft test) | `recv_app_data` enforces a ≥ 18_432-byte buffer (largest DTLS record = 2^14 + overhead) and documents why; the engine uses 64 KiB; the test that exposed it is kept as the pin (2048-byte buffer → 3037-byte record → zero bytes decoded) |
+| D2 | Multi-m-line offers (any browser sends audio + video + application) failed `CapsCountMismatch` → 488 | **Major** (coverage) | `sdp_util::answer` walks every m-line positionally: first audio + first application (RFC 8841, WebRTC legs only) accepted, everything else rejected port 0 per RFC 3264 §6 — never a caps-count error |
+
+Net after Task 49: **634 tests / 64 suites** (was 628/63) — dtls 10→11,
+sdp 31→33, sctp 49→51 (+2 spec pins), b2bua 39→40 + the `webrtc_datachan`
+suite.

@@ -231,10 +231,12 @@ configured bounds. Guidance:
    RFC 3758 FORWARD-TSN, transport-agnostic for RFC 8261 DTLS
    encapsulation) **and the B2BUA WebRTC leg ✅ shipped** (SAVPF offers
    answered with ICE → DTLS-SRTP → SRTP pump crypto; SRTP-only media, no
-   plaintext fallback; ICE+DTLS+SRTP loopback integration test);
-   remaining: SCTP data channels over the established DTLS (RFC 8261),
-   offerer-side (leg B) WebRTC (until then `m=application` offers are
-   answered port-0 honestly).
+   plaintext fallback; ICE+DTLS+SRTP loopback integration test) **and
+   data channels over DTLS ✅ shipped** (`m=application` answered per
+   RFC 8841, the SCTP association rides the established DTLS per RFC 8261,
+   DCEP channels open across the B2BUA with message echo, SCTP+SRTP
+   coexistence loopback test);
+   remaining: offerer-side (leg B) WebRTC.
 5. **Container entrypoint** — wire `zrtc` as the image entrypoint with a
    mounted config + real healthcheck.
 6. **SDP hardening** (rejected m-lines, port-0 answers, the RFC 3264 §6.1

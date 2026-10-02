@@ -25,8 +25,8 @@ transport-cc) and SIP RFC 5626 Outbound + RFC 5627 GRUU, WebRTC data
 classes end to end at the protocol layer (RFC 9260/4960 SCTP engine,
 RFC 8832 DCEP, RFC 3758 FORWARD-TSN in the `sctp` crate), and WebRTC MEDIA
 legs in the B2BUA (RFC 5763/5764/8445/3711: SAVPF offers answered with ICE
-→ DTLS-SRTP → SRTP pump crypto); 628 tests green
-across 63 suites — **every audit finding at every severity is fixed**).
+→ DTLS-SRTP → SRTP pump crypto); 634 tests green
+across 64 suites — **every audit finding at every severity is fixed**).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
@@ -78,9 +78,12 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC 8445 | ICE | **Done** (core) | `ice::agent`: candidate gathering (host/srflx/relay), priorities (§5.1.2.1), connectivity checks with short-term creds, role + tie-breaker, USE-CANDIDATE nomination, keepalives, prflx discovery; SDP candidate lines parse IPv6 (bare + bracketed, RFC 8839 §5.1). Triggered-check pacing simplified (all-pairs-at-once; documented). **Live in the B2BUA answerer**: gathers a host candidate, adopts the offer's credentials/candidates, re-issues checks every 500 ms until nomination (the answerer's first burst races the 200 OK carrying the credentials). |
 | RFC 5766 | TURN server | **Done** (core) | Allocation (long-term MD5 auth), refresh, CreatePermission, Send/Data indications, ChannelBind; per-allocation relay sockets pumped concurrently; permission enforcement on both paths. TCP allocations, ReservationToken and mobility not implemented. |
 | RFC 5766 | TURN client | **Done** | Agent-side allocation flow: 401 → credentials → verified response (MD5 long-term key pinned by independent known vectors), plus the unauthenticated path with idempotent re-Allocate per RFC 5766 §6.2; used for relay candidate gathering. |
-| RFC 7983 | Demultiplexing STUN/DTLS/RTP | **Done** | First-byte classification in the ICE agent; the media pump drops STUN (0–3) and DTLS (20–63) before the RTP/RTCP parsers on secured legs; the DTLS handshake driver feeds the state machine only datagrams whose first byte is a DTLS record (20–63), so ICE keepalives on the same address cannot reach OpenSSL. |
+| RFC 7983 | Demultiplexing STUN/DTLS/RTP | **Done** | First-byte classification in the ICE agent; the media pump drops STUN (0–3) before the RTP/RTCP parsers and forwards DTLS records (20–63) to the data-channel engine when the leg negotiated one (dropping them otherwise); the DTLS handshake driver feeds the state machine only datagrams whose first byte is a DTLS record (20–63), so ICE keepalives on the same address cannot reach OpenSSL. |
 | RFC 9260/4960 | SCTP (data-channel transport) | **Done** (engine subset) | `sctp` crate: common header with CRC32c (pinned entry-for-entry to the RFC 9260 Appendix A reference table + the CRC-32/ISCSI check value), four-way handshake with an HMAC-SHA256-protected state cookie (stale-cookie refresh from the retained INIT — the refresh carries the §5.1.5 Stale-Cookie cause with measured staleness — forged cookies silently discarded, cookie secret/tag/TSN OS-entropy seeded with a random cookie nonce inside the MAC'd region), verification-tag rules (INIT vtag 0, T-bit reflected ABORT/SHUTDOWN-COMPLETE, uninvited-INIT collision guard §8.5.1(E)), TSN window with gap-block SACKs + duplicate reporting, T3-RTX with RFC 6298 RTO (Karn's rule, T1 retransmit backoff), cwnd slow start/CA + peer a_rwnd flow control (the advertised window discounts ALL received-undelivered bytes per §6.2.1), message fragmentation, ordered/unordered reassembly (unordered delivers on arrival; TSN contiguity gates only ordered delivery), HEARTBEAT/ACK, graceful SHUTDOWN (deferred until outstanding acked, T2-SHUTDOWN retransmission with backoff per §9.1) + ABORT. Timer-handler ordering is pinned by a regression test (the lifetime sweep runs before T3 so an expired message can never be retransmitted). Hardened by the Task 47 audit round (1 Critical + 5 Major + 9 minor closed with regressions; deferred: fast retransmit on gap-acks, zero-window probe, oversize-inbound discard instead of abort). Transport-agnostic packet seam (`handle_packet`/`drain_outbound`); not implemented: multi-homing, restart, RFC 5061 re-config, RFC 6525 stream reset, ECN, unknown-chunk ERROR reports (skip-class honored). |
-| RFC 8832 | DCEP (data channel establishment) | **Done** (protocol layer) | `sctp::dcep`: DATA_CHANNEL_OPEN/ACK with all three reliability classes (reliable, max-retransmits, max-packet-lifetime) × ordered/unordered (0x00–0x02, 0x80–0x82), the single-byte ACK, UTF-8 label/protocol, OPEN dispatched through the ordered pipeline so stream sequence numbers stay consistent, duplicate OPEN → protocol-violation ABORT, stream-id parity per §6 (association initiator odd, responder even — pinned by test). Channels carry the reliability policy into the association's send path. |
+| RFC 8832 | DCEP (data channel establishment) | **Done** (live in the B2BUA) | `sctp::dcep`: DATA_CHANNEL_OPEN/ACK with all three reliability classes (reliable, max-retransmits, max-packet-lifetime) × ordered/unordered (0x00–0x02, 0x80–0x82), the single-byte ACK, UTF-8 label/protocol, OPEN dispatched through the ordered pipeline so stream sequence numbers stay consistent, duplicate OPEN → protocol-violation ABORT, stream-id parity per §6 (association initiator odd, responder even — pinned by test), and the §5.1 wire form pinned: BOTH DCEP messages ride PPID 50 (a wire test parses the emitted chunk; the original engine shipped OPEN on PPID 51 — invisible to self-roundtrips, fatal to real peers). Channels carry the reliability policy into the association's send path. |
+
+| RFC 8261 | SCTP over DTLS | **Done** (live in the B2BUA) | An SCTP packet is the entire DTLS application payload (no extra header): `dtls::DtlsEndpoint::send_app_data`/`recv_app_data` drive post-handshake OpenSSL over the leg's queue transport (recv buffer sized for the largest DTLS record — the queue truncates silently), the B2BUA's data-channel engine owns the live DTLS association after keying, the leg pump forwards RFC 7983 DTLS records (20–63) into it, and the engine encrypts SCTP→DTLS→UDP with no SRTP involvement. The B2BUA (DTLS client) initiates the association. Verified by the `webrtc_datachan` loopback (channel open + fragmented 2000 B message echo while SRTP audio coexists). |
+| RFC 8841 | SDP offer/answer for data channels | **Done** (answerer) | `sdp::negotiate`: an `m=application 9 UDP/DTLS/SCTP webrtc-datachannel` offer with data-channel caps is answered in kind — proto + format mirrored, real port, `a=sctp-port` (default 5000 per §4.1) + `a=max-message-size` (256 KiB) emitted as raw attributes, mid/ICE/candidates/fingerprint/setup echoed with the inverse setup role, parse→serialize fixed point; without caps (plain-RTP legs) the m-line is rejected port 0 per RFC 3264 §6, as are wrong-proto formats. The B2BUA's answer engine walks every m-line positionally (first audio + first application accepted, everything else port 0). |
 | RFC 3758 | PR-SCTP (partial reliability) | **Done** (engine layer) | `sctp::assoc`: sender-side abandonment for both policies (max-retransmits counts per T3 fire; max-packet-lifetime swept by first-send age) with whole-message abandonment granularity, FORWARD-TSN emission only up to the point where everything below is abandoned/acked (ordered streams carry one (SID, SSN) skip entry per abandoned stream — max SSN, one entry per stream per §3.2 — never re-generated as fresh reports), receiver-side advance (out-of-order purge below the point, ordered-SSN skip, partial-run discard), the emitted FORWARD-TSN is retransmitted until the receiver's SACK cum_tsn covers it (§3.5 — a lost FORWARD-TSN no longer stalls ordered delivery), and PR degrades to reliable automatically when the peer did not advertise FORWARD-TSN support (RFC 3758 §3.1). |
 
 ## 3. Codecs
@@ -150,8 +153,12 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
   a leg that negotiated SAVPF has NO plaintext fallback; a SAVPF offer
   without ICE credentials is rejected 488). Verified end to end by an
   ICE+DTLS+SRTP loopback integration test through the transcode bridge.
-  Remaining: SCTP data channels over the established DTLS (RFC 8261 —
-  engine ready, seam pending), offerer-side (leg B) WebRTC, trickle ICE.
+  **Data channels: DONE over the same leg** — `m=application` answered per
+  RFC 8841, the SCTP association rides the established DTLS (RFC 8261),
+  DCEP channels open across the B2BUA and messages echo (fragmentation
+  included) while media flows. Remaining: offerer-side (leg B) WebRTC,
+  trickle ICE, data-channel application semantics beyond echo (a real
+  messaging API is engine-level today).
 * **RTCP non-mux addressing (RFC 3550 §11)**: the media pump is mux-only;
   peers that refuse `a=rtcp-mux` would address RTCP at the RTP port+1,
   which we never bind (their feedback would be lost). We now at least
@@ -172,7 +179,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **628 passing across 63 suites**.
+  `cargo test --workspace` → **634 passing across 64 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16 + §17.1/§17.3
   SRTCP AEAD), STUN (RFC 5769 §2.1/§2.2; MD5 long-term keys + MESSAGE-INTEGRITY
   against independent vectors), G.729 (bcg729 oracle), cross-decode by ffmpeg.

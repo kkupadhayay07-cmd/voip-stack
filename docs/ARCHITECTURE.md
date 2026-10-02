@@ -77,10 +77,11 @@ this repository's code.
         │    sdp     │                     │ ai-bridge (AudioSocket/WS)   │
         │ offer/answer│                    └──────────────────────────────┘
         └────────────┘   data channels  ┌──────────────────────────────┐
-                         (engine only,  │            sctp              │
-        (attaches over  no I/O)         │ CRC32c wire codec, cookie    │
+                         (live on the   │            sctp              │
+        (attaches over  B2BUA's DTLS:   │ CRC32c wire codec, cookie    │
         DTLS via the    ┌───────────────│ handshake, TSN/SACK, T3-RTX, │
-        packet seam)                    │ DCEP channels, FORWARD-TSN   │
+        packet seam)    │ b2bua datachan│ DCEP channels, FORWARD-TSN   │
+                        └───────────────┤ (RFC 8261/8841 wired)        │
                                         └──────────────────────────────┘
 ```
 
@@ -90,10 +91,10 @@ leaves (`sctp`'s only dependency is `sha2`/`hmac` for the state-cookie MAC);
 the workspace (`sip-tx` consumes only `sip-core` types); `observ` and `api`
 observe rather than participate in media. No cycles, no cross-cutting
 "common" crate — shared types live in the layer that owns them. The `sctp`
-engine, like `ice`/`dtls`/`srtp`, is a library layer awaiting the B2BUA
-WebRTC leg: it speaks packets in/out through a seam (`handle_packet` /
-`drain_outbound`) so the RFC 8261 DTLS encapsulation — and only that —
-belongs to the future caller.
+engine, like `ice`/`dtls`/`srtp`, is a library layer; the RFC 8261 DTLS
+encapsulation lives in its one caller — `b2bua::datachan`, which owns the
+established DTLS association on a WebRTC leg and drives the engine through
+the seam.
 
 ### 2.2 Target architecture (Phases 1–6)
 
@@ -234,27 +235,36 @@ opened BEFORE parsing, an unprotectable datagram is counted and dropped,
 and a leg that negotiated SAVPF has no plaintext fallback. A SAVPF offer
 without ICE credentials is rejected 488.
 
-### 5.4 Data channels (library layer — SCTP engine ready, DTLS transport now exists)
+### 5.4 Data channels (live: SCTP over the B2BUA's established DTLS)
 
-The `sctp` crate holds the full data-channel protocol engine with NO
-transport attached: `SctpEndpoint::handle_packet(bytes)` consumes one SCTP
-packet and `drain_outbound()` yields the response packets — the caller
-wraps each in a DTLS application record (RFC 8261) over the ICE channel.
-Inside: CRC32c-checked chunk codec, four-way cookie handshake (server
-cookie = HMAC-SHA256 over the handshake state, stale cookies refresh from
-the retained INIT), TSN window with gap-block SACKs, T3-RTX with RFC 6298
-RTO, fragmentation + ordered/unordered reassembly, RFC 8832 DCEP channel
-establishment (OPEN rides the ordered pipeline; stream-id parity: INIT
-sender odd, responder even), RFC 3758 partial reliability with
-FORWARD-TSN, graceful SHUTDOWN and ABORT. All timers are caller-driven
-(`poll_timeout` + `on_timeout(now)`), so the engine is testable on a
-virtual clock — the lossy-loopback suite pins gap recovery, PR
-abandonment, forged cookies and the timer ordering that prevents a
-retransmission of an expired message. The DTLS transport the data
-channels will ride now EXISTS (see §5.2's WebRTC leg); until the SCTP
-engine is attached to it, the SDP engine answers `m=application` offers
-with port 0 (RFC 3264 §6) so the negotiation never promises a channel
-the media pump cannot serve.
+The `sctp` crate holds the full data-channel protocol engine:
+`SctpEndpoint::handle_packet(bytes)` consumes one SCTP packet and
+`drain_outbound()` yields the response packets. Inside: CRC32c-checked
+chunk codec, four-way cookie handshake (server cookie = HMAC-SHA256 over
+the handshake state, stale cookies refresh from the retained INIT), TSN
+window with gap-block SACKs, T3-RTX with RFC 6298 RTO, fragmentation +
+ordered/unordered reassembly, RFC 8832 DCEP channel establishment (OPEN
+rides the ordered pipeline; stream-id parity: INIT sender odd, responder
+even; both DCEP messages ride PPID 50 — pinned by a wire test), RFC 3758
+partial reliability with FORWARD-TSN, graceful SHUTDOWN and ABORT. All
+timers are caller-driven (`poll_timeout` + `on_timeout(now)`), so the
+engine is testable on a virtual clock.
+
+The transport is now WIRED (Task 49): on a WebRTC leg whose offer carries
+`m=application UDP/DTLS/SCTP` (answered per RFC 8841), the `b2bua::datachan`
+engine owns the established DTLS association (`EstablishedMedia` hands the
+live `DtlsEndpoint` over instead of dropping it) and runs a single task
+racing three inputs — DTLS records forwarded by the media pump (RFC 7983
+first-byte 20–63), application commands, and the association's timer wheel.
+Every SCTP packet is the entire DTLS application payload (RFC 8261): out via
+`send_app_data` → `take_outbound` → the leg socket (no SRTP — DTLS records
+are their own protection), in via the pump → `recv_app_data` (buffer sized
+for the largest DTLS record; the queue transport truncates silently) →
+`handle_packet`. The B2BUA is the DTLS client (`setup:active`), so it is the
+association initiator. Peer-opened channels are acknowledged in-band and
+received messages echo (the demo behavior; the API carries a send command
+for real applications). An SCTP+SRTP coexistence loopback test pins the
+whole path, including a fragmented 2000 B message.
 
 ### 5.5 Control & observability
 

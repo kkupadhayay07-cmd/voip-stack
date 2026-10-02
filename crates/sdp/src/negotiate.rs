@@ -46,6 +46,16 @@ pub struct IceCreds {
     pub pwd: String,
 }
 
+/// Local data-channel (RFC 8841) capabilities for an `m=application` m-line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataChannelCaps {
+    /// The SCTP port we answer with (`a=sctp-port`); the m= line port itself
+    /// is the UDP/ICE transport port when ICE is in play.
+    pub sctp_port: u16,
+    /// The largest message we accept (`a=max-message-size`).
+    pub max_message_size: u32,
+}
+
 /// One per-m-line set of local capabilities used to build an answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaCaps {
@@ -70,6 +80,11 @@ pub struct MediaCaps {
     pub fingerprint: Option<Fingerprint>,
     /// Role we assume when the offer says `actpass`.
     pub setup: SetupRole,
+    /// RFC 8841 data-channel capabilities. `None` answers every
+    /// `m=application` offer with port 0; `Some` answers the first
+    /// UDP/DTLS/SCTP m-line with `webrtc-datachannel` (the SCTP association
+    /// rides the leg's DTLS transport, RFC 8261).
+    pub data_channel: Option<DataChannelCaps>,
 }
 
 impl MediaCaps {
@@ -87,6 +102,28 @@ impl MediaCaps {
             ice_candidates: Vec::new(),
             fingerprint: None,
             setup: SetupRole::Active,
+            data_channel: None,
+        }
+    }
+
+    /// Application-m-line capabilities: a data channel on the leg's
+    /// ICE/DTLS transport. The direction/codec machinery of the audio path
+    /// does not apply (there is no codec negotiation on SCTP m-lines).
+    pub fn application(host: &str, port: u16, dc: DataChannelCaps) -> MediaCaps {
+        MediaCaps {
+            media: "application".to_owned(),
+            direction: Direction::SendRecv,
+            rtcp_mux: false,
+            codecs: Vec::new(),
+            telephone_event: None,
+            host: host.to_owned(),
+            port,
+            mid: None,
+            ice: None,
+            ice_candidates: Vec::new(),
+            fingerprint: None,
+            setup: SetupRole::Active,
+            data_channel: Some(dc),
         }
     }
 }
@@ -297,6 +334,122 @@ fn rejected_media(offer_m: &MediaDescription, offer: &Session) -> MediaDescripti
     }
 }
 
+/// Build the answer for one accepted `m=application` m-line (RFC 8841).
+///
+/// The transport machinery echoes the audio path (ICE credentials and
+/// candidates, DTLS fingerprint and the inverse setup role, mid) because the
+/// SCTP association rides the SAME ICE/DTLS transport as the leg's media —
+/// RFC 8261. Codec/direction/rtcp-fb negotiation does not exist on SCTP
+/// m-lines; `a=sctp-port` and `a=max-message-size` are emitted as raw
+/// attributes (no typed mirror — the parser keeps unknown attributes
+/// verbatim, so parse → serialize → parse stays a fixed point).
+fn answer_application_media(
+    offer_m: &MediaDescription,
+    offer: &Session,
+    caps_m: &MediaCaps,
+    dc: DataChannelCaps,
+) -> MediaDescription {
+    let (addr_type, _) = match offer_m.connection.as_ref().or(offer.connection.as_ref()) {
+        Some(c) if c.addr_type.eq_ignore_ascii_case("IP6") => ("IP6", "::"),
+        _ => ("IP4", "0.0.0.0"),
+    };
+    let mut m = MediaDescription {
+        media: "application".into(),
+        port: caps_m.port,
+        port_count: 1,
+        proto: offer_m.proto.clone(),
+        formats: vec!["webrtc-datachannel".into()],
+        info: None,
+        connection: Some(Connection {
+            net_type: "IN".into(),
+            addr_type: addr_type.into(),
+            address: caps_m.host.clone(),
+        }),
+        bandwidths: Vec::new(),
+        attributes: Vec::new(),
+        extras: Vec::new(),
+        rtpmaps: Default::default(),
+        fmtps: Default::default(),
+        rtcp_fb: Default::default(),
+        direction: None,
+        rtcp_mux: false,
+        mid: None,
+        ptime: None,
+        maxptime: None,
+        ice_ufrag: None,
+        ice_pwd: None,
+        ice_options: None,
+        ice_candidates: Vec::new(),
+        fingerprint: None,
+        setup: None,
+        rtcp_addr: None,
+        extmaps: Vec::new(),
+        ssrcs: Vec::new(),
+    };
+
+    m.attributes
+        .push(Attribute::new("sctp-port", Some(dc.sctp_port.to_string())));
+    m.attributes.push(Attribute::new(
+        "max-message-size",
+        Some(dc.max_message_size.to_string()),
+    ));
+
+    // mid echo (required for BUNDLE continuity, same as audio)
+    if let Some(mid) = &offer_m.mid {
+        m.mid = Some(mid.clone());
+        m.attributes.push(Attribute::new("mid", Some(mid.clone())));
+    }
+
+    // ICE echo (our credentials + gathered candidates)
+    if offer_m.ice_ufrag.is_some() || offer.ice_ufrag.is_some() {
+        if let Some(ice) = &caps_m.ice {
+            m.ice_ufrag = Some(ice.ufrag.clone());
+            m.ice_pwd = Some(ice.pwd.clone());
+            m.attributes
+                .push(Attribute::new("ice-ufrag", Some(ice.ufrag.clone())));
+            m.attributes
+                .push(Attribute::new("ice-pwd", Some(ice.pwd.clone())));
+        }
+        for line in &caps_m.ice_candidates {
+            let bare = line
+                .strip_prefix("a=")
+                .unwrap_or(line)
+                .strip_prefix("candidate:")
+                .unwrap_or(line);
+            m.ice_candidates.push(bare.to_owned());
+            m.attributes
+                .push(Attribute::new("candidate", Some(bare.to_owned())));
+        }
+    }
+
+    // DTLS fingerprint echo + inverse setup role (same rules as audio).
+    let offer_fp = offer_m
+        .fingerprint
+        .clone()
+        .or_else(|| offer.fingerprint.clone());
+    if offer_fp.is_some() {
+        if let Some(fp) = &caps_m.fingerprint {
+            m.fingerprint = Some(fp.clone());
+            m.attributes.push(Attribute::new(
+                "fingerprint",
+                Some(format!("{} {}", fp.hash_func, fp.value)),
+            ));
+        }
+        let offer_setup = offer_m.setup.or(offer.setup).unwrap_or(SetupRole::Actpass);
+        let role = match offer_setup {
+            SetupRole::Actpass => caps_m.setup,
+            SetupRole::Active => SetupRole::Passive,
+            SetupRole::Passive => SetupRole::Active,
+            SetupRole::Holdconn => SetupRole::Holdconn,
+        };
+        m.setup = Some(role);
+        m.attributes
+            .push(Attribute::new("setup", Some(role.as_str().to_owned())));
+    }
+
+    m
+}
+
 /// Build an RFC 3264 answer for `offer` from the per-m-line `caps`.
 pub fn answer_session(offer: &Session, caps: &[MediaCaps]) -> Result<Session, NegotiateError> {
     if caps.len() != offer.medias.len() {
@@ -347,6 +500,29 @@ pub fn answer_session(offer: &Session, caps: &[MediaCaps]) -> Result<Session, Ne
 
     for (i, offer_m) in offer.medias.iter().enumerate() {
         let caps_m = &caps[i];
+
+        // RFC 8841: m=application m-lines negotiate data channels, not RTP
+        // codecs — the audio path below (format resolution, direction
+        // clamping, rtcp-fb) does not apply. Answered only when the caps
+        // slot is application-typed AND carries data-channel capabilities
+        // AND the offer is a UDP/DTLS/SCTP webrtc-datachannel line; every
+        // other application offer is rejected with port 0 (RFC 3264 §6).
+        if offer_m.media == "application" {
+            let dc_ok = caps_m.media == "application"
+                && offer_m.port != 0
+                && caps_m.port != 0
+                && offer_m.proto == "UDP/DTLS/SCTP"
+                && offer_m.formats.iter().any(|f| f == "webrtc-datachannel");
+            match (dc_ok.then_some(()), caps_m.data_channel) {
+                (Some(()), Some(dc)) => {
+                    answer
+                        .medias
+                        .push(answer_application_media(offer_m, offer, caps_m, dc));
+                }
+                _ => answer.medias.push(rejected_media(offer_m, offer)),
+            }
+            continue;
+        }
 
         let mut m = if caps_m.media == offer_m.media {
             rejected_media(offer_m, offer)
@@ -734,13 +910,12 @@ a=ssrc:3520455752 cname:xyz\r\n";
     }
 
     #[test]
-    fn answer_rejects_data_channel_mline_until_webrtc_leg_exists() {
-        // An m=application offer (RFC 8841) cannot be honored yet: the media
-        // pump is RTP-only and the ICE/DTLS/SRTP leg is not wired, so the
-        // stream must be rejected with port 0 (RFC 3264 §6) — same rule the
-        // "offer what the pump actually does" lesson requires. The rejection
-        // preserves the m-line verbatim (proto + formats) so a future
-        // WebRTC leg can negotiate it.
+    fn answer_rejects_data_channel_mline_without_dc_caps() {
+        // An m=application offer (RFC 8841) is only answered when the caps
+        // slot carries data-channel capabilities (the SCTP-over-DTLS engine
+        // is wired on the leg). Without them the stream is rejected with
+        // port 0 (RFC 3264 §6) — "offer what the pump actually does". The
+        // rejection preserves the m-line verbatim (proto + formats).
         let offer_str = "v=0\r\n\
             o=- 1 1 IN IP4 1.2.3.4\r\n\
             s=-\r\n\
@@ -763,6 +938,95 @@ a=ssrc:3520455752 cname:xyz\r\n";
         // The audio stream is answered normally and keeps its position.
         assert_eq!(answer.medias[1].media, "audio");
         assert_eq!(answer.medias[1].port, caps_audio().port);
+    }
+
+    #[test]
+    fn answer_accepts_data_channel_mline_with_dc_caps() {
+        // With data-channel caps the m=application offer is answered in
+        // kind: proto + webrtc-datachannel mirrored, real port, sctp-port +
+        // max-message-size, and the leg's ICE/DTLS transport fields.
+        let offer_str = "v=0\r\n\
+            o=- 1 1 IN IP4 1.2.3.4\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 1.2.3.4\r\n\
+            m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+            a=mid:1\r\n\
+            a=sctp-port:5000\r\n\
+            a=max-message-size:1073741823\r\n\
+            a=setup:actpass\r\n\
+            a=fingerprint:sha-256 D2:FA:0E:C3:22:59:5E:14\r\n\
+            a=ice-ufrag:EsAw\r\n\
+            a=ice-pwd:P2uYro0UCOQ4zxjKXaWCBui1\r\n\
+            m=audio 5000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n";
+        let offer = parse(offer_str).unwrap();
+        let mut app_caps = MediaCaps::application(
+            "10.0.0.5",
+            20000,
+            DataChannelCaps {
+                sctp_port: 5000,
+                max_message_size: 262_144,
+            },
+        );
+        app_caps.ice = Some(IceCreds {
+            ufrag: "ourfrag".into(),
+            pwd: "ourpwd".into(),
+        });
+        app_caps.fingerprint = Some(Fingerprint {
+            hash_func: "sha-256".into(),
+            value: "AA:BB:CC:DD".into(),
+        });
+        let answer = answer_session(&offer, &[app_caps, caps_audio()]).unwrap();
+        assert_eq!(answer.medias.len(), 2);
+        let app = &answer.medias[0];
+        assert_eq!(app.media, "application");
+        assert_eq!(app.proto, "UDP/DTLS/SCTP");
+        assert_eq!(app.port, 20000);
+        assert_eq!(app.formats, vec!["webrtc-datachannel".to_string()]);
+        assert_eq!(app.mid.as_deref(), Some("1"));
+        assert_eq!(app.ice_ufrag.as_deref(), Some("ourfrag"));
+        assert_eq!(app.setup, Some(SetupRole::Active)); // actpass → active
+        let text = answer.serialize();
+        assert!(text.contains("a=sctp-port:5000\r\n"), "{text}");
+        assert!(text.contains("a=max-message-size:262144\r\n"), "{text}");
+        assert!(text.contains("a=setup:active\r\n"), "{text}");
+        // parse → serialize → parse fixed point with the raw sctp attrs.
+        let rt = parse(&text).unwrap();
+        assert_eq!(answer, rt);
+        // stream_plans: the application plan has no codec; the audio plan
+        // does. Callers pick the codec-bearing plan, not plans[0] blindly.
+        let plans = stream_plans(&answer);
+        assert_eq!(plans.len(), 2);
+        assert!(plans[0].codec.is_none());
+        assert_eq!(plans[1].codec.as_ref().unwrap().0, "PCMU");
+    }
+
+    #[test]
+    fn application_offer_wrong_proto_or_format_is_rejected() {
+        // Only UDP/DTLS/SCTP webrtc-datachannel is honored; exotic
+        // application transports (DTLS/SCTP without UDP, sctp beacon
+        // formats) are rejected even with dc caps.
+        let offer_str = "v=0\r\n\
+            o=- 1 1 IN IP4 1.2.3.4\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 1.2.3.4\r\n\
+            m=application 9 DTLS/SCTP webrtc-datachannel\r\n\
+            m=audio 5000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n";
+        let offer = parse(offer_str).unwrap();
+        let app_caps = MediaCaps::application(
+            "10.0.0.5",
+            20000,
+            DataChannelCaps {
+                sctp_port: 5000,
+                max_message_size: 262_144,
+            },
+        );
+        let answer = answer_session(&offer, &[app_caps, caps_audio()]).unwrap();
+        assert_eq!(answer.medias[0].port, 0);
+        assert_eq!(answer.medias[0].proto, "DTLS/SCTP");
     }
 
     #[test]

@@ -87,6 +87,11 @@ pub struct PumpConfig {
     pub twcc_ext: Option<u8>,
     /// Period of the RTCP sender report (ms; floored at 50 at use site).
     pub rtcp_interval_ms: u64,
+    /// Where post-handshake DTLS records (first byte 20–63, RFC 7983) go on
+    /// a WebRTC leg with data channels: the `datachan` engine decrypts them
+    /// into SCTP packets (RFC 8261). `None` drops the datagrams — a leg
+    /// without negotiated data channels has nothing behind the DTLS seam.
+    pub dtls_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 /// Handle for one running pump task.
@@ -511,14 +516,20 @@ async fn run_pump(
                     Ok(x) => x,
                     Err(e) => { tracing::debug!("media recv err: {e}"); continue; }
                 };
-                // RFC 7983 demultiplexing on a secured leg: STUN (0–3) and
-                // DTLS (20–63) bytes never reach the RTP/RTCP parsers —
-                // post-handshake STUN keepalives and stray DTLS datagrams
-                // are dropped here.
+                // RFC 7983 demultiplexing on a secured leg: STUN (0–3)
+                // never reaches the RTP/RTCP parsers; DTLS (20–63) is
+                // forwarded to the data-channel engine when the leg
+                // negotiated one (its records are the RFC 8261 SCTP seam)
+                // and dropped otherwise.
                 if crypto.is_some() {
                     match buf.first() {
                         Some(b) if *b <= 3 => continue,
-                        Some(b) if (20..=63).contains(b) => continue,
+                        Some(b) if (20..=63).contains(b) => {
+                            if let Some(tx) = &cfg.dtls_tx {
+                                let _ = tx.send(buf[..n].to_vec());
+                            }
+                            continue;
+                        }
                         _ => {}
                     }
                 }
@@ -1012,6 +1023,7 @@ mod tests {
             nack: false,
             twcc_ext: None,
             rtcp_interval_ms: 60_000,
+            dtls_tx: None,
         }
     }
 

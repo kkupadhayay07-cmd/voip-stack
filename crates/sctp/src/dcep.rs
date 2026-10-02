@@ -20,8 +20,16 @@
 
 use crate::wire::SctpError;
 
-pub const PPID_DCEP_OPEN: u32 = 51;
-pub const PPID_DCEP_ACK: u32 = 50;
+/// RFC 8832 §5.1: BOTH DCEP messages (DATA_CHANNEL_OPEN and
+/// DATA_CHANNEL_ACK) ride PPID 50 (`WEBRTC_DCEP`). Keeping the two
+/// historical names is deliberate — call sites document intent — but the
+/// value is the spec value for both; a real peer dispatches on 50 and
+/// ignores anything else (a PPID-51 OPEN silently vanishes on the wire).
+pub const PPID_DCEP_OPEN: u32 = PPID_DCEP;
+pub const PPID_DCEP_ACK: u32 = PPID_DCEP;
+
+/// THE DCEP PPID (RFC 8832 §5.1, `WEBRTC_DCEP`).
+pub const PPID_DCEP: u32 = 50;
 
 pub const MSG_OPEN: u8 = 0x03;
 pub const MSG_ACK: u8 = 0x02;

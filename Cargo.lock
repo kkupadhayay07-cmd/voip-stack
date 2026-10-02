@@ -184,6 +184,7 @@ dependencies = [
  "observ",
  "rand 0.8.8",
  "rtp",
+ "sctp",
  "sdp",
  "serde",
  "sip-core",

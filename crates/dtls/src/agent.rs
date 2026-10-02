@@ -278,6 +278,70 @@ impl DtlsEndpoint {
         Ok(())
     }
 
+    /// Send post-handshake application data (the RFC 8261 seam: an SCTP
+    /// packet becomes the whole DTLS application payload).
+    ///
+    /// The encrypted datagrams land in the outbound queue — the caller
+    /// drains them with [`Self::take_outbound`] and sends each one over the
+    /// leg socket. OpenSSL fragments oversized writes across records within
+    /// the configured MTU.
+    pub fn send_app_data(&mut self, bytes: &[u8]) -> Result<(), DtlsError> {
+        let mut off = 0;
+        while off < bytes.len() {
+            match self.stream.ssl_write(&bytes[off..]) {
+                Ok(0) => {
+                    return Err(DtlsError::Handshake(
+                        "app-data write made no progress".into(),
+                    ))
+                }
+                Ok(n) => off += n,
+                Err(e) => match e.code() {
+                    openssl::ssl::ErrorCode::WANT_READ | openssl::ssl::ErrorCode::WANT_WRITE => {}
+                    openssl::ssl::ErrorCode::ZERO_RETURN => {
+                        // Peer sent close_notify: the DTLS association is
+                        // closing, further writes are impossible.
+                        return Err(DtlsError::Handshake(
+                            "dtls association closed by peer".into(),
+                        ));
+                    }
+                    _ => return Err(DtlsError::Handshake(format!("{e}"))),
+                },
+            }
+        }
+        Ok(())
+    }
+
+    /// Receive post-handshake application data into `buf`.
+    ///
+    /// Returns `Ok(None)` when no decrypted data is pending (queue empty /
+    /// peer quiet) — the caller keeps pumping. The buffer must be large
+    /// enough for the LARGEST DTLS record (2^14 payload + overhead):
+    /// OpenSSL does not fragment app-data writes to the handshake MTU, so a
+    /// peer record can legitimately exceed one MTU, and the queue transport
+    /// SILENTLY TRUNCATES a datagram to the caller's buffer (a truncated
+    /// record fails its MAC and is dropped without an error code). 18_432
+    /// is the smallest safe bound.
+    pub fn recv_app_data(&mut self, buf: &mut [u8]) -> Result<Option<usize>, DtlsError> {
+        const MAX_RECORD: usize = 18_432;
+        if buf.len() < MAX_RECORD {
+            return Err(DtlsError::Io(
+                "app-data buffer below the max DTLS record — a large peer record would silently truncate"
+                    .into(),
+            ));
+        }
+        match self.stream.ssl_read(buf) {
+            Ok(n) => Ok(Some(n)),
+            Err(e) => match e.code() {
+                openssl::ssl::ErrorCode::WANT_READ => Ok(None),
+                openssl::ssl::ErrorCode::ZERO_RETURN => {
+                    // close_notify received: no further data will arrive.
+                    Ok(None)
+                }
+                _ => Err(DtlsError::Handshake(format!("{e}"))),
+            },
+        }
+    }
+
     /// The negotiated SRTP profile.
     pub fn negotiated_profile(&self) -> Result<Profile, DtlsError> {
         let profile = self

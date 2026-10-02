@@ -6,6 +6,7 @@ use dtls::{DtlsEndpoint, DtlsRole, Identity, SrtpOffers};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+use tokio::time::timeout;
 
 fn noop(_: Vec<u8>, _: SocketAddr) {}
 
@@ -221,4 +222,71 @@ async fn send_lossy(sock: &UdpSocket, d: &[u8], to: SocketAddr, drops: &mut usiz
         return;
     }
     let _ = sock.send_to(d, to).await;
+}
+
+/// Pump one endpoint's queued outbound datagrams onto the wire.
+async fn flush(sock: &UdpSocket, ep: &mut DtlsEndpoint, to: SocketAddr) {
+    for d in ep.take_outbound() {
+        let _ = sock.send_to(&d, to).await;
+    }
+}
+
+/// Post-handshake application data crosses both directions intact — the
+/// RFC 8261 seam SCTP-over-DTLS rides on. One `send_app_data` call carries
+/// one application datagram (one SCTP packet); an oversized write arrives as
+/// ordered records the peer re-concatenates with successive reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn app_data_roundtrip_and_ordered_fragmented_write() {
+    let pair = make_pair(SrtpOffers::default_offer()).await;
+    let (mut client, mut server) = run_handshake(pair).await;
+    let (caddr, saddr) = {
+        // Re-bind scratch sockets only for addressing: the pair's sockets are
+        // moved into run_handshake, so use fresh ones at the same peers.
+        let c = bind_udp().await;
+        let s = bind_udp().await;
+        (c.1, s.1)
+    };
+    let _ = (&caddr, &saddr);
+
+    // Small roundtrip, client → server.
+    client.send_app_data(b"ping-sctp").unwrap();
+    let (csock, _) = bind_udp().await;
+    let (ssock, saddr2) = bind_udp().await;
+    flush(&csock, &mut client, saddr2).await;
+    // Must hold the LARGEST possible DTLS record — the queue transport
+    // truncates datagrams to the caller's buffer (the hazard this test pins).
+    let mut buf = vec![0u8; 65_535];
+    let (n, _) = timeout(Duration::from_secs(2), ssock.recv_from(&mut buf))
+        .await
+        .expect("server sees the client's app-data record")
+        .unwrap();
+    server.push_datagram(buf[..n].to_vec());
+    let mut rbuf = vec![0u8; 65_535];
+    let got = server.recv_app_data(&mut rbuf).unwrap();
+    assert_eq!(got, Some(9));
+    assert_eq!(&rbuf[..9], b"ping-sctp");
+
+    // Fragmented write (3000 B > MTU): ordered records, byte-exact.
+    let payload: Vec<u8> = (0..3000).map(|i| (i % 251) as u8).collect();
+    server.send_app_data(&payload).unwrap();
+    let (csock2, caddr2) = bind_udp().await;
+    flush(&ssock, &mut server, caddr2).await;
+    let mut received = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while received.len() < payload.len() && std::time::Instant::now() < deadline {
+        match timeout(Duration::from_millis(300), csock2.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) if n > 0 => {
+                client.push_datagram(buf[..n].to_vec());
+                while let Some(k) = client.recv_app_data(&mut rbuf).unwrap() {
+                    if k == 0 {
+                        break;
+                    }
+                    received.extend_from_slice(&rbuf[..k]);
+                }
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(received.len(), payload.len(), "all app-data bytes arrive");
+    assert_eq!(received, payload, "ordered, uncorrupted reassembly");
 }
