@@ -39,7 +39,10 @@ pub const PT_ECN: u16 = 0x8000;
 /// signal PR-SCTP support (RFC 3758 §3.1).
 pub const PT_SUPPORTED_EXTENSIONS: u16 = 0x8008;
 
-/// Cause codes for ABORT/ERROR (RFC 9260 §3.3.10).
+/// Cause codes for ABORT/ERROR (RFC 9260 §3.3.10). Cause 3 doubles as a
+/// recognized INIT-ACK parameter when a stale state cookie is refreshed
+/// (§5.1.5): the value is the measured staleness in microseconds.
+pub const CAUSE_STALE_COOKIE: u16 = 3;
 pub const CAUSE_UNRECOGNIZED_CHUNK: u16 = 6;
 
 /// DATA chunk flag bits.
@@ -393,6 +396,11 @@ fn parse_chunk(ctype: u8, flags: u8, body: &[u8]) -> Result<Chunk, SctpError> {
 }
 
 /// Parse a padded sequence of parameter TLVs.
+///
+/// The padded advance of the LAST parameter may run past the end of the
+/// buffer (e.g. a trailing param with `plen = 6` in a 6-byte tail pads to
+/// 8): like usrsctp/libwebrtc, stop cleanly at the chunk end instead of
+/// slicing out of bounds.
 pub fn parse_params(mut buf: &[u8]) -> Result<Vec<RawParam>, SctpError> {
     let mut out = Vec::new();
     while buf.len() >= 4 {
@@ -405,7 +413,11 @@ pub fn parse_params(mut buf: &[u8]) -> Result<Vec<RawParam>, SctpError> {
             ptype,
             value: buf[4..plen].to_vec(),
         });
-        buf = &buf[pad4(plen)..];
+        let adv = pad4(plen);
+        if adv >= buf.len() {
+            break;
+        }
+        buf = &buf[adv..];
     }
     Ok(out)
 }
@@ -705,6 +717,62 @@ mod tests {
         let pkt = encode_packet(5000, 5000, 42, &[Chunk::Data(d.clone())]);
         let p = parse_packet(&pkt, true).unwrap();
         assert_eq!(p.chunks[0], Chunk::Data(d));
+    }
+
+    /// AUD-3a regression: an unauthenticated INIT (or HEARTBEAT/ABORT) whose
+    /// last param has `plen = 6` with only 6 bytes remaining — `pad4(6) = 8`
+    /// runs past the buffer end. Must parse Ok and stop cleanly, not panic.
+    #[test]
+    fn trailing_short_param_stops_cleanly_without_panic() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0xDEAD_BEEFu32.to_be_bytes()); // initiate tag
+        body.extend_from_slice(&128_000u32.to_be_bytes()); // a_rwnd
+        body.extend_from_slice(&1024u16.to_be_bytes()); // OS
+        body.extend_from_slice(&1024u16.to_be_bytes()); // MIS
+        body.extend_from_slice(&4711u32.to_be_bytes()); // initial TSN
+                                                        // The attack param: type 1, plen 6, exactly 6 trailing bytes.
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&6u16.to_be_bytes());
+        body.extend_from_slice(&[0xAB, 0xCD]);
+        assert_eq!(body.len(), 16 + 6);
+
+        let params = parse_params(&body[16..]).expect("must parse without panicking");
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].ptype, 1);
+        assert_eq!(params[0].value, vec![0xAB, 0xCD]);
+
+        // The same bytes as a full (checksummed) packet — the remote path.
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&5000u16.to_be_bytes());
+        pkt.extend_from_slice(&5000u16.to_be_bytes());
+        pkt.extend_from_slice(&0u32.to_be_bytes()); // vtag 0 for INIT
+        pkt.extend_from_slice(&0u32.to_be_bytes()); // checksum placeholder
+        encode_chunk(CT_INIT, 0, &body, &mut pkt);
+        let csum = crc32c::packet_checksum(&pkt);
+        pkt[8..12].copy_from_slice(&csum.to_be_bytes());
+        let p = parse_packet(&pkt, true).expect("attack packet must parse cleanly");
+        match &p.chunks[0] {
+            Chunk::Init(i) => assert_eq!(i.params.len(), 1),
+            other => panic!("expected INIT, got {other:?}"),
+        }
+    }
+
+    /// A normal multi-param parse still yields every param (the fix above
+    /// only bends the last-param padding rule).
+    #[test]
+    fn multi_param_parse_still_yields_all_params() {
+        let mut buf = Vec::new();
+        encode_param(PT_HEARTBEAT_INFO, b"info", &mut buf);
+        encode_param(PT_IPV4, &[10, 0, 0, 1], &mut buf);
+        encode_param(PT_SUPPORTED_EXTENSIONS, &[CT_FORWARD_TSN], &mut buf);
+        let params = parse_params(&buf).expect("well-formed params must parse");
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0].ptype, PT_HEARTBEAT_INFO);
+        assert_eq!(params[0].value, b"info".to_vec());
+        assert_eq!(params[1].ptype, PT_IPV4);
+        assert_eq!(params[1].value, vec![10, 0, 0, 1]);
+        assert_eq!(params[2].ptype, PT_SUPPORTED_EXTENSIONS);
+        assert_eq!(params[2].value, vec![CT_FORWARD_TSN]);
     }
 
     #[test]

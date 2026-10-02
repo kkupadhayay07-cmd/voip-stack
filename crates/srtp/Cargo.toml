@@ -8,8 +8,8 @@ description = "SRTP/SRTCP: RFC 3711 AES-CM/HMAC-SHA1, RFC 7714 AES-GCM AEAD, KDF
 [dependencies]
 aes = "0.8"
 aes-gcm = "0.10"
-hmac = "0.12"
-sha1 = "0.10"
+hmac = { workspace = true }
+sha1 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

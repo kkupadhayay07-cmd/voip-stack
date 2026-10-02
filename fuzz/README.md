@@ -12,6 +12,9 @@ lives in each crate's `tests/fuzz_smoke.rs` (see below).
 | `parse_sdp`           | `sdp::parse`                               | returns `Result`, never panics    |
 | `parse_rtp`           | `rtp::RtpPacket::parse`                    | returns `Result`, never panics    |
 | `parse_dtmf`          | `rtp::dtmf::parse_event`                   | returns `Result`, never panics    |
+| `parse_sctp_packet`   | `sctp::wire::parse_packet`                 | returns `Result`, never panics    |
+| `parse_dcep`          | `sctp::dcep::parse`                        | returns `Result`, never panics    |
+| `parse_dns_response`  | `rfc3263::wire::parse_response`            | returns `Result`, never panics    |
 
 All parser crates are `#![forbid(unsafe_code)]` (sip-core, sdp) or keep their
 `unsafe` confined to codec FFI outside the parse path (rtp), so the fuzz
@@ -25,6 +28,9 @@ cargo +nightly fuzz run parse_sip_message
 cargo +nightly fuzz run parse_sdp
 cargo +nightly fuzz run parse_rtp
 cargo +nightly fuzz run parse_dtmf
+cargo +nightly fuzz run parse_sctp_packet
+cargo +nightly fuzz run parse_dcep
+cargo +nightly fuzz run parse_dns_response
 ```
 
 Useful flags:

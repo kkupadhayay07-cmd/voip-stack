@@ -9,4 +9,7 @@ description = "SCTP data-channel engine: RFC 9260/4960 core subset (CRC32c wire 
 thiserror = { workspace = true }
 # State-cookie MAC (server role); the wire codec is pure std.
 sha2 = { workspace = true }
-hmac = "0.12"
+hmac = { workspace = true }
+# OS entropy for cookie keys, verification tags, initial TSNs and the
+# cookie nonce (already in the tree transitively; 0.3 exposes `fill`).
+getrandom = "0.3"

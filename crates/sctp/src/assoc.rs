@@ -39,6 +39,10 @@ use crate::{CloseReason, SctpConfig, SctpEvent};
 pub const MAX_INIT_RETRANS: u32 = 8;
 /// Cookie MAC length (HMAC-SHA256 truncated).
 const COOKIE_MAC_LEN: usize = 16;
+/// Offset of the MAC inside the state cookie (after the 8-byte nonce).
+const COOKIE_MAC_AT: usize = 60;
+/// Total state-cookie size: 60 bytes of MAC'd fields + 16-byte MAC.
+const COOKIE_LEN: usize = 76;
 /// Common header (12) + DATA fixed fields (4+12) — the fragmentation budget
 /// for user payload in one MTU-sized packet.
 const DATA_OVERHEAD: usize = 28;
@@ -54,24 +58,22 @@ type HmacSha256 = Hmac<Sha256>;
 
 // ---------------------------------------------------------------- PRNG
 
-/// Process-wide xorshift64* state seeded from the clock (same pattern the
-/// `rfc3263` crate uses for query IDs). Tests bypass it via config overrides.
-fn next_random() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static STATE: AtomicU64 = AtomicU64::new(0);
-    let mut s = STATE.load(Ordering::Relaxed);
-    if s == 0 {
-        s = SystemTime::now()
+/// Fill `buf` with OS entropy via the `getrandom` crate. Falls back to the
+/// coarse clock only if the platform entropy source fails (never observed in
+/// practice). The clock is no longer the primary seed: a wall-clock seed is
+/// brute-forceable, and a shared xorshift state leaks every future output
+/// (initial TSN) once one public value (the verification tag) is seen.
+fn fill_random(buf: &mut [u8]) {
+    if getrandom::fill(buf).is_err() {
+        let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9E37_79B9_7F4A_7C15)
-            | 1;
+            .to_le_bytes();
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = seed[i % 8] ^ (i as u8).wrapping_mul(31);
+        }
     }
-    s ^= s << 13;
-    s ^= s >> 7;
-    s ^= s << 17;
-    STATE.store(s, Ordering::Relaxed);
-    s
 }
 
 fn now_unix_ms() -> u64 {
@@ -238,6 +240,25 @@ struct T1 {
     payload: Vec<u8>,
 }
 
+/// Timer bookkeeping for T2-SHUTDOWN / T2-SHUTDOWN-ACK (RFC 9260 §9.1/§9.2):
+/// the payload is rebuilt from the state at each fire so the retransmitted
+/// chunk always carries the current cumulative point.
+#[derive(Debug)]
+struct T2 {
+    deadline: Instant,
+    attempts: u32,
+}
+
+/// RFC 3758 §3.5: a FORWARD-TSN MUST be retransmitted until the peer's
+/// cumulative ack point covers `new_cum`. One record is outstanding at a
+/// time; a newer emission subsumes it (higher new_cum + merged skips).
+#[derive(Debug, Clone)]
+struct OutstandingFtsn {
+    new_cum: u32,
+    /// Per-stream skips (sid, highest abandoned ssn) for ordered streams.
+    streams: Vec<(u16, u16)>,
+}
+
 /// Counters for observability (exposed via `SctpEndpoint::stats`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AssociationStats {
@@ -278,6 +299,9 @@ pub struct SctpEndpoint {
 
     // ---- timers ----
     t1: Option<T1>,
+    t2: Option<T2>,
+    /// Retransmission deadline for the outstanding FORWARD-TSN (RFC 3758 §3.5).
+    ftsn_deadline: Option<Instant>,
     rto: Duration,
     srtt: Option<Duration>,
     rttvar: Duration,
@@ -295,6 +319,8 @@ pub struct SctpEndpoint {
     peer_cum: u32,
     /// Ordered streams already reported in a FORWARD-TSN (sid → ssn).
     ftsn_reported: HashMap<u16, u16>,
+    /// The unacknowledged FORWARD-TSN (RFC 3758 §3.5).
+    ftsn_outstanding: Option<OutstandingFtsn>,
 
     // ---- receive side ----
     cum_tsn: u32,
@@ -322,18 +348,28 @@ pub struct SctpEndpoint {
 impl SctpEndpoint {
     // ------------------------------------------------------------ create
 
-    fn base(cfg: SctpConfig) -> Self {
+    fn base(mut cfg: SctpConfig) -> Self {
+        // Config sanity: SACK gap-block offsets are u16, so a receive window
+        // beyond 65535 chunks can never be expressed; keep at least one slot
+        // in the send buffer. All window math below stays overflow-safe for
+        // the clamped ranges.
+        cfg.recv_window_chunks = cfg.recv_window_chunks.min(65_535);
+        cfg.send_buffer_chunks = cfg.send_buffer_chunks.max(1);
         let cookie_key = cfg.cookie_key.unwrap_or_else(|| {
             let mut k = [0u8; 32];
-            for c in k.iter_mut() {
-                *c = next_random() as u8;
-            }
+            fill_random(&mut k);
             k
         });
-        let local_tag = cfg
-            .initial_tag
-            .unwrap_or_else(|| (next_random() | 1) as u32);
-        let local_tsn = cfg.initial_tsn.unwrap_or_else(|| next_random() as u32);
+        let local_tag = cfg.initial_tag.unwrap_or_else(|| {
+            let mut b = [0u8; 4];
+            fill_random(&mut b);
+            u32::from_be_bytes(b) | 1
+        });
+        let local_tsn = cfg.initial_tsn.unwrap_or_else(|| {
+            let mut b = [0u8; 4];
+            fill_random(&mut b);
+            u32::from_be_bytes(b)
+        });
         // RFC 9260 §7.2.1: cwnd = min(4*MTU, max(2*MTU, 4380)).
         let cwnd = (cfg.mtu * 4).min((cfg.mtu * 2).max(4380));
         Self {
@@ -364,6 +400,8 @@ impl SctpEndpoint {
             msg_counter: 0,
             cum_tsn: 0,
             t1: None,
+            t2: None,
+            ftsn_deadline: None,
             srtt: None,
             t3_deadline: None,
             heartbeat_deadline: None,
@@ -376,6 +414,7 @@ impl SctpEndpoint {
             closed: false,
             peer_forward_tsn: false,
             last_init: None,
+            ftsn_outstanding: None,
         }
     }
 
@@ -418,7 +457,9 @@ impl SctpEndpoint {
     }
 
     fn recv_window_bytes(&self) -> u32 {
-        self.cfg.recv_window_chunks * self.cfg.mtu as u32
+        // Saturating: recv_window_chunks is clamped to u16 range but a large
+        // MTU can still push the byte product past u32::MAX.
+        (u64::from(self.cfg.recv_window_chunks) * self.cfg.mtu as u64).min(u32::MAX as u64) as u32
     }
 
     // -------------------------------------------------------------- io
@@ -474,7 +515,7 @@ impl SctpEndpoint {
 
     fn handle_chunk(&mut self, chunk: Chunk, now: Instant, events: &mut Vec<SctpEvent>) {
         match chunk {
-            Chunk::Init(init) => self.on_init(init, now),
+            Chunk::Init(init) => self.on_init(init, now, None),
             Chunk::InitAck(init) => self.on_init_ack(init, now, events),
             Chunk::CookieEcho { cookie } => self.on_cookie_echo(cookie, now, events),
             Chunk::CookieAck => self.on_cookie_ack(now, events),
@@ -501,7 +542,7 @@ impl SctpEndpoint {
             Chunk::Error { .. } => {
                 // RFC 9260 §8.5: ERROR is informational — counted, not acted on.
             }
-            Chunk::Shutdown { .. } => self.on_shutdown(),
+            Chunk::Shutdown { .. } => self.on_shutdown(now),
             Chunk::ShutdownAck => self.on_shutdown_ack(events),
             Chunk::ShutdownComplete { .. } => self.on_shutdown_complete(events),
             Chunk::Unknown { .. } => {
@@ -513,12 +554,21 @@ impl SctpEndpoint {
 
     // ------------------------------------------------------- handshake
 
-    fn on_init(&mut self, init: wire::InitChunk, now: Instant) {
+    fn on_init(&mut self, init: wire::InitChunk, now: Instant, stale_cookie_us: Option<u32>) {
         if matches!(
             self.state,
-            State::Established | State::ShutdownSent | State::ShutdownAckSent
+            State::Established
+                | State::ShutdownSent
+                | State::ShutdownAckSent
+                | State::InitSent
+                | State::CookieSent
         ) {
-            return; // association restart is not supported (documented)
+            // Association restart is not supported (documented). A client
+            // role (InitSent/CookieSent) must not flip to CookieEchoed on an
+            // uninvited INIT either — that would brick the handshake it is
+            // already running (RFC 9260 §5.2.2 collision handling is out of
+            // scope).
+            return;
         }
         self.peer_tag = init.initiate_tag;
         self.peer_initial_tsn = init.initial_tsn;
@@ -538,6 +588,14 @@ impl SctpEndpoint {
             params.push(wire::RawParam {
                 ptype: wire::PT_SUPPORTED_EXTENSIONS,
                 value: vec![wire::CT_FORWARD_TSN],
+            });
+        }
+        if let Some(us) = stale_cookie_us {
+            // RFC 9260 §5.1.5: a refreshed INIT-ACK carries the Stale Cookie
+            // Error cause with the measured staleness in microseconds.
+            params.push(wire::RawParam {
+                ptype: wire::CAUSE_STALE_COOKIE,
+                value: us.to_be_bytes().to_vec(),
             });
         }
         let init_ack = Chunk::InitAck(wire::InitChunk {
@@ -617,10 +675,12 @@ impl SctpEndpoint {
         };
         let stale_ms = now_unix_ms().saturating_sub(parsed.issued_ms);
         if stale_ms > self.cfg.cookie_lifetime.as_millis() as u64 {
-            // Stale cookie (RFC 9260 §5.1.5): send a fresh INIT-ACK if we
-            // still have the INIT that produced it.
+            // Stale cookie (RFC 9260 §5.1.5): send a fresh INIT-ACK — with
+            // the Stale Cookie Error cause carrying the measured staleness —
+            // if we still have the INIT that produced it.
             if let Some(init) = self.last_init.clone() {
-                self.on_init(init, now);
+                let stale_us = stale_ms.saturating_mul(1000).min(u32::MAX as u64) as u32;
+                self.on_init(init, now, Some(stale_us));
             }
             return;
         }
@@ -694,6 +754,11 @@ impl SctpEndpoint {
                     )));
                     return;
                 }
+                // Register the channel BEFORE the ack so the ack consumes
+                // SSN 0 from the stream's ordered counter — registering it
+                // afterwards reset the counter to 0 and the next message on
+                // this stream re-used SSN 0, which the peer's expected-SSN
+                // guard then dropped forever (silent data loss).
                 self.channels.insert(
                     stream,
                     Channel {
@@ -702,10 +767,19 @@ impl SctpEndpoint {
                         awaiting_ack: false,
                     },
                 );
-                // The ack goes out reliably+ordered (documented choice).
+                // The ack goes out reliably+ordered (documented choice). If
+                // the send buffer is exhausted, roll the registration back:
+                // the peer's reliable OPEN retransmission re-triggers us once
+                // space frees (T3-RTX), so nothing is lost.
                 let mut ack_msg = Vec::new();
                 dcep::encode_ack(&mut ack_msg);
-                self.enqueue_user(stream, PPID_DCEP_ACK, ack_msg, Policy::Reliable, false);
+                if self
+                    .enqueue_user(stream, PPID_DCEP_ACK, ack_msg, Policy::Reliable, false)
+                    .is_err()
+                {
+                    self.channels.remove(&stream);
+                    return;
+                }
                 // Deliver user data that arrived before the OPEN (PR loss).
                 if let Some(pending) = self.pre_dcep.remove(&stream) {
                     for (ppid, data) in pending {
@@ -780,6 +854,14 @@ impl SctpEndpoint {
     fn feed_ordered(&mut self, c: DataChunk, events: &mut Vec<SctpEvent>) {
         let stream = c.stream;
         let ssn = c.ssn;
+        // Phase 0 — chunks of a message a FORWARD-TSN already skipped must
+        // be dropped at feed time, not parked forever (RFC 3758 §4.2).
+        {
+            let buf = self.ordered.entry(stream).or_default();
+            if ssn_lt(ssn, buf.expected) {
+                return;
+            }
+        }
         // Phase 1 — insert the chunk into the current or a parked run.
         {
             let buf = self.ordered.entry(stream).or_default();
@@ -792,6 +874,13 @@ impl SctpEndpoint {
                         }
                     }
                     None => {
+                        if !c.begin {
+                            // A fragment run can only START on a B chunk;
+                            // a continuation with no open run is junk —
+                            // dropping it beats fabricating a run that can
+                            // never reassemble.
+                            return;
+                        }
                         let end_seen = c.end;
                         let mut run = FragRun {
                             ssn,
@@ -935,7 +1024,7 @@ impl SctpEndpoint {
             },
         );
         // Establishment messages go reliably+ordered (documented choice).
-        self.enqueue_user(stream, PPID_DCEP_OPEN, msg, Policy::Reliable, false);
+        self.enqueue_user(stream, PPID_DCEP_OPEN, msg, Policy::Reliable, false)?;
         self.flush(now);
         Ok(stream)
     }
@@ -991,7 +1080,7 @@ impl SctpEndpoint {
         if !(self.peer_forward_tsn && self.cfg.forward_tsn) {
             policy = Policy::Reliable;
         }
-        self.enqueue_user(stream, ppid, data, policy, channel_type.unordered());
+        self.enqueue_user(stream, ppid, data, policy, channel_type.unordered())?;
         self.flush(now);
         Ok(())
     }
@@ -1003,10 +1092,19 @@ impl SctpEndpoint {
         data: Vec<u8>,
         policy: Policy,
         unordered: bool,
-    ) {
+    ) -> Result<(), SctpError> {
+        let max_payload = self.cfg.mtu.saturating_sub(DATA_OVERHEAD).max(1);
+        // Send-buffer bound (in chunks), enforced BEFORE any TSN is consumed:
+        // popping already-assigned TSNs off the tail would punch a permanent
+        // hole into the TSN sequence and stall the receiver's cumulative
+        // point (and with it all ordered delivery) forever.
+        let needed = (data.len() as u32).div_ceil(max_payload as u32).max(1);
+        let budget = self.cfg.send_buffer_chunks as usize;
+        if self.inflight.len() + needed as usize > budget {
+            return Err(SctpError::SendBufferFull);
+        }
         let msg_id = self.msg_counter;
         self.msg_counter += 1;
-        let max_payload = self.cfg.mtu.saturating_sub(DATA_OVERHEAD).max(1);
         let ssn = if unordered {
             0
         } else {
@@ -1048,12 +1146,8 @@ impl SctpEndpoint {
                 break;
             }
         }
-        // Enforce the send-buffer bound (drop from the tail on overflow —
-        // halves of messages must never send).
-        while self.inflight.len() > self.cfg.send_buffer_chunks as usize {
-            self.inflight.pop_back();
-        }
         self.stats.messages_tx += 1;
+        Ok(())
     }
 
     /// Build packets from the send queue within cwnd/a_rwnd/MTU bounds.
@@ -1061,7 +1155,7 @@ impl SctpEndpoint {
         if self.closed {
             return;
         }
-        self.emit_forward_tsns();
+        self.emit_forward_tsns(now);
 
         let window = self.cwnd.min(self.peer_a_rwnd.max(1));
         let mut packet: Vec<Chunk> = Vec::new();
@@ -1118,6 +1212,40 @@ impl SctpEndpoint {
         self.stats.packets_tx += 1;
     }
 
+    /// Payload bytes received but not yet delivered to the application:
+    /// out-of-order queue + every reassembly run + messages held pending a
+    /// DCEP OPEN. This is what `a_rwnd` must discount (RFC 9260 §6.2.1 —
+    /// the advertised window reflects received-but-undelivered data).
+    fn undelivered_bytes(&self) -> usize {
+        let mut n = 0usize;
+        for c in self.ofo.values() {
+            n += c.payload.len();
+        }
+        for buf in self.ordered.values() {
+            if let Some(run) = &buf.current {
+                for c in run.pieces.values() {
+                    n += c.payload.len();
+                }
+            }
+            for run in buf.parked.values() {
+                for c in run.pieces.values() {
+                    n += c.payload.len();
+                }
+            }
+        }
+        if let Some(run) = &self.unordered.current {
+            for c in run.pieces.values() {
+                n += c.payload.len();
+            }
+        }
+        for pending in self.pre_dcep.values() {
+            for (_, data) in pending {
+                n += data.len();
+            }
+        }
+        n
+    }
+
     fn send_sack_now(&mut self) {
         let mut gaps: Vec<SackBlock> = Vec::new();
         let mut iter = self.ofo.keys().copied().peekable();
@@ -1136,10 +1264,13 @@ impl SctpEndpoint {
                 end: end.wrapping_sub(self.cum_tsn) as u16,
             });
         }
-        let free = (self.cfg.recv_window_chunks as usize - self.ofo.len()) * self.cfg.mtu;
+        // RFC 9260 §6.2.1: a_rwnd = advertised window − received-but-undelivered
+        // bytes (floor at 0; saturating so huge configs cannot overflow).
+        let undelivered = self.undelivered_bytes().min(u32::MAX as usize) as u32;
+        let a_rwnd = self.recv_window_bytes().saturating_sub(undelivered);
         let sack = Chunk::Sack(wire::SackChunk {
             cum_tsn: self.cum_tsn,
-            a_rwnd: free as u32,
+            a_rwnd,
             gaps,
             dups: std::mem::take(&mut self.dups),
         });
@@ -1157,6 +1288,18 @@ impl SctpEndpoint {
         self.peer_a_rwnd = s.a_rwnd as usize;
         if tsn_lt(self.peer_cum, s.cum_tsn) {
             self.peer_cum = s.cum_tsn;
+        }
+
+        // RFC 3758 §3.5: the outstanding FORWARD-TSN is acknowledged once the
+        // peer's cumulative point covers its new_cum — clear the record and
+        // stop retransmitting it.
+        if self
+            .ftsn_outstanding
+            .as_ref()
+            .is_some_and(|f| tsn_le(f.new_cum, s.cum_tsn))
+        {
+            self.ftsn_outstanding = None;
+            self.ftsn_deadline = None;
         }
 
         let mut newly_acked = 0usize;
@@ -1178,25 +1321,47 @@ impl SctpEndpoint {
             }
         }
         // Gap blocks (RFC 9260 §3.3.4): offsets from the cumulative point.
-        for g in &s.gaps {
-            let start = s.cum_tsn.wrapping_add(g.start as u32);
-            let end = s.cum_tsn.wrapping_add(g.end as u32);
-            let mut t = start;
-            loop {
-                if let Some(pos) = self.inflight.iter().position(|c| c.tsn == t) {
-                    let c = self.inflight.remove(pos).unwrap();
-                    newly_acked += c.size;
-                    if c.retransmits == 0 && rtt_sample.is_none() {
-                        rtt_sample = c
-                            .last_sent
-                            .map(|st| now.checked_duration_since(st).unwrap_or_default());
+        // `inflight` is TSN-ordered, so merge the blocks into ranges and walk
+        // the queue once — O(inflight + gaps) instead of a scan per TSN.
+        let mut blocks: Vec<&SackBlock> = s
+            .gaps
+            .iter()
+            .filter(|g| g.start >= 1 && g.start <= g.end)
+            .collect();
+        blocks.sort_by_key(|g| (g.start, g.end));
+        let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(blocks.len());
+        for g in blocks {
+            let (gs, ge) = (
+                s.cum_tsn.wrapping_add(g.start as u32),
+                s.cum_tsn.wrapping_add(g.end as u32),
+            );
+            match ranges.last_mut() {
+                Some((_, e)) if tsn_le(gs, *e) => {
+                    if tsn_lt(*e, ge) {
+                        *e = ge;
                     }
-                    self.outstanding_bytes = self.outstanding_bytes.saturating_sub(c.size);
                 }
-                if t == end {
-                    break;
+                _ => ranges.push((gs, ge)),
+            }
+        }
+        let mut ri = 0usize;
+        let mut idx = 0usize;
+        while idx < self.inflight.len() && ri < ranges.len() {
+            let t = self.inflight[idx].tsn;
+            let (gs, ge) = ranges[ri];
+            if tsn_lt(t, gs) {
+                idx += 1;
+            } else if tsn_lt(ge, t) {
+                ri += 1;
+            } else {
+                let c = self.inflight.remove(idx).unwrap();
+                newly_acked += c.size;
+                if c.retransmits == 0 && rtt_sample.is_none() {
+                    rtt_sample = c
+                        .last_sent
+                        .map(|st| now.checked_duration_since(st).unwrap_or_default());
                 }
-                t = t.wrapping_add(1);
+                self.outstanding_bytes = self.outstanding_bytes.saturating_sub(c.size);
             }
         }
         // Duplicate reports acknowledge the original transmission too.
@@ -1224,21 +1389,34 @@ impl SctpEndpoint {
         // Congestion window (RFC 9260 §7.2.1, simplified per-SACK steps).
         if newly_acked > 0 {
             if self.cwnd < self.ssthresh {
-                self.cwnd += self.cfg.mtu;
+                // Slow start: at most min(newly_acked, MTU) per SACK.
+                self.cwnd += newly_acked.min(self.cfg.mtu);
             } else {
                 self.partial_bytes_acked += newly_acked;
                 if self.partial_bytes_acked >= self.cwnd {
                     self.cwnd += self.cfg.mtu;
-                    self.partial_bytes_acked -= self.cwnd;
+                    // §7.2.2: subtract the OLD cwnd, not the incremented one.
+                    self.partial_bytes_acked -= self.cwnd - self.cfg.mtu;
                 }
             }
+        }
+
+        // SACK-driven FORWARD-TSN retransmission pass (RFC 3758 §3.5): keep
+        // the announcement alive until a cumulative ack covers it.
+        if let Some(f) = self.ftsn_outstanding.clone() {
+            self.queue_packet(&[Chunk::ForwardTsn {
+                new_cum_tsn: f.new_cum,
+                streams: f.streams,
+            }]);
+            self.stats.ftsn_tx += 1;
+            self.ftsn_deadline = Some(now + self.rto);
         }
 
         if self.outstanding_bytes == 0 {
             self.t3_deadline = None;
             self.partial_bytes_acked = 0;
             if self.shutdown_pending {
-                self.begin_shutdown();
+                self.begin_shutdown(now);
             }
         }
     }
@@ -1246,14 +1424,19 @@ impl SctpEndpoint {
     // -------------------------------------------------- forward-tsn (PR)
 
     /// RFC 3758: advance the peer ack point over abandoned chunks and send
-    /// FORWARD-TSN. Abandoned chunk buffers are freed at send time.
-    fn emit_forward_tsns(&mut self) {
+    /// FORWARD-TSN. Abandoned chunk buffers are freed at send time; the
+    /// announcement itself is kept in `ftsn_outstanding` and retransmitted
+    /// (T3 passes, SACK-driven passes and a dedicated deadline) until a
+    /// SACK's cumulative point covers it (RFC 3758 §3.5). Returns true when
+    /// a fresh announcement was just emitted (so callers do not re-send it
+    /// again in the same pass).
+    fn emit_forward_tsns(&mut self, now: Instant) -> bool {
         if !(self.peer_forward_tsn && self.cfg.forward_tsn) {
             // Without PR support abandoned chunks are just dropped (they can
             // only exist if the caller forced PR with both sides unaware —
             // send_message already degrades the policy, so this is defensive).
             self.inflight.retain(|c| !c.abandoned);
-            return;
+            return false;
         }
         // Highest point where every tsn in (peer_cum, point] is abandoned.
         let mut point: Option<u32> = None;
@@ -1268,32 +1451,61 @@ impl SctpEndpoint {
             }
         }
         let Some(new_cum) = point else {
-            return;
+            return false;
         };
         // Ordered stream skips for abandoned messages (RFC 3758 §3.2): one
-        // entry per stream, the highest abandoned SSN, never re-reported.
+        // entry per stream carrying the HIGHEST abandoned SSN, never
+        // re-reported for newer skips below the recorded point.
         let mut streams: Vec<(u16, u16)> = Vec::new();
         for c in &self.inflight {
             if !c.abandoned || c.unordered || tsn_gt(c.tsn, new_cum) {
                 continue;
             }
-            match self.ftsn_reported.get(&c.stream) {
-                Some(&last) if ssn_le(c.ssn, last) => {}
-                _ => {
-                    self.ftsn_reported.insert(c.stream, c.ssn);
-                    streams.push((c.stream, c.ssn));
+            if let Some(&last) = self.ftsn_reported.get(&c.stream) {
+                if ssn_le(c.ssn, last) {
+                    continue;
                 }
+            }
+            match streams.iter_mut().find(|(s, _)| *s == c.stream) {
+                // Later chunks of the same stream carry ≥ SSN (TSN order);
+                // keep the max so exactly one entry per stream is emitted.
+                Some((_, ssn)) => {
+                    if ssn_lt(*ssn, c.ssn) {
+                        *ssn = c.ssn;
+                    }
+                }
+                None => streams.push((c.stream, c.ssn)),
+            }
+            let reported = self.ftsn_reported.entry(c.stream).or_insert(c.ssn);
+            if ssn_lt(*reported, c.ssn) {
+                *reported = c.ssn;
             }
         }
         streams.sort();
+        // An earlier FORWARD-TSN that was never cumulatively acknowledged
+        // must keep riding along (RFC 3758 §3.5): merge its skips in.
+        if let Some(prev) = self.ftsn_outstanding.take() {
+            for (sid, ssn) in prev.streams {
+                if !streams.iter().any(|(s, _)| *s == sid) {
+                    streams.push((sid, ssn));
+                }
+            }
+            streams.sort();
+        }
         self.inflight
             .retain(|c| !(c.abandoned && tsn_le(c.tsn, new_cum)));
         self.stats.ftsn_tx += 1;
         self.stats.abandoned += 1;
+        self.ftsn_outstanding = Some(OutstandingFtsn {
+            new_cum,
+            streams: streams.clone(),
+        });
+        self.ftsn_deadline = Some(now + self.rto);
         self.queue_packet(&[Chunk::ForwardTsn {
             new_cum_tsn: new_cum,
             streams,
         }]);
+        true
     }
 
     fn on_forward_tsn(&mut self, new_cum: u32, streams: &[(u16, u16)]) {
@@ -1354,8 +1566,10 @@ impl SctpEndpoint {
             }
         };
         consider(self.t1.as_ref().map(|t| t.deadline));
+        consider(self.t2.as_ref().map(|t| t.deadline));
         consider(self.t3_deadline);
         consider(self.heartbeat_deadline);
+        consider(self.ftsn_deadline);
         if self.peer_forward_tsn && self.cfg.forward_tsn {
             for c in &self.inflight {
                 if c.abandoned {
@@ -1369,29 +1583,38 @@ impl SctpEndpoint {
         min
     }
 
-    /// Fire all due timers at virtual time `now`.
-    pub fn on_timeout(&mut self, now: Instant) {
+    /// Fire all due timers at virtual time `now`. Terminal timer events
+    /// (handshake / shutdown retransmission exhaustion) are returned so the
+    /// application learns why the association went away.
+    pub fn on_timeout(&mut self, now: Instant) -> Vec<SctpEvent> {
+        let mut events = Vec::new();
         if self.closed {
-            return;
+            return events;
         }
-        // T1-INIT / T1-COOKIE.
-        if let Some(t1) = self.t1.as_ref() {
-            if t1.deadline <= now {
-                let attempts = t1.attempts + 1;
-                let payload = t1.payload.clone();
-                if attempts > MAX_INIT_RETRANS {
-                    self.t1 = None;
-                    self.close_out();
-                    return;
-                }
-                self.t1 = Some(T1 {
-                    deadline: now + self.rto,
-                    attempts,
-                    payload: payload.clone(),
-                });
-                self.outbox.push_back(payload);
-                self.stats.packets_tx += 1;
+        // T1-INIT / T1-COOKIE: retransmit with exponential backoff (the RTO
+        // doubles per attempt, clamped at rto_max — RFC 9260 §4/§5).
+        let t1_due = self.t1.as_ref().is_some_and(|t| t.deadline <= now);
+        if t1_due {
+            let attempts = self.t1.as_ref().map(|t| t.attempts + 1).unwrap_or(1);
+            let payload = self
+                .t1
+                .as_ref()
+                .map(|t| t.payload.clone())
+                .unwrap_or_default();
+            if attempts > MAX_INIT_RETRANS {
+                self.t1 = None;
+                self.close_out();
+                events.push(SctpEvent::Closed(CloseReason::HandshakeTimeout));
+                return events;
             }
+            self.rto = (self.rto * 2).min(self.cfg.rto_max);
+            self.t1 = Some(T1 {
+                deadline: now + self.rto,
+                attempts,
+                payload: payload.clone(),
+            });
+            self.outbox.push_back(payload);
+            self.stats.packets_tx += 1;
         }
         // Lifetime sweep (RFC 3758 max packet lifetime).
         if self.peer_forward_tsn && self.cfg.forward_tsn {
@@ -1413,63 +1636,129 @@ impl SctpEndpoint {
             }
         }
         // T3-RTX: retransmit everything outstanding, back off RTO.
-        if let Some(deadline) = self.t3_deadline {
-            if deadline <= now && self.outstanding_bytes > 0 {
-                self.rto = (self.rto * 2).min(self.cfg.rto_max);
-                self.ssthresh = self.cwnd / 2;
-                self.cwnd = self.cfg.mtu;
-                self.partial_bytes_acked = 0;
-                let mut exhausted: Vec<u64> = Vec::new();
-                for c in self.inflight.iter_mut() {
-                    if c.sent && !c.abandoned {
-                        c.retransmits += 1;
-                        self.stats.retransmits_tx += 1;
-                        if let Policy::MaxRetrans(n) = c.policy {
-                            if c.retransmits > n {
-                                exhausted.push(c.msg_id);
-                            }
+        let t3_due = self
+            .t3_deadline
+            .is_some_and(|d| d <= now && self.outstanding_bytes > 0);
+        if t3_due {
+            self.rto = (self.rto * 2).min(self.cfg.rto_max);
+            // RFC 9260 §7.2.3: ssthresh = max(cwnd/2, 4*MTU) — never below
+            // the initial congestion window.
+            self.ssthresh = (self.cwnd / 2).max(4 * self.cfg.mtu);
+            self.cwnd = self.cfg.mtu;
+            self.partial_bytes_acked = 0;
+            let mut exhausted: Vec<u64> = Vec::new();
+            for c in self.inflight.iter_mut() {
+                if c.sent && !c.abandoned {
+                    c.retransmits += 1;
+                    self.stats.retransmits_tx += 1;
+                    if let Policy::MaxRetrans(n) = c.policy {
+                        if c.retransmits > n {
+                            exhausted.push(c.msg_id);
                         }
                     }
                 }
-                for msg in exhausted {
-                    self.abandon_message(msg);
-                }
-                self.emit_forward_tsns();
-                let live: Vec<(usize, DataChunk)> = self
-                    .inflight
-                    .iter()
-                    .filter(|c| c.sent && !c.abandoned)
-                    .map(|c| (c.size, c.to_chunk()))
-                    .collect();
-                let mut packet: Vec<Chunk> = Vec::new();
-                let mut packet_len = 12usize;
-                for (size, chunk) in live {
-                    if packet_len + size > self.cfg.mtu {
-                        let chunks = std::mem::take(&mut packet);
-                        packet_len = 12;
-                        self.queue_packet(&chunks);
-                    }
-                    packet.push(Chunk::Data(chunk));
-                    packet_len += size;
-                }
-                if !packet.is_empty() {
-                    self.queue_packet(&packet);
-                }
-                self.t3_deadline = Some(now + self.rto);
             }
+            for msg in exhausted {
+                self.abandon_message(msg);
+            }
+            // RFC 3758 §3.5: every retransmission pass re-sends an
+            // unacknowledged FORWARD-TSN alongside the data chunks — unless
+            // the sweep above just emitted a fresh one (it already rides
+            // this pass).
+            if !self.emit_forward_tsns(now) {
+                if let Some(f) = self.ftsn_outstanding.clone() {
+                    self.queue_packet(&[Chunk::ForwardTsn {
+                        new_cum_tsn: f.new_cum,
+                        streams: f.streams,
+                    }]);
+                    self.stats.ftsn_tx += 1;
+                    self.ftsn_deadline = Some(now + self.rto);
+                }
+            }
+            let live: Vec<(usize, DataChunk)> = self
+                .inflight
+                .iter()
+                .filter(|c| c.sent && !c.abandoned)
+                .map(|c| (c.size, c.to_chunk()))
+                .collect();
+            let mut packet: Vec<Chunk> = Vec::new();
+            let mut packet_len = 12usize;
+            for (size, chunk) in live {
+                if packet_len + size > self.cfg.mtu {
+                    let chunks = std::mem::take(&mut packet);
+                    packet_len = 12;
+                    self.queue_packet(&chunks);
+                }
+                packet.push(Chunk::Data(chunk));
+                packet_len += size;
+            }
+            if !packet.is_empty() {
+                self.queue_packet(&packet);
+            }
+            self.t3_deadline = Some(now + self.rto);
+        }
+        // T2-SHUTDOWN / T2-SHUTDOWN-ACK (RFC 9260 §9.1/§9.2): the payload is
+        // rebuilt from the state at each fire. Exhaustion aborts.
+        let t2_due = self.t2.as_ref().is_some_and(|t| t.deadline <= now);
+        if t2_due {
+            let attempts = self.t2.as_ref().map(|t| t.attempts + 1).unwrap_or(1);
+            if attempts > MAX_INIT_RETRANS {
+                self.t2 = None;
+                self.close_out();
+                events.push(SctpEvent::Closed(CloseReason::ShutdownTimeout));
+                return events;
+            }
+            self.rto = (self.rto * 2).min(self.cfg.rto_max);
+            self.t2 = Some(T2 {
+                deadline: now + self.rto,
+                attempts,
+            });
+            match self.state {
+                State::ShutdownSent => {
+                    self.queue_packet(&[Chunk::Shutdown {
+                        cum_tsn: self.cum_tsn,
+                    }]);
+                }
+                State::ShutdownAckSent => {
+                    self.queue_packet(&[Chunk::ShutdownAck]);
+                }
+                _ => self.t2 = None, // stale timer (state moved on)
+            }
+        }
+        // Outstanding FORWARD-TSN deadline (RFC 3758 §3.5): there may be no
+        // T3 running once every abandoned chunk left the queue — the FTSN
+        // would otherwise never be regenerated after a loss.
+        let ftsn_due = self
+            .ftsn_deadline
+            .is_some_and(|d| d <= now && self.ftsn_outstanding.is_some());
+        if ftsn_due {
+            if let Some(f) = self.ftsn_outstanding.clone() {
+                self.queue_packet(&[Chunk::ForwardTsn {
+                    new_cum_tsn: f.new_cum,
+                    streams: f.streams,
+                }]);
+                self.stats.ftsn_tx += 1;
+            }
+            self.ftsn_deadline = Some(now + self.rto);
         }
         // Heartbeat.
         if let Some(deadline) = self.heartbeat_deadline {
             if deadline <= now && self.state == State::Established {
-                self.heartbeat_counter += 1;
-                let mut info = Vec::new();
-                info.extend_from_slice(&self.heartbeat_counter.to_be_bytes());
-                info.extend_from_slice(&now_unix_ms().to_be_bytes());
-                self.queue_packet(&[Chunk::Heartbeat { info }]);
-                self.heartbeat_deadline = Some(now + self.cfg.heartbeat_interval.unwrap());
+                if let Some(interval) = self.cfg.heartbeat_interval {
+                    self.heartbeat_counter += 1;
+                    let mut info = Vec::new();
+                    info.extend_from_slice(&self.heartbeat_counter.to_be_bytes());
+                    info.extend_from_slice(&now_unix_ms().to_be_bytes());
+                    self.queue_packet(&[Chunk::Heartbeat { info }]);
+                    self.heartbeat_deadline = Some(now + interval);
+                } else {
+                    // Deadline without an interval cannot re-arm itself.
+                    self.heartbeat_deadline = None;
+                }
             }
         }
         self.flush(now);
+        events
     }
 
     fn abandon_message(&mut self, msg_id: u64) {
@@ -1491,36 +1780,55 @@ impl SctpEndpoint {
 
     /// Begin the graceful shutdown (SHUTDOWN is deferred until the peer
     /// acknowledged everything outstanding).
-    pub fn shutdown(&mut self) -> Result<(), SctpError> {
+    pub fn shutdown(&mut self, now: Instant) -> Result<(), SctpError> {
         if self.state != State::Established {
             return Err(SctpError::WrongState("not established"));
         }
         self.shutdown_pending = true;
         if self.outstanding_bytes == 0 {
-            self.begin_shutdown();
+            self.begin_shutdown(now);
         }
         Ok(())
     }
 
-    fn begin_shutdown(&mut self) {
+    fn begin_shutdown(&mut self, now: Instant) {
         self.shutdown_pending = false;
-        let cum = self.cum_tsn;
-        self.queue_packet(&[Chunk::Shutdown { cum_tsn: cum }]);
+        self.queue_packet(&[Chunk::Shutdown {
+            cum_tsn: self.cum_tsn,
+        }]);
         self.state = State::ShutdownSent;
+        // T2-SHUTDOWN guards the exchange (RFC 9260 §9.1).
+        self.t2 = Some(T2 {
+            deadline: now + self.rto,
+            attempts: 0,
+        });
     }
 
-    fn on_shutdown(&mut self) {
-        if self.state != State::Established && self.state != State::ShutdownSent {
-            return;
+    fn on_shutdown(&mut self, now: Instant) {
+        match self.state {
+            State::Established | State::ShutdownSent => {
+                self.queue_packet(&[Chunk::ShutdownAck]);
+                self.state = State::ShutdownAckSent;
+                // T2-SHUTDOWN-ACK guards our half of the exchange
+                // (RFC 9260 §9.2).
+                self.t2 = Some(T2 {
+                    deadline: now + self.rto,
+                    attempts: 0,
+                });
+            }
+            State::ShutdownAckSent => {
+                // Retransmitted SHUTDOWN — re-ack idempotently (§9.2).
+                self.queue_packet(&[Chunk::ShutdownAck]);
+            }
+            _ => {}
         }
-        self.queue_packet(&[Chunk::ShutdownAck]);
-        self.state = State::ShutdownAckSent;
     }
 
     fn on_shutdown_ack(&mut self, events: &mut Vec<SctpEvent>) {
         if self.state != State::ShutdownSent {
             return;
         }
+        self.t2 = None;
         self.queue_packet(&[Chunk::ShutdownComplete { reflected: false }]);
         self.close_out();
         events.push(SctpEvent::Closed(CloseReason::Shutdown));
@@ -1530,6 +1838,7 @@ impl SctpEndpoint {
         if self.state != State::ShutdownAckSent {
             return;
         }
+        self.t2 = None;
         self.close_out();
         events.push(SctpEvent::Closed(CloseReason::Shutdown));
     }
@@ -1563,8 +1872,11 @@ impl SctpEndpoint {
     fn close_out(&mut self) {
         self.closed = true;
         self.t1 = None;
+        self.t2 = None;
         self.t3_deadline = None;
         self.heartbeat_deadline = None;
+        self.ftsn_deadline = None;
+        self.ftsn_outstanding = None;
     }
 
     // ------------------------------------------------------------ misc
@@ -1592,7 +1904,7 @@ impl SctpEndpoint {
     // ---------------------------------------------------------- cookie
 
     fn build_cookie(&self, init: &wire::InitChunk) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(68);
+        let mut buf = Vec::with_capacity(COOKIE_LEN);
         buf.extend_from_slice(b"SCTPCK01");
         buf.extend_from_slice(&self.local_tag.to_be_bytes()); // 8
         buf.extend_from_slice(&self.local_tsn.to_be_bytes()); // 12
@@ -1607,8 +1919,14 @@ impl SctpEndpoint {
         buf.extend_from_slice(&now_unix_ms().to_be_bytes()); // 40..48
         buf.push(u8::from(supports_forward_tsn(init))); // 48
         buf.extend_from_slice(&[0u8; 3]); // 49..52 (alignment)
+                                          // Random nonce inside the MAC'd region: two cookies issued for the
+                                          // same INIT never share bytes, so a captured COOKIE-ECHO cannot be
+                                          // replayed as a fresh-looking cookie (the MAC binds the exchange).
+        let mut nonce = [0u8; 8];
+        fill_random(&mut nonce);
+        buf.extend_from_slice(&nonce); // 52..60
         let mac = cookie_mac(&self.cookie_key, &buf);
-        buf.extend_from_slice(&mac); // 52..68
+        buf.extend_from_slice(&mac); // 60..76
         buf
     }
 }
@@ -1625,18 +1943,18 @@ struct CookieState {
 }
 
 fn cookie_valid_mac(key: &[u8; 32], buf: &[u8]) -> bool {
-    if buf.len() != 68 || &buf[..8] != b"SCTPCK01" {
+    if buf.len() != COOKIE_LEN || &buf[..8] != b"SCTPCK01" {
         return false;
     }
-    let mac: [u8; COOKIE_MAC_LEN] = match buf[52..68].try_into() {
+    let mac: [u8; COOKIE_MAC_LEN] = match buf[COOKIE_MAC_AT..COOKIE_LEN].try_into() {
         Ok(m) => m,
         Err(_) => return false,
     };
-    mac == cookie_mac(key, &buf[..52])
+    mac == cookie_mac(key, &buf[..COOKIE_MAC_AT])
 }
 
 fn parse_cookie(buf: &[u8]) -> Result<CookieState, SctpError> {
-    if buf.len() != 68 || &buf[..8] != b"SCTPCK01" {
+    if buf.len() != COOKIE_LEN || &buf[..8] != b"SCTPCK01" {
         return Err(SctpError::BadChunk("cookie malformed"));
     }
     let rd32 = |at: usize| u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]);
@@ -1702,5 +2020,37 @@ mod probe {
         let parsed = parse_cookie(&cookie).unwrap();
         assert_eq!(parsed.client_tag, 111);
         assert_eq!(parsed.server_tag, 222);
+    }
+
+    /// AUD-6: the random nonce inside the MAC'd region must make every
+    /// issued cookie distinct — two cookies for the SAME INIT used to be
+    /// byte-identical within one clock tick, so a captured COOKIE-ECHO
+    /// replayed as another exchange's cookie looked fresh.
+    #[test]
+    fn cookie_nonce_makes_reissued_cookies_distinct() {
+        let cfg = SctpConfig {
+            is_client: false,
+            initial_tag: Some(222),
+            initial_tsn: Some(2000),
+            cookie_key: Some([7u8; 32]),
+            ..Default::default()
+        };
+        let ep = SctpEndpoint::new_server(cfg);
+        let init = wire::InitChunk {
+            initiate_tag: 111,
+            a_rwnd: 76800,
+            os: 1024,
+            mis: 1024,
+            initial_tsn: 1000,
+            params: vec![],
+        };
+        let a = ep.build_cookie(&init);
+        let b = ep.build_cookie(&init);
+        assert_ne!(a, b, "nonce must make re-issued cookies distinct");
+        assert_eq!(a.len(), COOKIE_LEN);
+        for c in [&a, &b] {
+            assert!(cookie_valid_mac(&ep.cookie_key, c), "MAC must validate");
+            assert_eq!(parse_cookie(c).unwrap().client_tag, 111);
+        }
     }
 }

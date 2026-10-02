@@ -9,8 +9,8 @@ description = "Native STUN/ICE/TURN: RFC 5389 message codec with RFC 5769 vector
 tokio = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
-hmac = "0.12"
-sha1 = "0.10"
+hmac = { workspace = true }
+sha1 = { workspace = true }
 md-5 = { workspace = true }
 
 [dev-dependencies]

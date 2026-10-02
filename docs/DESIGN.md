@@ -6,6 +6,20 @@
 > plus the hardening series (`sip-tx` §17 transaction layer, `observ`
 > observability, trunk auth, daemon transports). Current per-RFC status:
 > [`COMPLIANCE.md`](COMPLIANCE.md) · system structure: [`ARCHITECTURE.md`](ARCHITECTURE.md).
+>
+> **Errata (this is the frozen v1.0 planning artifact — as-built reality
+> differs in the details below; `ARCHITECTURE.md` is the authoritative
+> structure document):** the workspace grew to 21 crates (the §2 tree and
+> §2.1 table sketch the Phase-1 plan: `stun`/`turn` were built into the
+> `ice` crate, RFC 3263 landed as its own `rfc3263` crate, SCTP data
+> channels as the `sctp` crate); the daemon binary is `zrtc` and the demo
+> binary is `b2bua-demo` (never `voipd`); `Dockerfile` lives at the repo
+> root (no `docker/` dir); this file is `docs/DESIGN.md` and the compliance
+> doc is `docs/COMPLIANCE.md` (no `RFC-COMPLIANCE.md`); TLS is OpenSSL
+> (`openssl`, `dtls`/`zrtc`), not rustls; the workspace Cargo.toml carries
+> members + shared deps only (no `[lints]` table); the real fuzz targets
+> are `parse_sip_message` / `parse_sdp` / `parse_rtp` / `parse_dtmf` /
+> `parse_sctp_packet` / `parse_dcep` / `parse_dns_response`.
 
 A from-scratch, production-grade SIP and media protocol stack written in Rust.
 No external SIP proxies, media servers, or softphone libraries are used or

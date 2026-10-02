@@ -5,9 +5,12 @@
 #   docker compose logs -f zrtc-b2bua
 #   docker compose down
 #
-# NOTE: the b2bua demo daemon (`voipd`) has not landed yet; the image currently
-# builds cleanly and exits immediately (placeholder CMD). Port mappings and
-# env below are already the intended production shape for Phase 2.
+# NOTE: the image builds the whole workspace and stages its binaries (`zrtc`,
+# `b2bua-demo`) but its CMD is intentionally still a no-op healthcheck stub —
+# it validates the build pipeline end to end and exits cleanly. Wiring the
+# daemon entrypoint to a mounted zrtc.toml is the documented follow-up
+# (docs/DEPLOYMENT.md, demo/zrtc.toml.example). Port mappings and env below
+# are already the intended production shape for Phase 2.
 
 services:
   zrtc-b2bua:

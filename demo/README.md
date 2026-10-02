@@ -3,7 +3,7 @@
 End-to-end demonstrations of the VoIP stack: a **complete call served entirely
 by the native stack** — no external SIP proxy, PBX or media server.
 
-Three ways to run:
+Four ways to run:
 
 1. **Full-stack daemon demo** — `./demo/run.sh` (the `zrtc` service end to end).
 2. **Load-harness soak** — `CALLS=200 CONCURRENCY=20 ./demo/soak.sh` (N concurrent

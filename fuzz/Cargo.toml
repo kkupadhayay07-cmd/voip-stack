@@ -13,6 +13,8 @@ libfuzzer-sys = "0.4"
 sip-core = { path = "../crates/sip-core" }
 sdp = { path = "../crates/sdp" }
 rtp = { path = "../crates/rtp" }
+sctp = { path = "../crates/sctp" }
+rfc3263 = { path = "../crates/rfc3263" }
 
 [[bin]]
 name = "parse_sip_message"
@@ -38,6 +40,27 @@ bench = false
 [[bin]]
 name = "parse_dtmf"
 path = "fuzz_targets/parse_dtmf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_sctp_packet"
+path = "fuzz_targets/parse_sctp_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_dcep"
+path = "fuzz_targets/parse_dcep.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_dns_response"
+path = "fuzz_targets/parse_dns_response.rs"
 test = false
 doc = false
 bench = false

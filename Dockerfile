@@ -2,19 +2,24 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # ZRTC VoIP stack — multi-stage production image
 #
-# Stage 1 (builder): rust:1.98-slim + pkg-config/libopus-dev → cargo build
+# Stage 1 (builder): rust:1-slim + pkg-config/libopus-dev → cargo build
 # Stage 2 (runtime): debian:bookworm-slim + libopus0/ca-certificates only.
 #
-# The b2bua demo daemon (`voipd`) has not landed yet (the b2bua crate is still
-# a placeholder), so the builder stages every executable it finds in
-# target/release into /out/bin using an ELF-magic check (glob-safe, no
-# dependency on specific binary names). When /out/bin is empty the image still
-# builds; once `voipd` lands it is picked up automatically — flip the
-# commented ENTRYPOINT/CMD and healthcheck below, nothing else changes.
+# The whole workspace is built (cargo build --release --workspace); the
+# builder stages every executable it finds in target/release into /out/bin
+# using an ELF-magic check (glob-safe, no dependency on specific binary
+# names). Today that is the `zrtc` daemon and the `b2bua-demo` binary. The
+# container CMD is intentionally still a no-op healthcheck stub (see the
+# TODO at the bottom): the image validates the build pipeline end to end
+# and stages the binaries; wiring the daemon entrypoint to a mounted
+# zrtc.toml is the documented follow-up (docs/DEPLOYMENT.md,
+# demo/zrtc.toml.example). The toolchain channel is pinned by
+# rust-toolchain.toml (stable) inside the source tree, so the base tag
+# stays deliberately floating.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: build ───────────────────────────────────────────────────────────
-FROM rust:1.98-slim AS builder
+FROM rust:1-slim AS builder
 
 # libopus + pkg-config are required by the `codecs` crate (opus 0.3 binds the
 # system libopus via pkg-config).

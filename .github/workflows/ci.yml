@@ -106,6 +106,10 @@ jobs:
         run: cargo test -p sdp --test fuzz_smoke
       - name: rtp corpus (packets + DTMF)
         run: cargo test -p rtp --test fuzz_smoke
+      - name: sctp corpus (wire + DCEP)
+        run: cargo test -p sctp --test fuzz_smoke
+      - name: rfc3263 corpus (DNS wire)
+        run: cargo test -p rfc3263 --test fuzz_smoke
 
   codec-interop:
     name: G.729 interop (ffmpeg)

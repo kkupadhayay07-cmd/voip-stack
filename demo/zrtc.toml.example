@@ -1,4 +1,5 @@
-# zrtc trunk configuration examples — all five auth modes.
+# zrtc trunk configuration examples — all four auth modes (ip / digest /
+# bearer / tls_client_cert).
 #
 # Copy the [trunk] block that matches your vendor into your zrtc.toml
 # (the rest of the file below is the standard demo config). Secrets should
@@ -36,6 +37,10 @@ keepalive_secs = 60
 # auth_pass = "secret"            # or ZRTC_TRUNK_PASS
 # # auth_realm = "your-vendor.example"
 # # aor = "sip:trunk-user@your-vendor.example"
+# # instance_id = "urn:uuid:0b14e56c-…"   # stable Outbound instance URN
+#   # Set this in production: without it the daemon generates a
+#   # process-local URN per start (logged as a warning), which defeats
+#   # RFC 5626 binding reuse across restarts. See docs/DEPLOYMENT.md.
 # keepalive_secs = 60
 
 # ---------------------------------------------------------------------------

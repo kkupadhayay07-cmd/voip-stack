@@ -43,6 +43,14 @@
 //!   SACKed immediately (RFC 9260 allows "MAY" delay)
 //! - No RFC 8260 stream schedulers / interleaving (the I-bit is parsed and
 //!   treated as unordered-classic)
+//! - No fast retransmit on gap-acks (loss recovery waits for T3-RTX), and no
+//!   zero-window probe (a fully exhausted peer a_rwnd needs SACK movement to
+//!   resume)
+//! - An inbound user message larger than `max_message_size` aborts the
+//!   association (RFC 9260 allows a graceful discard instead)
+//! - DCEP ACK chunks and FORWARD-TSN trailing bytes are parsed strictly
+//!   (no lenience for non-minimal encodings), and [`SctpEndpoint::shutdown`]
+//!   does not flush messages that were never sent (the caller drains first)
 //!
 //! [RFC 9260]: https://datatracker.ietf.org/doc/html/rfc9260
 //! [RFC 4960]: https://datatracker.ietf.org/doc/html/rfc4960
@@ -76,9 +84,12 @@ pub struct SctpConfig {
     /// the DTLS/IP overhead (1200 is the WebRTC-blessed default).
     pub mtu: usize,
     /// Out-of-order receive buffer, in chunks (bounded memory; anything
-    /// beyond is dropped and reported as a duplicate).
+    /// beyond is dropped and reported as a duplicate). Clamped to 65535 at
+    /// endpoint creation — SACK gap-block offsets are u16.
     pub recv_window_chunks: u32,
-    /// Send buffer bound, in chunks.
+    /// Send buffer bound, in chunks. A send that would exceed it is rejected
+    /// with [`SctpError::SendBufferFull`] *before* any TSN is consumed
+    /// (clamped to ≥ 1).
     pub send_buffer_chunks: u32,
     pub rto_initial: Duration,
     pub rto_min: Duration,
@@ -165,6 +176,9 @@ pub enum CloseReason {
     LocalClose,
     /// Handshake retransmissions exhausted.
     HandshakeTimeout,
+    /// SHUTDOWN / SHUTDOWN-ACK retransmissions exhausted (T2, RFC 9260
+    /// §9.1/§9.2) — the peer never completed the graceful exchange.
+    ShutdownTimeout,
     /// Cookie stale / MAC mismatch / malformed handshake.
     HandshakeRejected(String),
     /// vtag/TSN/protocol rule violation.

@@ -89,7 +89,7 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **614 passing** across 59 suites, `clippy -D warnings`
+`cargo test --workspace` → **626 passing** across 61 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
 **The external audit is fully closed**: every finding at every severity —
@@ -134,6 +134,12 @@ code before acting (same rule as the external audit). Fixed in this commit:
 * RTP destination from the SDP answer's `c=` line (split signaling/media
   hosts) — pre-existing, now documented in COMPLIANCE §5.
 * RTCP BYE on media teardown; `nacks_tx` counts FCI entries (documented).
+* SCTP (Task 47): fast retransmit on gap-ack/dup-SACK signals (loss recovery
+  waits a full RTO); zero-window probe when the peer advertises a_rwnd 0;
+  oversized inbound messages abort the association (could discard instead);
+  DCEP ACK accepts any 0x02-prefixed buffer (RFC 8832 §5.2 wants exactly one
+  byte); FORWARD-TSN parse tolerates non-multiple-of-4 bodies; `shutdown()`
+  discards queued-but-unsent messages without an event.
 
 Net: **571 tests / 56 suites** (was 561) — 6 new regression tests pin the
 fixed behavior; the wire-format expectations were cross-checked against
@@ -209,3 +215,34 @@ never claims a data channel the media pump cannot serve.
 
 Net: **614 tests / 59 suites** (was 574/56) — sctp +39 (20 lib + 19
 loopback), sdp +1.
+
+# Full-repo audit round + SCTP hardening (Task 47, 2026-09)
+
+A whole-codebase audit wave with three read-only tracks — (a) SCTP engine
+deep-audit against RFC 9260/3758/8832, (b) doc-sync verification of every
+document against the code at HEAD, (c) cross-crate consistency (CI, fuzz
+parity, Docker, demo, workspace hygiene). Findings and fixes:
+
+| # | Finding | Severity | Fix |
+|---|---------|----------|-----|
+| C1 | **Unauthenticated remote panic in `parse_params`**: the last parameter's 4-byte padded advance (`pad4(plen)`) could exceed the remaining slice (`plen ≤ buf.len()` was validated, the ADVANCE was not) — `&buf[8..]` on a 6-byte slice panics. Reachable by a single INIT/HEARTBEAT/ABORT datagram (vtag 0 + valid CRC32c, no handshake state needed) — a DoS of the future DTLS/SCTP seam | **Critical** | Stop cleanly at chunk end when the padded advance overruns (usrsctp/libwebrtc behavior); pinned by a unit test with the exact attack byte form + a packet-entry corpus test |
+| S1 | **Send-buffer overflow silently dropped tail chunks** (`pop_back` after TSNs were consumed) — a permanent TSN hole that stuck the receiver's `cum_tsn` and stalled every later ordered message association-wide, with `send_message` returning `Ok` | **Major** | Reject with `SendBufferFull` BEFORE any TSN is consumed (message granularity); overflow test pins no-loss |
+| S2 | **FORWARD-TSN was fire-and-forget** (RFC 3758 §3.5 violation): the abandoned state was destroyed at emission and nothing retransmitted a lost FTSN — the receiver's `cum_tsn` never advanced and ordered delivery died on every stream | **Major** | Outstanding-FTSN record (new_cum + stream skips) retransmitted on timer/SACK passes until a SACK's cum_tsn covers it; lossy-loopback test drops the FTSN and requires delivery to resume |
+| S3 | **Graceful-shutdown FSM deadlocked on one packet loss**: no T2-SHUTDOWN timer, SHUTDOWN in ShutdownAckSent ignored, no shutdown deadline in `poll_timeout` once outstanding hit 0 (RFC 9260 §9.1/§9.2) | **Major** | T2-SHUTDOWN with exponential backoff + `ShutdownTimeout` abort; SHUTDOWN re-ACKed in ShutdownAckSent; deadline surfaced for both shutdown states; lossy tests cover lost SHUTDOWN and lost SHUTDOWN-ACK |
+| S4 | **Advertised a_rwnd ignored reassembly-held bytes**: only `ofo` counted — parked fragment runs, the unordered current run and pre-DCEP buffers were invisible, so a compliant peer could grow memory unbounded (RFC 9260 §6.2.1) | **Major** | `undelivered_bytes()` spans ofo + ordered runs + unordered + pre-DCEP, saturating the advertised window; parked-data test pins the shrink |
+| S5 | **Predictable security randomness**: one clock-seeded xorshift64\* drew the cookie MAC key, local verification tag and initial TSN — the tag is transmitted in the clear in INIT (state recoverable), the clock seed is brute-forceable, and cookies had no nonce (captured COOKIE-ECHO replayable within the lifetime) | **Major** | Global state seeded once from OS entropy (`getrandom`); 8-byte random nonce added inside the MAC'd cookie region; config overrides preserved; distinct-cookie test added |
+| M1–M9 | Minor: SACK gap processing was O(gaps×span×inflight) per-TSN scans (hostile-peer CPU burn) → merged-range walk; handshake-retransmit exhaustion closed silently (`HandshakeTimeout` close event added); `feed_ordered` opened fragment runs from non-B chunks + post-skip late chunks parked forever (refused/dropped); FORWARD-TSN carried duplicate (sid, ssn) entries (one max-SSN entry per stream, §3.2); T1-INIT/COOKIE retransmits had no RTO backoff (doubles, clamped); a client accepted an uninvited INIT in InitSent and bricked its own handshake (collision guard, §8.5.1(E)); stale-cookie refresh omitted the Stale-Cookie cause (cause 3 + measured µs); `recv_window_chunks` unclamped (≤ 65535 — SACK gap offsets are u16); `heartbeat_interval.unwrap()` in the timeout path (removed) | Minor | All fixed with tests where the behavior is observable |
+| D1 | `docs/TESTING.md` claimed "every parser entry point is exercised" while the newest, most attack-exposed parser (sctp wire) — and the older rfc3263 DNS wire — had no fuzz corpus and no cargo-fuzz target; the gap was silent in this document | **Major (coverage)** | `crates/sctp/tests/fuzz_smoke.rs` + `crates/rfc3263/tests/fuzz_smoke.rs` (deterministic corpora + xorshift mutations, stable CI), `fuzz/fuzz_targets/parse_sctp_packet.rs` + `parse_dcep.rs` + `parse_dns_response.rs`, CI corpus jobs added |
+| D2 | `FINAL_REPORT.md`: the Task 45 history row was deleted by the Task 46 commit, a blank line broke the addendum table, and the §6 Remaining list still claimed sender-side TWCC / GRUU / NAPTR-SRV were open (three tasks stale) | Minor (docs) | Task 45 row restored, table seam fixed, §6 rewritten (Remaining = B2BUA WebRTC leg, dialog-layer extraction, release soak M2, Postgres CDR) |
+| D3 | Cross-crate drift: Dockerfile/compose carried a stale "b2bua is a placeholder / voipd" narrative, no `.dockerignore`, `rust:1.98-slim` base tag implied a pin the floating `stable` toolchain file doesn't provide, `demo/zrtc.toml.example` lacked the documented `[trunk].instance_id` key, demo/README said "Three ways" listing four and "five auth modes" for four, `hmac`/`sha1` were version-literal in 3 manifests while sibling crypto deps are workspace-centralized, `docs/DESIGN.md` retained voipd-era planning sketches | Minor (hygiene) | All fixed in the same commit: Dockerfile header rewritten + `rust:1-slim` base, `.dockerignore` added, example config + README counts corrected, `hmac = { workspace = true }` / `sha1 = { workspace = true }` centralized, DESIGN.md marked as the frozen planning artifact with errata pointers |
+
+**Deferred (documented, not silent)** — added to the list above: SCTP fast
+retransmit on gap-ack/dup-SACK signals (loss recovery currently waits a full
+RTO); zero-window probe when the peer advertises a_rwnd 0; oversized inbound
+messages abort the association (could discard instead); DCEP ACK accepts any
+0x02-prefixed buffer (RFC 8832 §5.2 wants exactly one byte); FORWARD-TSN
+parse tolerates non-multiple-of-4 bodies; `shutdown()` discards queued-but-
+unsent messages without an event.
+
+Net: **626 tests / 61 suites** (was 614/59) — sctp +10 (49: 23 lib + 24
+loopback + 2 fuzz-smoke), rfc3263 +2 (38, incl. 2 fuzz-smoke).

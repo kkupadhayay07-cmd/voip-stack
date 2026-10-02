@@ -1,0 +1,10 @@
+# Keep the Docker build context small — COPY . . ships the whole tree.
+.git
+target/
+**/target/
+fuzz/artifacts/
+fuzz/coverage/
+demo/*.log
+demo/*.pid
+docs/
+.github/

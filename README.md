@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 614 tests passing across 59 suites in 21 crates;
+**Current state: 626 tests passing across 61 suites in 21 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
@@ -60,7 +60,7 @@ recovery) + RFC 8832 DCEP + RFC 3758 FORWARD-TSN in the new `sctp` crate.**
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 614 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 626 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -134,12 +134,18 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
   four-way cookie handshake (lost COOKIE-ECHO recovered by T1), ordered
   streams hold delivery behind gaps while unordered channels deliver
   through them, max-retransmits and max-packet-lifetime messages are
-  abandoned with FORWARD-TSN and later ordered messages skip the SSN, the
-  state cookie rejects a wrong HMAC, and graceful SHUTDOWN defers until
-  everything outstanding is acknowledged. The loopback also caught a real
-  race: T3-RTX fired before the lifetime sweep in the same timer pass and
-  resurrected an expired message — timer handlers are now ordered so
-  abandonment always precedes retransmission.
+  abandoned with FORWARD-TSN, the state cookie rejects a wrong HMAC, and
+  graceful SHUTDOWN defers until everything outstanding is acknowledged.
+  The engine was then hardened against a dedicated audit round (Task 47):
+  the wire parser stops cleanly when a trailing parameter's 4-byte padding
+  overruns the chunk (was an unauthenticated remote panic), send-buffer
+  overflow is rejected before TSNs are consumed (no silent permanent TSN
+  hole), FORWARD-TSN is retransmitted until SACK-acked (RFC 3758 §3.5),
+  graceful shutdown gained a T2-SHUTDOWN timer (one lost SHUTDOWN or
+  SHUTDOWN-ACK no longer deadlocks), the advertised a_rwnd discounts all
+  received-undelivered bytes, cookie secret/tag/TSN are OS-entropy seeded
+  with a random cookie nonce, and the sctp/rfc3263 wire parsers now carry
+  fuzz-smoke corpora + nightly libFuzzer targets in CI.
 * **P2 audit sweep**: RTP/RTCP demux survives SRTCP auth trailers (no %4
   misroute), `push_via` prepends to the stack top, non-2xx ACK mirrors a
   single top Via and keeps the Route set (§17.1.1.2), non-INVITE server tx

@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use sctp::wire::{parse_packet, Chunk};
 use sctp::{ChannelType, CloseReason, SctpConfig, SctpEndpoint, SctpError, SctpEvent};
 
 const RTO: Duration = Duration::from_millis(100);
@@ -44,6 +45,43 @@ impl Harness {
             rto_initial: RTO,
             rto_min: Duration::from_millis(50),
             heartbeat_interval: hb,
+            initial_tag: Some(222),
+            initial_tsn: Some(2000),
+            cookie_key: Some([7u8; 32]),
+            ..SctpConfig::default()
+        });
+        let mut h = Self {
+            client,
+            server,
+            now: base,
+            net: VecDeque::new(),
+            client_events: Vec::new(),
+            server_events: Vec::new(),
+        };
+        h.drain_to_net();
+        h
+    }
+
+    /// Harness with a bounded send buffer (send-buffer-full regression).
+    fn new_with_send_buffer(send_buffer_chunks: u32) -> Self {
+        let base = Instant::now();
+        let client = SctpEndpoint::new_client(
+            SctpConfig {
+                is_client: true,
+                rto_initial: RTO,
+                rto_min: Duration::from_millis(50),
+                send_buffer_chunks,
+                initial_tag: Some(111),
+                initial_tsn: Some(1000),
+                ..SctpConfig::default()
+            },
+            base,
+        )
+        .unwrap();
+        let server = SctpEndpoint::new_server(SctpConfig {
+            is_client: false,
+            rto_initial: RTO,
+            rto_min: Duration::from_millis(50),
             initial_tag: Some(222),
             initial_tsn: Some(2000),
             cookie_key: Some([7u8; 32]),
@@ -422,7 +460,7 @@ fn graceful_shutdown_three_way() {
     h.handshake();
     let _ = h.take_client_events();
     let _ = h.take_server_events();
-    h.client.shutdown().unwrap();
+    h.client.shutdown(h.now).unwrap();
     h.drain_to_net();
     h.deliver_all();
     assert_eq!(
@@ -448,7 +486,7 @@ fn shutdown_defers_until_outstanding_acked() {
     h.deliver_all();
 
     h.client_send(s, b"payload".to_vec());
-    h.client.shutdown().unwrap();
+    h.client.shutdown(h.now).unwrap();
     h.drain_to_net();
     h.deliver_all();
     // Data still delivered, then the shutdown exchange runs. Snapshot both
@@ -587,4 +625,192 @@ fn message_size_cap_and_stream_checks() {
             .open_data_channel("nope", "", ChannelType::Reliable, fresh.now),
         Err(SctpError::WrongState(_))
     ));
+}
+
+/// AUD-2: a send that would exceed `send_buffer_chunks` must be rejected
+/// with `SendBufferFull` BEFORE any TSN is consumed — the pre-fix behavior
+/// popped already-assigned chunks off the tail, punching a permanent TSN
+/// hole that stalled ordered delivery forever.
+#[test]
+fn send_buffer_overflow_rejects_before_tsn_consumed() {
+    let mut h = Harness::new_with_send_buffer(2);
+    h.handshake();
+    let s = h
+        .client
+        .open_data_channel("sb", "", ChannelType::Reliable, h.now)
+        .unwrap();
+    h.drain_to_net();
+    h.deliver_all();
+
+    // Two 1-chunk messages fill the buffer (nothing acked yet).
+    h.client
+        .send_message(s, 60, b"one".to_vec(), h.now)
+        .unwrap();
+    h.client
+        .send_message(s, 60, b"two".to_vec(), h.now)
+        .unwrap();
+    h.drain_to_net();
+    assert!(matches!(
+        h.client.send_message(s, 60, b"three".to_vec(), h.now),
+        Err(SctpError::SendBufferFull)
+    ));
+    // The rejected burst consumed no TSNs: the two queued messages deliver
+    // gap-free.
+    h.deliver_all();
+    assert_eq!(
+        msgs(&h.take_server_events()),
+        vec![(s, b"one".to_vec()), (s, b"two".to_vec())]
+    );
+    // The association is alive and delivers subsequent messages.
+    h.client_send(s, b"four".to_vec());
+    h.deliver_all();
+    assert_eq!(msgs(&h.take_server_events()), vec![(s, b"four".to_vec())]);
+}
+
+/// AUD-3 (RFC 3758 §3.5): a lost FORWARD-TSN must be regenerated (on its own
+/// deadline — no T3 is running once the abandoned chunk left the queue) until
+/// the peer's cumulative ack covers it, or the receiver's ordered streams
+/// stall forever.
+#[test]
+fn lost_forward_tsn_is_retransmitted_until_acked() {
+    let mut h = Harness::new();
+    h.handshake();
+    let s = h
+        .client
+        .open_data_channel("pr", "", ChannelType::MaxRetransmits(0), h.now)
+        .unwrap();
+    h.drain_to_net();
+    h.deliver_all();
+
+    h.client_send(s, b"dead".to_vec());
+    assert!(h.drop_first(true));
+    h.deliver_all();
+
+    // T3: retransmit budget exhausted → abandon → FORWARD-TSN emitted.
+    h.now += RTO;
+    h.client.on_timeout(h.now);
+    h.server.on_timeout(h.now);
+    h.drain_to_net();
+    // Lose the FORWARD-TSN (the abandoned chunk is not retransmitted, so it
+    // is the only packet heading to the server).
+    assert!(h.drop_first(true), "FORWARD-TSN must be in flight");
+    h.deliver_all();
+    assert_eq!(h.server.stats().ftsn_rx, 0, "the announcement was lost");
+
+    // The dedicated deadline regenerates the announcement.
+    let deadline = h.client.poll_timeout().expect("FTSN retransmit deadline");
+    h.now = deadline;
+    h.client.on_timeout(h.now);
+    h.server.on_timeout(h.now);
+    h.drain_to_net();
+    h.deliver_all();
+    assert!(
+        h.server.stats().ftsn_rx >= 1,
+        "lost FTSN must be regenerated"
+    );
+
+    // The receiver skipped the dead message: the next ordered one delivers.
+    h.client_send(s, b"alive".to_vec());
+    h.deliver_all();
+    assert_eq!(msgs(&h.take_server_events()), vec![(s, b"alive".to_vec())]);
+}
+
+/// AUD-4 (RFC 9260 §9.2): a lost SHUTDOWN-ACK must not deadlock the
+/// exchange — the client's T2 retransmits the SHUTDOWN and the server in
+/// ShutdownAckSent re-acknowledges it.
+#[test]
+fn shutdown_survives_lost_shutdown_ack_via_t2() {
+    let mut h = Harness::new();
+    h.handshake();
+    let _ = h.take_client_events();
+    let _ = h.take_server_events();
+
+    h.client.shutdown(h.now).unwrap();
+    h.drain_to_net();
+    // Deliver the SHUTDOWN; the server replies SHUTDOWN-ACK — lose it.
+    let (_, shutdown) = h.net.pop_front().unwrap();
+    h.server.handle_packet(&shutdown, h.now);
+    h.drain_to_net();
+    assert!(h.drop_first(false), "SHUTDOWN-ACK must be in flight");
+    h.deliver_all();
+    assert!(!h.client.is_closed() && !h.server.is_closed());
+
+    // T2 fires on both sides: the client resends SHUTDOWN, the server
+    // (ShutdownAckSent) re-sends SHUTDOWN-ACK → the exchange completes.
+    h.advance(RTO);
+    let ce = h.take_client_events();
+    let se = h.take_server_events();
+    assert!(ce.contains(&SctpEvent::Closed(CloseReason::Shutdown)));
+    assert!(se.contains(&SctpEvent::Closed(CloseReason::Shutdown)));
+    assert!(h.client.is_closed() && h.server.is_closed());
+}
+
+/// AUD-4: with the peer dead, T2 retransmission exhaustion aborts the
+/// association with `ShutdownTimeout` instead of hanging forever.
+#[test]
+fn t2_exhaustion_aborts_with_shutdown_timeout() {
+    let mut h = Harness::new();
+    h.handshake();
+    let _ = h.take_client_events();
+
+    h.client.shutdown(h.now).unwrap();
+    h.drain_to_net();
+    // Black-hole the exchange: drop every client→server packet and never
+    // let the peer answer. Pump on poll_timeout until the endpoint aborts.
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        let Some(deadline) = h.client.poll_timeout() else {
+            break;
+        };
+        h.now = h.now.max(deadline);
+        events.extend(h.client.on_timeout(h.now));
+        h.drain_to_net();
+        h.net.retain(|(dst, _)| !*dst);
+        if h.client.is_closed() {
+            break;
+        }
+    }
+    assert!(
+        events.contains(&SctpEvent::Closed(CloseReason::ShutdownTimeout)),
+        "T2 exhaustion must surface ShutdownTimeout, got {events:?}"
+    );
+    assert!(h.client.is_closed());
+}
+
+/// AUD-5 (RFC 9260 §6.2.1): the SACK's a_rwnd must discount ALL
+/// received-but-undelivered bytes (here: a chunk parked in the out-of-order
+/// queue behind a gap), not just some — otherwise the advertised window
+/// overstates the buffer and receive memory is unbounded.
+#[test]
+fn sack_a_rwnd_discounts_undelivered_bytes() {
+    let mut h = Harness::new();
+    h.handshake();
+    let s = h
+        .client
+        .open_data_channel("w", "", ChannelType::Reliable, h.now)
+        .unwrap();
+    h.drain_to_net();
+    h.deliver_all();
+
+    h.client_send(s, b"first".to_vec());
+    assert!(h.drop_first(true));
+    h.client_send(s, b"second".to_vec());
+    // Deliver "second" by hand and capture the server's SACK: it parks in
+    // the ofo queue (6 undelivered payload bytes).
+    let (_, data2) = h.net.pop_front().unwrap();
+    assert!(h.server.handle_packet(&data2, h.now).is_empty());
+    h.drain_to_net();
+    let (_, sack_pkt) = h.net.pop_front().unwrap();
+    let parsed = parse_packet(&sack_pkt, true).expect("server SACK must parse");
+    let sack = match parsed.chunks.first() {
+        Some(Chunk::Sack(s)) => s,
+        other => panic!("expected SACK, got {other:?}"),
+    };
+    assert_eq!(sack.gaps.len(), 1, "gap block for the parked chunk");
+    let full_window = u64::from(64u32) * 1200; // recv_window_chunks * mtu
+    assert_eq!(
+        u64::from(sack.a_rwnd),
+        full_window - 6,
+        "a_rwnd must discount the undelivered payload bytes"
+    );
 }
