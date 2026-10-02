@@ -235,7 +235,12 @@ impl DtlsEndpoint {
             tokio::select! {
                 r = socket.recv_from(buf) => {
                     match r {
-                        Ok((n, from)) if from == peer => {
+                        Ok((n, from)) if from == peer && n > 0 && (20..=63).contains(&buf[0]) => {
+                            // RFC 7983: only DTLS records (first byte 20–63)
+                            // feed the state machine.  STUN (0–3) or media
+                            // (128–191) datagrams from the SAME address —
+                            // e.g. ICE keepalives riding the selected pair —
+                            // must not be handed to OpenSSL.
                             self.push_datagram(buf[..n].to_vec());
                             received = true;
                         }

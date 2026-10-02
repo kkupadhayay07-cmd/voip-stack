@@ -16,9 +16,13 @@ sip-tx = { workspace = true }
 sdp = { workspace = true }
 rtp = { workspace = true }
 codecs = { workspace = true }
+srtp = { workspace = true }
+ice = { workspace = true }
+dtls = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
+thiserror = { workspace = true }

@@ -1,8 +1,10 @@
 //! SDP helpers: local capability sets, offers and answers for both legs.
 
 use codecs::{CodecId, FormatInfo, Registry};
-use sdp::negotiate::{answer_session, CodecCap, MediaCaps, NegotiateError, StreamPlan};
-use sdp::types::{Attribute, Connection, ExtMap, MediaDescription, Origin, Session, Timing};
+use sdp::negotiate::{answer_session, CodecCap, IceCreds, MediaCaps, NegotiateError, StreamPlan};
+use sdp::types::{
+    Attribute, Connection, ExtMap, Fingerprint, MediaDescription, Origin, Session, Timing,
+};
 
 /// Payload types we advertise for dynamic codecs.
 pub const PT_OPUS: u8 = 111;
@@ -70,6 +72,34 @@ pub fn audio_caps(host: &str, port: u16, codecs: &[CodecId]) -> MediaCaps {
     let mut caps = MediaCaps::audio(host, port, caps_for(codecs));
     caps.telephone_event = Some(CodecCap::new("telephone-event", 8000, PT_TELEPHONE_EVENT));
     caps
+}
+
+/// WebRTC transport fields the answer carries when the leg negotiated
+/// ICE + DTLS-SRTP (`webrtc::WebRtcMedia::answer_transport` output).
+#[derive(Debug, Clone)]
+pub struct WebrtcAnswerCaps {
+    pub ufrag: String,
+    pub pwd: String,
+    /// Our certificate fingerprint, bare colon-hex (no `sha-256 ` prefix).
+    pub fingerprint: String,
+    /// Candidate lines in RFC 8839 form (without the `a=` prefix).
+    pub candidates: Vec<String>,
+}
+
+impl WebrtcAnswerCaps {
+    fn apply(self, caps: &mut MediaCaps) {
+        caps.ice = Some(IceCreds {
+            ufrag: self.ufrag,
+            pwd: self.pwd,
+        });
+        caps.ice_candidates = self.candidates;
+        caps.fingerprint = Some(Fingerprint {
+            hash_func: "sha-256".to_owned(),
+            value: self.fingerprint,
+        });
+        // caps.setup stays `Active`: we are the answerer and drive the DTLS
+        // handshake as the client (RFC 5763 §5).
+    }
 }
 
 /// Builds a session-level SDP offer for the UAC leg (audio, all local codecs).
@@ -195,13 +225,20 @@ pub fn build_offer(host: &str, port: u16, codecs: &[CodecId], sess_id: u32) -> S
 }
 
 /// Builds the answer for an inbound offer using local capabilities.
+/// `webrtc` carries the ICE/DTLS fields when the leg negotiated
+/// UDP/TLS/RTP/SAVPF (None on plain RTP/AVP legs).
 pub fn answer(
     offer: &Session,
     host: &str,
     port: u16,
     codecs: &[CodecId],
+    webrtc: Option<WebrtcAnswerCaps>,
 ) -> Result<Session, NegotiateError> {
-    answer_session(offer, &[audio_caps(host, port, codecs)])
+    let mut caps = audio_caps(host, port, codecs);
+    if let Some(w) = webrtc {
+        w.apply(&mut caps);
+    }
+    answer_session(offer, &[caps])
 }
 
 /// Extracts the (codec-name, clock, channels) and payload type the plan uses.
@@ -247,7 +284,7 @@ mod tests {
         let offer = build_offer("127.0.0.1", 30000, &codecs, 42);
         let text = offer.serialize();
         let parsed = sdp::parse::parse(&text).expect("offer parses");
-        let ans = answer(&parsed, "127.0.0.1", 30001, &codecs).expect("self answer");
+        let ans = answer(&parsed, "127.0.0.1", 30001, &codecs, None).expect("self answer");
         let plans = sdp::negotiate::stream_plans(&ans);
         assert_eq!(plans.len(), 1);
         assert!(plans[0].active);
@@ -275,7 +312,7 @@ mod tests {
         assert!(plans[0].rtcp_fb_nack);
         assert_eq!(plans[0].twcc_ext_id, Some(1));
         // ...and the offer/answer loop preserves them end to end.
-        let ans = answer(&parsed, "127.0.0.1", 30001, &[CodecId::Pcmu]).unwrap();
+        let ans = answer(&parsed, "127.0.0.1", 30001, &[CodecId::Pcmu], None).unwrap();
         let ans_plans = sdp::negotiate::stream_plans(&sdp::parse::parse(&ans.serialize()).unwrap());
         assert!(ans_plans[0].rtcp_fb_nack);
         assert_eq!(ans_plans[0].twcc_ext_id, Some(1));

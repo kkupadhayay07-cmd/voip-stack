@@ -13,6 +13,7 @@ use rtp::nack::{nack_packet, nack_seqs, parse_nack_fci, NackTracker, RtxPool, RT
 use rtp::packet::{RtpExtension, RtpPacket};
 use rtp::rtcp::{encode_compound, parse_compound, RtcpPacket, SdesChunk, SdesType, SenderInfo};
 use rtp::twcc::{parse_twcc, twcc_packet, TwccRxMonitor, TwccSendTracker};
+use srtp::SrtpSession;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering::Relaxed;
@@ -25,6 +26,40 @@ use tokio::sync::{mpsc, watch, Mutex};
 /// G.711/G.729; downsampled for Opus fullband — a fullband pass-through fast
 /// path is a Phase 4 optimization).
 pub const BRIDGE_RATE: u32 = 16_000;
+
+/// SRTP sessions for one leg, keyed by the DTLS-SRTP handshake
+/// (RFC 3711): `tx` protects what this leg sends, `rx` opens what it
+/// receives.  Owned by the pump task — the sessions carry per-stream ROC
+/// state that must not be shared.
+pub struct CryptoPair {
+    pub tx: SrtpSession,
+    pub rx: SrtpSession,
+}
+
+impl std::fmt::Debug for CryptoPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CryptoPair")
+            .field("profile", &self.tx.profile())
+            .finish()
+    }
+}
+
+/// Protect an outbound datagram when the leg negotiated SRTP.  `rtcp`
+/// selects the SRTCP transform (RFC 3711 §3.3/§3.4 — index + E-bit + auth
+/// tag appended, unlike the SRTP packet-attached tag).  Returns `false`
+/// when protection failed: the caller must NOT fall back to plaintext —
+/// the leg negotiated SAVPF, so an unprotected packet is a wire-format
+/// violation, not a fallback path.
+fn seal(crypto: &mut Option<CryptoPair>, wire: &mut Vec<u8>, rtcp: bool) -> bool {
+    let Some(cp) = crypto.as_mut() else {
+        return true;
+    };
+    if rtcp {
+        cp.tx.protect_rtcp(wire).is_ok()
+    } else {
+        cp.tx.protect(wire).is_ok()
+    }
+}
 
 /// Everything the pump needs for one leg's media.
 #[derive(Debug, Clone)]
@@ -91,6 +126,9 @@ pub struct MediaStats {
     /// across the latest feedback window (clock-domain free — see
     /// `TwccPacketResult::delay_us`).
     pub twcc_mean_delay_us: std::sync::atomic::AtomicI64,
+    /// Datagrams dropped because SRTP protection/opening failed (never
+    /// sent or parsed as plaintext).
+    pub srtp_failures: std::sync::atomic::AtomicU64,
 }
 
 impl MediaStats {
@@ -132,6 +170,9 @@ impl MediaStats {
     }
     pub fn twcc_mean_delay_us(&self) -> i64 {
         self.twcc_mean_delay_us.load(Relaxed)
+    }
+    pub fn srtp_failures(&self) -> u64 {
+        self.srtp_failures.load(Relaxed)
     }
 }
 
@@ -183,16 +224,18 @@ pub enum BridgeMsg {
     },
 }
 
-/// Starts a media pump on an already-bound RTP socket.
+/// Starts a media pump on an already-bound RTP socket (plaintext RTP/AVP
+/// leg).
 pub fn start_with_socket(
     cfg: PumpConfig,
     rtp: Arc<UdpSocket>,
     bridge_out: mpsc::Sender<BridgeMsg>,
     bridge_in: mpsc::Receiver<BridgeMsg>,
 ) -> Result<PumpHandle, codecs::CodecError> {
-    start_with_socket_session(
+    start_with_socket_session_crypto(
         cfg,
         rtp,
+        None,
         bridge_out,
         bridge_in,
         observ::CallSession::detached(),
@@ -209,6 +252,22 @@ pub fn start_with_socket_session(
     bridge_in: mpsc::Receiver<BridgeMsg>,
     session: observ::CallSession,
 ) -> Result<PumpHandle, codecs::CodecError> {
+    start_with_socket_session_crypto(cfg, rtp, None, bridge_out, bridge_in, session)
+}
+
+/// Starts a pump with optional SRTP crypto (`Some` on a leg that
+/// negotiated UDP/TLS/RTP/SAVPF and completed ICE+DTLS).  The pump owns
+/// the sessions: every send is protected, every receive opened, and an
+/// unprotectable inbound datagram is dropped — never parsed as plaintext
+/// (RFC 3711; no AVP/SAVPF fallback on a negotiated-secure leg).
+pub fn start_with_socket_session_crypto(
+    cfg: PumpConfig,
+    rtp: Arc<UdpSocket>,
+    crypto: Option<CryptoPair>,
+    bridge_out: mpsc::Sender<BridgeMsg>,
+    bridge_in: mpsc::Receiver<BridgeMsg>,
+    session: observ::CallSession,
+) -> Result<PumpHandle, codecs::CodecError> {
     let remote = Arc::new(Mutex::new(None::<SocketAddr>));
     let stats = Arc::new(MediaStats::default());
     let (stop_tx, stop) = watch::channel(false);
@@ -219,6 +278,7 @@ pub fn start_with_socket_session(
     let task = tokio::spawn(run_pump(
         cfg,
         rtp,
+        crypto,
         remote.clone(),
         stats.clone(),
         dec,
@@ -243,6 +303,7 @@ pub fn start_with_socket_session(
 async fn run_pump(
     cfg: PumpConfig,
     rtp: Arc<UdpSocket>,
+    mut crypto: Option<CryptoPair>,
     remote: Arc<Mutex<Option<SocketAddr>>>,
     stats: Arc<MediaStats>,
     mut dec: Box<dyn Decoder>,
@@ -411,8 +472,12 @@ async fn run_pump(
                     ssrc,
                     items: vec![(SdesType::Cname, format!("zrtc-{ssrc:08x}"))],
                 }]);
-                let wire = encode_compound(&[sr, cname]);
-                let _ = rtp.send_to(&wire, dst).await;
+                let mut wire = encode_compound(&[sr, cname]);
+                if seal(&mut crypto, &mut wire, true) {
+                    let _ = rtp.send_to(&wire, dst).await;
+                } else {
+                    stats.srtp_failures.fetch_add(1, Relaxed);
+                }
             }
             _ = twcc_tick.tick() => {
                 // draft-holmerberg transport-cc: drain the arrival window
@@ -430,7 +495,12 @@ async fn run_pump(
                                     ssrc,
                                     blocks: Vec::new(),
                                 };
-                                let _ = rtp.send_to(&encode_compound(&[rr, p]), dst).await;
+                                let mut wire = encode_compound(&[rr, p]);
+                                if seal(&mut crypto, &mut wire, true) {
+                                    let _ = rtp.send_to(&wire, dst).await;
+                                } else {
+                                    stats.srtp_failures.fetch_add(1, Relaxed);
+                                }
                             }
                         }
                     }
@@ -441,12 +511,32 @@ async fn run_pump(
                     Ok(x) => x,
                     Err(e) => { tracing::debug!("media recv err: {e}"); continue; }
                 };
+                // RFC 7983 demultiplexing on a secured leg: STUN (0–3) and
+                // DTLS (20–63) bytes never reach the RTP/RTCP parsers —
+                // post-handshake STUN keepalives and stray DTLS datagrams
+                // are dropped here.
+                if crypto.is_some() {
+                    match buf.first() {
+                        Some(b) if *b <= 3 => continue,
+                        Some(b) if (20..=63).contains(b) => continue,
+                        _ => {}
+                    }
+                }
                 if rtp::looks_like_rtcp(&buf[..n]) {
                     // RFC 3550 §7.1 + RFC 4585: NACK requests pull media
                     // packets back out of the retransmission window; SRs
                     // feed our DLSR/last_sr fields.
+                    let mut rtcp_wire = buf[..n].to_vec();
+                    if crypto.is_some() {
+                        let Some(cp) = crypto.as_mut() else { continue };
+                        if cp.rx.unprotect_rtcp(&mut rtcp_wire).is_err() {
+                            // Forged or corrupt SRTCP: drop, never parse.
+                            stats.srtp_failures.fetch_add(1, Relaxed);
+                            continue;
+                        }
+                    }
                     handle_rtcp(
-                        &buf[..n],
+                        &rtcp_wire,
                         src,
                         &rtp,
                         &resend,
@@ -456,8 +546,61 @@ async fn run_pump(
                         ssrc,
                         remote_ssrc,
                         &stats,
+                        &mut crypto,
                     )
                     .await;
+                    continue;
+                }
+                if crypto.is_some() {
+                    // Secured media path: open the SRTP datagram BEFORE any
+                    // parsing.  An unprotectable datagram (forged, corrupt,
+                    // or replayed) is dropped — never parsed as plaintext.
+                    let Some(cp) = crypto.as_mut() else { continue };
+                    let mut wire = buf[..n].to_vec();
+                    if cp.rx.unprotect(&mut wire).is_err() {
+                        stats.srtp_failures.fetch_add(1, Relaxed);
+                        continue;
+                    }
+                    let Ok(pkt) = RtpPacket::parse(&wire) else { continue };
+                    stats.packets_rx.fetch_add(1, Relaxed);
+                    // media hook: RTP packet tap
+                    observ::session::rtp_tap(session.call_id(), session.leg(), src, local, &wire, true);
+                    {
+                        let mut r = remote.lock().await;
+                        if r.is_none_or(|a| a != src) {
+                            *r = Some(src);
+                        }
+                    }
+                    if remote_ssrc.is_none() {
+                        remote_ssrc = Some(pkt.ssrc());
+                    }
+                    let now_ms = started.elapsed().as_millis() as u64;
+                    nack_tracker.on_packet(pkt.ssrc(), pkt.header.sequence, now_ms);
+                    if let (Some(ext_id), Some(ext)) = (cfg.twcc_ext, pkt.extension.as_ref()) {
+                        if let Some(tseq) = onebyte_ext_value(ext, ext_id) {
+                            twcc.on_packet(tseq, Some(started.elapsed().as_micros() as u64));
+                        }
+                    }
+                    if Some(pkt.payload_type()) == cfg.te_pt_rx {
+                        let msg = BridgeMsg::Dtmf {
+                            timestamp: pkt.header.timestamp,
+                            marker: pkt.header.marker,
+                            payload: pkt.payload.to_vec(),
+                        };
+                        if bridge_out.try_send(msg).is_err() {
+                            tracing::debug!("bridge backpressured; DTMF event dropped");
+                        }
+                        continue;
+                    }
+                    let _ = jb.push(
+                        pkt.ssrc(),
+                        pkt.header.sequence,
+                        pkt.header.timestamp,
+                        pkt.header.marker,
+                        pkt.payload_type(),
+                        pkt.payload.to_vec(),
+                        now_ms,
+                    );
                     continue;
                 }
                 let Ok(pkt) = RtpPacket::parse(&buf[..n]) else { continue };
@@ -489,7 +632,12 @@ async fn run_pump(
                             ssrc,
                             blocks: Vec::new(),
                         };
-                        let _ = rtp.send_to(&encode_compound(&[rr, p]), src).await;
+                        let mut wire = encode_compound(&[rr, p]);
+                        if seal(&mut crypto, &mut wire, true) {
+                            let _ = rtp.send_to(&wire, src).await;
+                        } else {
+                            stats.srtp_failures.fetch_add(1, Relaxed);
+                        }
                     }
                 }
                 if let (Some(ext_id), Some(ext)) = (cfg.twcc_ext, pkt.extension.as_ref()) {
@@ -612,10 +760,14 @@ async fn run_pump(
                             tx_octets += relay.payload.len() as u64;
                             resend.store(&relay);
                             // media hook: DTMF relay tap
-                            let wire = relay.encode();
+                            let mut wire = relay.encode();
                             stats.packets_tx.fetch_add(1, Relaxed);
                             observ::session::rtp_tap(session.call_id(), session.leg(), local, dst, &wire, false);
-                            let _ = rtp.send_to(&wire, dst).await;
+                            if seal(&mut crypto, &mut wire, false) {
+                                let _ = rtp.send_to(&wire, dst).await;
+                            } else {
+                                stats.srtp_failures.fetch_add(1, Relaxed);
+                            }
                         }
                     }
                     BridgeMsg::Pcm(pcm) => {
@@ -652,11 +804,15 @@ async fn run_pump(
                                     tx_pkts += 1;
                                     tx_octets += pkt.payload.len() as u64;
                                     resend.store(&pkt);
-                                    // media hook: encoded frame tap
-                                    let encoded = pkt.encode();
+                                    // media hook: encoded frame tap (pre-crypto
+                                    // wire form)
+                                    let mut encoded = pkt.encode();
                                     stats.packets_tx.fetch_add(1, Relaxed);
-                                    observ::session::rtp_tap(session.call_id(), session.leg(), local, dst, &encoded, false);
-                                    let _ = rtp.send_to(&encoded, dst).await;
+                                    if seal(&mut crypto, &mut encoded, false) {
+                                        let _ = rtp.send_to(&encoded, dst).await;
+                                    } else {
+                                        stats.srtp_failures.fetch_add(1, Relaxed);
+                                    }
                                 }
                             }
                             enc_in.drain(..frame_len);
@@ -703,6 +859,7 @@ async fn handle_rtcp(
     our_ssrc: u32,
     remote_ssrc: Option<u32>,
     stats: &MediaStats,
+    crypto: &mut Option<CryptoPair>,
 ) {
     let Ok(packets) = parse_compound(wire) else {
         return;
@@ -741,9 +898,16 @@ async fn handle_rtcp(
                     }
                     guard.insert(seq, Instant::now());
                     if let Some(orig) = resend.get(seq) {
-                        let wire = orig.encode();
+                        // Retransmissions ride the same wire format as the
+                        // original — protected on a secured leg (RFC 4585
+                        // §6.2.1 non-RTX form, verbatim payload).
+                        let mut wire = orig.encode();
                         stats.retransmits_tx.fetch_add(1, Relaxed);
-                        let _ = rtp.send_to(&wire, src).await;
+                        if seal(crypto, &mut wire, false) {
+                            let _ = rtp.send_to(&wire, src).await;
+                        } else {
+                            stats.srtp_failures.fetch_add(1, Relaxed);
+                        }
                     } else {
                         stats.nack_misses.fetch_add(1, Relaxed);
                     }

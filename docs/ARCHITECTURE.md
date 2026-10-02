@@ -67,6 +67,8 @@ this repository's code.
                 └──┬───────┬──┘
    media/security  │       │      ┌──────────────────────────────┐
                 ┌──▼─────┐ └─────►│ srtp · dtls · ice (STUN/TURN)│
+                │        │        │  (b2bua WebRTC legs: ICE →   │
+                │        │        │   DTLS-SRTP → SRTP pump)     │
         ┌───────▼────┐   ┌──────▼──────┐└──────────────▲───────────────┘
         │    rtp     │   │    codecs   │   WebRTC keying (DTLS export)
         │ RTP/JB/DTMF│   │ Opus/G.711/ │
@@ -208,7 +210,31 @@ with the S-bit (bit 14) selecting symbol size, and inter-arrival recv
 deltas the sender accumulates. Pumps enable only what the leg's SDP
 negotiation allows — unnegotiated legs stay RTCP-silent.
 
-### 5.3 Data channels (library layer — not yet attached to a call)
+### 5.3 WebRTC media legs (b2bua::webrtc)
+
+A leg whose offer is `UDP/TLS/RTP/SAVPF` with ICE + a sha-256 fingerprint
+runs ICE → DTLS → SRTP instead of plaintext RTP. On INVITE the engine
+prepares the transport (`WebRtcMedia::prepare`): the ICE agent binds its
+own socket (controlled role; its port becomes the answer's media port),
+gathers a host candidate and adopts the offer's credentials/candidates;
+the DTLS endpoint is created as the CLIENT because we answer
+`setup:active` (RFC 5763 §5 — the answerer may not start DTLS until ICE
+completes), with the offer's fingerprint pinned (sha-256 enforced). The
+answer carries `ice-ufrag/pwd`, our candidate lines (new
+`MediaCaps::ice_candidates` echo, prefix-less wire form, parse→serialize
+fixed point), `a=fingerprint` and `a=setup:active`. After the 200 OK
+leaves, `establish()` connects ICE (checks re-issued every 500 ms until
+nomination — the answerer's first burst races the answer), drives the
+DTLS handshake over the nominated pair through the RFC 7983 filter, and
+exports the RFC 5764 §4.2 keying into the pump's SRTP sessions. From
+then on the pump owns the crypto: RFC 7983 demux drops STUN/DTLS bytes
+before the media parsers, every send is protected (SRTCP compounds for
+RTCP, verbatim-RTP retransmits for NACK answers), every receive is
+opened BEFORE parsing, an unprotectable datagram is counted and dropped,
+and a leg that negotiated SAVPF has no plaintext fallback. A SAVPF offer
+without ICE credentials is rejected 488.
+
+### 5.4 Data channels (library layer — SCTP engine ready, DTLS transport now exists)
 
 The `sctp` crate holds the full data-channel protocol engine with NO
 transport attached: `SctpEndpoint::handle_packet(bytes)` consumes one SCTP
@@ -224,12 +250,13 @@ FORWARD-TSN, graceful SHUTDOWN and ABORT. All timers are caller-driven
 (`poll_timeout` + `on_timeout(now)`), so the engine is testable on a
 virtual clock — the lossy-loopback suite pins gap recovery, PR
 abandonment, forged cookies and the timer ordering that prevents a
-retransmission of an expired message. Until the ICE/DTLS/SRTP leg is
-wired into the B2BUA, the SDP engine answers `m=application` offers with
-port 0 (RFC 3264 §6) so the negotiation never promises a channel the
-media pump cannot serve.
+retransmission of an expired message. The DTLS transport the data
+channels will ride now EXISTS (see §5.2's WebRTC leg); until the SCTP
+engine is attached to it, the SDP engine answers `m=application` offers
+with port 0 (RFC 3264 §6) so the negotiation never promises a channel
+the media pump cannot serve.
 
-### 5.4 Control & observability
+### 5.5 Control & observability
 
 CDR events are emitted on unbounded channels from call engines and drained by
 a single writer task (one record per call, persisted via the `cdr` store).

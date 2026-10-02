@@ -202,7 +202,7 @@ async fn handle_invite(
         }
     };
     let rtp_port = rtp.local_addr().map(|a| a.port()).unwrap_or(0);
-    let answer = match sdp_util::answer(&offer, host, rtp_port, &SINK_CODECS) {
+    let answer = match sdp_util::answer(&offer, host, rtp_port, &SINK_CODECS, None) {
         Ok(a) => a,
         Err(e) => {
             tracing::info!(%call_id, "sink: SDP negotiation failed: {e:?}");

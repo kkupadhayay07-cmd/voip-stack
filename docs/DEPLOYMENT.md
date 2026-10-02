@@ -229,16 +229,21 @@ configured bounds. Guidance:
    when the extmap is negotiated) **and data channels ✅ shipped in the
    `sctp` crate** (RFC 9260/4960 association engine + RFC 8832 DCEP +
    RFC 3758 FORWARD-TSN, transport-agnostic for RFC 8261 DTLS
-   encapsulation); remaining: wiring the ICE/DTLS/SRTP leg into the B2BUA
-   (until then `m=application` offers are answered port-0 honestly).
+   encapsulation) **and the B2BUA WebRTC leg ✅ shipped** (SAVPF offers
+   answered with ICE → DTLS-SRTP → SRTP pump crypto; SRTP-only media, no
+   plaintext fallback; ICE+DTLS+SRTP loopback integration test);
+   remaining: SCTP data channels over the established DTLS (RFC 8261),
+   offerer-side (leg B) WebRTC (until then `m=application` offers are
+   answered port-0 honestly).
 5. **Container entrypoint** — wire `zrtc` as the image entrypoint with a
    mounted config + real healthcheck.
 6. **SDP hardening** (rejected m-lines, port-0 answers, the RFC 3264 §6.1
    direction clamp, **IPv6 answer address types and RFC 8843 BUNDLE group
    echo are done**) — and **GRUU/Outbound done** (RFC 5626 flow
    keep-alives + registration refresh, RFC 5627 pub-gruu synthesis;
-   `NAPTR/SRV` shipped earlier), leaving the B2BUA WebRTC leg and
-   carrier-grade signaling extras on the extension list. (PRACK/100rel shipped — see
+   `NAPTR/SRV` shipped earlier, and the **B2BUA WebRTC leg shipped in
+   Task 48**) — carrier-grade signaling extras remain on the extension
+   list. (PRACK/100rel shipped — see
    `COMPLIANCE.md`. The external audit is fully closed at every severity —
    Critical, High and the complete P2 backlog — with regression tests;
    see `docs/BUG_AUDIT_2026-09.md`.)

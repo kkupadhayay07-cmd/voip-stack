@@ -366,10 +366,19 @@ impl IceAgent {
 
     /// Run connectivity checks until a pair is nominated or `timeout`
     /// elapses.  Returns the selected pair.
+    ///
+    /// Checks are RE-ISSUED every 500 ms until nomination.  The first burst
+    /// alone is not enough for an answerer: the peer cannot validate our
+    /// requests until it has received our answer (short-term credentials
+    /// travel in the SDP), so early checks are dropped as unauthorized and
+    /// without a re-issue the controlled-side path never completes when we
+    /// happen to draw the controlling role (RFC 8445 §7.2.2 keepalive-style
+    /// restlessness as a workaround for the offer/answer credential race).
     pub async fn connect(&mut self, timeout: Duration) -> Result<SelectedPair, IceError> {
         let remote_pwd = self.remote_pwd.clone().ok_or(IceError::NoValidPair)?;
         let remote_ufrag = self.remote_ufrag.clone().ok_or(IceError::NoValidPair)?;
         self.issue_checks(&remote_ufrag, &remote_pwd).await?;
+        let mut last_issue = std::time::Instant::now();
 
         // Pump the socket until nominated, re-issuing checks when a role
         // conflict forces a switch (RFC 8445 §7.3.1.1).
@@ -379,6 +388,10 @@ impl IceAgent {
         loop {
             if let Some(sel) = &self.selected {
                 return Ok(sel.clone());
+            }
+            if last_issue.elapsed() >= Duration::from_millis(500) {
+                last_issue = std::time::Instant::now();
+                self.issue_checks(&remote_ufrag, &remote_pwd).await?;
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -391,6 +404,7 @@ impl IceAgent {
             self.handle_datagram(&buf[..n], from).await?;
             if self.role_version != role_version {
                 role_version = self.role_version;
+                last_issue = std::time::Instant::now();
                 self.issue_checks(&remote_ufrag, &remote_pwd).await?;
             }
         }

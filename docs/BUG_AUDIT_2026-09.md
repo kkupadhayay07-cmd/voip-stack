@@ -89,7 +89,7 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **626 passing** across 61 suites, `clippy -D warnings`
+`cargo test --workspace` → **628 passing** across 63 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
 **The external audit is fully closed**: every finding at every severity —
@@ -246,3 +246,23 @@ unsent messages without an event.
 
 Net: **626 tests / 61 suites** (was 614/59) — sctp +10 (49: 23 lib + 24
 loopback + 2 fuzz-smoke), rfc3263 +2 (38, incl. 2 fuzz-smoke).
+
+## Task 48 — B2BUA WebRTC leg: bugs caught and hardened while wiring
+
+Wiring ICE + DTLS-SRTP into the live B2BUA (the first time the `ice`, `dtls`
+and `srtp` crates compose under a real call) surfaced three defects in the
+same class the user's audit instruction targets — integration races the
+unit tests cannot see:
+
+| # | Finding | Severity | Fix |
+|---|---------|----------|-----|
+| W1 | The ICE answerer's first check burst races the answer: the peer cannot validate our STUN checks until the 200 OK carries our ufrag/pwd, so early checks are dropped as unauthorized — and `connect()` never re-sent them. When the answerer happened to draw the controlling role, aggressive nomination (USE-CANDIDATE) could never fire and ICE stalled until timeout | **Major** (integration) | `connect()` re-issues checks every 500 ms until nomination (and after every role-conflict switch); the WebRTC loopback test exercises exactly the answerer-side race it fixes |
+| W2 | `DtlsEndpoint::handshake_udp` routed datagrams to the DTLS state machine by SOURCE ADDRESS only — ICE keepalives / STUN from the selected pair's address (the same address during and after ICE) would be handed to OpenSSL as garbage records | **Major** (integration) | RFC 7983 content filter inside `handshake_udp`: only first-byte 20–63 feeds the state machine; other bytes go to the `packets_from_peer` callback and do not reset the retransmission timer |
+| W3 | SDP answer built from caps could not carry ICE candidates (`MediaCaps` had credentials but no candidate list), so a WebRTC answer would have advertised credentials with no reachable address | **Major** (coverage) | `MediaCaps::ice_candidates` + `answer_session` echo, emitting the prefix-less form the parser's mirror uses (a full `candidate:`-prefixed line would double the prefix on the wire — `a=candidate:candidate:1 …`) |
+
+Also documented: the engine's CDR sink is a process-global `OnceLock`, so
+two engines in one test process silently lose `CallEnded` events from the
+second engine — the 488-rejection test lives in its own test binary.
+
+Net after Task 48: **628 tests / 63 suites** (was 626/61) — b2bua +2
+integration tests + 2 new suites (`webrtc_leg`, `webrtc_reject`).

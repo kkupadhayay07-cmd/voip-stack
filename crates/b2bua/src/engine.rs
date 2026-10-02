@@ -5,6 +5,7 @@ use crate::media::{self, PumpConfig, PumpHandle};
 use crate::rel100::{self, Reliable1xx};
 use crate::sdp_util;
 use crate::timers::{self, LegTimers, Role, UasNegotiation};
+use crate::webrtc;
 use crate::{CdrEvent, Side};
 use rand::Rng;
 use sdp::negotiate::{stream_plans, StreamPlan};
@@ -104,7 +105,8 @@ struct Leg {
     /// Peer Contact URI text (request-URI for in-dialog requests).
     contact: Option<String>,
     plan: Option<StreamPlan>,
-    /// Bound RTP socket (A: bound on INVITE, B: bound on originate).
+    /// Bound RTP socket (A: bound on INVITE or handed over by the WebRTC
+    /// establishment once ICE+DTLS complete, B: bound on originate).
     rtp: Option<Arc<UdpSocket>>,
     media: Option<PumpHandle>,
     confirmed: bool,
@@ -114,6 +116,10 @@ struct Leg {
     /// A retransmitted 1xx (same `RSeq`) must be answered by RESENDING it
     /// verbatim — same CSeq number and same branch (RFC 3261 §17.1.2).
     last_prack: Option<SentPrack>,
+    /// Prepared ICE+DTLS transport when this leg negotiated
+    /// UDP/TLS/RTP/SAVPF (leg A only today).  `rtp` is None until
+    /// [`webrtc::WebRtcMedia::establish`] hands the agent socket over.
+    webrtc: Option<webrtc::WebRtcMedia>,
 }
 
 /// The PRACK a leg last sent for a reliable 1xx, kept as exact wire bytes
@@ -957,15 +963,65 @@ impl B2bua {
         )
         .await;
 
-        // Bind leg A media socket and build the answer.
-        let Ok(a_sock) = UdpSocket::bind(("0.0.0.0", self.cfg.media_base_port)).await else {
-            tracing::error!(%call_id, "media bind failed");
-            return;
+        // WebRTC detection (RFC 5763/5764): a UDP/TLS/RTP/SAVPF offer with
+        // a DTLS fingerprint and ICE credentials runs the leg over
+        // ICE → DTLS → SRTP instead of plaintext RTP.  On a WebRTC offer we
+        // do NOT bind a plain socket — the ICE agent's socket IS the media
+        // socket and its port goes into the answer.
+        let offer_media = offer.medias.first().cloned();
+        let webrtc_offer = offer_media
+            .as_ref()
+            .is_some_and(|m| m.proto == "UDP/TLS/RTP/SAVPF" && m.fingerprint.is_some());
+        let (a_sock, a_webrtc, a_port) = if webrtc_offer {
+            let m = offer_media.as_ref().expect("checked above");
+            match webrtc::WebRtcMedia::prepare(m).await {
+                Ok(w) => {
+                    let port = w.local_port().unwrap_or(0);
+                    (None, Some(w), port)
+                }
+                Err(e) => {
+                    tracing::info!(%call_id, "WebRTC transport rejected: {e}");
+                    send_staged(
+                        &mut a_tx,
+                        sock,
+                        src,
+                        sip_core::builder::respond_to(
+                            &req,
+                            488,
+                            "Not Acceptable Here",
+                            Vec::new(),
+                            None,
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else {
+            let Ok(s) = UdpSocket::bind(("0.0.0.0", self.cfg.media_base_port)).await else {
+                tracing::error!(%call_id, "media bind failed");
+                return;
+            };
+            let s = Arc::new(s);
+            let port = s.local_addr().map(|a| a.port()).unwrap_or(0);
+            (Some(s), None, port)
         };
-        let a_sock = Arc::new(a_sock);
-        let a_port = a_sock.local_addr().map(|a| a.port()).unwrap_or(0);
-        let answer = match sdp_util::answer(&offer, &self.cfg.media_host, a_port, &self.cfg.codecs)
-        {
+        let webrtc_caps = a_webrtc.as_ref().map(|w| {
+            let t = w.answer_transport();
+            sdp_util::WebrtcAnswerCaps {
+                ufrag: t.ufrag,
+                pwd: t.pwd,
+                fingerprint: t.fingerprint,
+                candidates: t.candidates,
+            }
+        });
+        let answer = match sdp_util::answer(
+            &offer,
+            &self.cfg.media_host,
+            a_port,
+            &self.cfg.codecs,
+            webrtc_caps,
+        ) {
             Ok(ans) => ans,
             Err(e) => {
                 tracing::info!(%call_id, "SDP negotiation failed: {e:?}");
@@ -1129,11 +1185,12 @@ impl B2bua {
             invite: Some(req),
             contact,
             plan: a_plan,
-            rtp: Some(a_sock),
+            rtp: a_sock,
             media: None,
             confirmed: false,
             timer: leg_a_timer,
             last_prack: None,
+            webrtc: a_webrtc,
         };
         call.leg_a = Some(leg_a);
         call.a_tx = Some(a_tx);
@@ -1153,6 +1210,7 @@ impl B2bua {
             confirmed: false,
             timer: None,
             last_prack: None,
+            webrtc: None,
         });
         b_to_a.insert(b_call_id, call_id.clone());
         self.cdr
@@ -1269,7 +1327,7 @@ impl B2bua {
             call.a_hold = true;
             return;
         }
-        self.confirm_leg_a(sock, local, calls, a_id).await;
+        self.confirm_leg_a(sock, local, calls, b_to_a, a_id).await;
         let _ = b_id;
     }
 
@@ -1283,6 +1341,7 @@ impl B2bua {
         sock: &Arc<UdpSocket>,
         local: SocketAddr,
         calls: &mut HashMap<String, Call>,
+        b_to_a: &mut HashMap<String, String>,
         a_id: &str,
     ) {
         let (a_snapshot, response) = {
@@ -1339,6 +1398,47 @@ impl B2bua {
         }
         call.a_ack_deadline = Some(Instant::now() + ACK_TIMEOUT);
 
+        // WebRTC leg establishment (RFC 5763 §5): the 200 OK carrying our
+        // candidates is on the wire, so ICE checks can flow — connect, run
+        // DTLS (we are the client, setup:active) and key the SRTP sessions.
+        // The leg's pump starts only with established crypto: a negotiated
+        // SAVPF leg must never send or accept plaintext media.  Failure
+        // tears the call down (488/BYE) instead of degrading.
+        let mut a_crypto: Option<media::CryptoPair> = None;
+        let mut a_pair_remote: Option<SocketAddr> = None;
+        if let Some(a) = call.leg_a.as_mut() {
+            if let Some(w) = a.webrtc.take() {
+                match w.establish().await {
+                    Ok(est) => {
+                        tracing::info!(
+                            call_id = %a_id,
+                            peer = %est.remote,
+                            "WebRTC leg up: ICE + DTLS({}) + SRTP",
+                            est.crypto.tx.profile().dtls_name().unwrap_or("?")
+                        );
+                        a.rtp = Some(est.socket);
+                        a_pair_remote = Some(est.remote);
+                        a_crypto = Some(est.crypto);
+                    }
+                    Err(e) => {
+                        tracing::warn!(call_id = %a_id, "WebRTC establishment failed: {e}");
+                        // No media path to leg A: release the call.  Leg B
+                        // has not been confirmed into a bridged call yet
+                        // (its pump never started), so a plain teardown with
+                        // BYEs is safe here.
+                        teardown(
+                            calls,
+                            b_to_a,
+                            a_id,
+                            "WebRTC establishment failed",
+                            Some(488),
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
         // Start both media pumps.
         let sockets = (
             call.leg_a.as_ref().and_then(|l| l.rtp.clone()),
@@ -1391,11 +1491,24 @@ impl B2bua {
                         let sess_b = observ::CallSession::new(a_id, None, None)
                             .with_leg(observ::event::Leg::B);
                         match (
-                            media::start_with_socket_session(cfg_a, a_sock, a_out, a_in, sess_a),
+                            media::start_with_socket_session_crypto(
+                                cfg_a,
+                                a_sock,
+                                a_crypto.take(),
+                                a_out,
+                                a_in,
+                                sess_a,
+                            ),
                             media::start_with_socket_session(cfg_b, b_sock, b_out, b_in, sess_b),
                         ) {
                             (Ok(ha), Ok(hb)) => {
-                                seed_remote(&ha, &pa).await;
+                                // A secured (WebRTC) leg routes media at the
+                                // ICE-nominated pair, not the offer's c= line.
+                                if let Some(pair) = a_pair_remote {
+                                    *ha.remote.lock().await = Some(pair);
+                                } else {
+                                    seed_remote(&ha, &pa).await;
+                                }
                                 seed_remote(&hb, &pb).await;
                                 if let Some(a) = call.leg_a.as_mut() {
                                     a.media = Some(ha);
@@ -1916,7 +2029,7 @@ impl B2bua {
                 .and_then(|s| s.local_addr().ok())
                 .map(|a| a.port())
                 .unwrap_or(0);
-            match sdp_util::answer(&offer, &self.cfg.media_host, port, &self.cfg.codecs) {
+            match sdp_util::answer(&offer, &self.cfg.media_host, port, &self.cfg.codecs, None) {
                 Ok(ans) => {
                     // Renegotiation is only accepted when the media does not
                     // change — the pumps are already running with the current
@@ -2106,7 +2219,8 @@ impl B2bua {
             call.a_hold = false;
         }
         if confirm_now {
-            self.confirm_leg_a(sock, local, calls, call_id).await;
+            self.confirm_leg_a(sock, local, calls, b_to_a, call_id)
+                .await;
         }
     }
 

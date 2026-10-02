@@ -63,6 +63,10 @@ pub struct MediaCaps {
     pub port: u16,
     pub mid: Option<String>,
     pub ice: Option<IceCreds>,
+    /// Our ICE candidate SDP lines (RFC 8839), emitted verbatim as
+    /// `a=candidate` attributes when the offer carried ICE.  Without them a
+    /// WebRTC peer would know our credentials but no address to check.
+    pub ice_candidates: Vec<String>,
     pub fingerprint: Option<Fingerprint>,
     /// Role we assume when the offer says `actpass`.
     pub setup: SetupRole,
@@ -80,6 +84,7 @@ impl MediaCaps {
             port,
             mid: None,
             ice: None,
+            ice_candidates: Vec::new(),
             fingerprint: None,
             setup: SetupRole::Active,
         }
@@ -449,6 +454,22 @@ pub fn answer_session(offer: &Session, caps: &[MediaCaps]) -> Result<Session, Ne
                     .push(Attribute::new("ice-ufrag", Some(ice.ufrag.clone())));
                 m.attributes
                     .push(Attribute::new("ice-pwd", Some(ice.pwd.clone())));
+            }
+            // Our gathered candidates (RFC 8839): the caps carry full SDP
+            // lines (with the `candidate:` prefix, as `Candidate::to_sdp`
+            // emits), but the wire attribute value and the typed mirror hold
+            // the prefix-less form — the parser stores `a=candidate:<value>`
+            // as value = `<value>`, so both views stay consistent and
+            // parse → serialize → parse is a fixed point.
+            for line in &caps_m.ice_candidates {
+                let bare = line
+                    .strip_prefix("a=")
+                    .unwrap_or(line)
+                    .strip_prefix("candidate:")
+                    .unwrap_or(line);
+                m.ice_candidates.push(bare.to_owned());
+                m.attributes
+                    .push(Attribute::new("candidate", Some(bare.to_owned())));
             }
         }
 
