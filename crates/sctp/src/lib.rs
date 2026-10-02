@@ -19,6 +19,12 @@
 //! - [RFC 3758] partial reliability: sender-side abandonment
 //!   (max-retransmits *and* max-packet-lifetime) with FORWARD-TSN advance and
 //!   receiver-side stream-sequence skipping
+//! - [RFC 6525] stream reconfiguration: RE-CONFIG chunk with the Outgoing
+//!   SSN Reset Request and Re-configuration Response parameters — the
+//!   mechanism [RFC 8831] §6.7 mandates for closing a data channel
+//!   (request, peer response, reciprocal reset, stream id reuse), with the
+//!   §5.2.2 E2 deferred reset when our cumulative point has not reached the
+//!   peer's last assigned TSN yet
 //!
 //! The crate is transport-agnostic: it never touches sockets. Bytes in /
 //! packets out through [`SctpEndpoint::handle_packet`] and
@@ -36,9 +42,10 @@
 //!
 //! - No multi-homing (WebRTC is single-path; one destination per association)
 //! - ECNE/CWR chunks are skipped, not interpreted (ECN is not negotiated)
-//! - No SCTP restart, no dynamic address reconfiguration (RFC 5061), no
-//!   stream reset (RFC 6525) — a closing data channel currently leaves its
-//!   stream id consumed (matches DCEP's own lifetime model)
+//! - No SCTP restart, no dynamic address reconfiguration (RFC 5061). The
+//!   RFC 6525 subset is limited to what RFC 8831 needs: Outgoing SSN Reset
+//!   Request + Response (no Incoming-SSN/SSN-TSN/Add-Streams parameters,
+//!   one outstanding request at a time)
 //! - The SACK delay timer is not implemented: every DATA-bearing packet is
 //!   SACKed immediately (RFC 9260 allows "MAY" delay)
 //! - No RFC 8260 stream schedulers / interleaving (the I-bit is parsed and
@@ -57,6 +64,8 @@
 //! [RFC 3309]: https://datatracker.ietf.org/doc/html/rfc3309
 //! [RFC 8832]: https://datatracker.ietf.org/doc/html/rfc8832
 //! [RFC 3758]: https://datatracker.ietf.org/doc/html/rfc3758
+//! [RFC 6525]: https://datatracker.ietf.org/doc/html/rfc6525
+//! [RFC 8831]: https://datatracker.ietf.org/doc/html/rfc8831
 //! [RFC 8261]: https://datatracker.ietf.org/doc/html/rfc8261
 
 #![forbid(unsafe_code)]
@@ -70,7 +79,11 @@ use std::time::Duration;
 
 pub use assoc::{AssociationStats, SctpEndpoint, MAX_INIT_RETRANS};
 pub use dcep::ChannelType;
-pub use wire::{SackBlock, SctpError};
+pub use wire::{
+    ReConfigChunk, ReConfigParam, SackBlock, SctpError, RC_RESULT_BAD_SEQ, RC_RESULT_DENIED,
+    RC_RESULT_IN_PROGRESS, RC_RESULT_IN_PROGRESS_PEER, RC_RESULT_NOTHING_TO_DO,
+    RC_RESULT_PERFORMED, RC_RESULT_WRONG_SSN,
+};
 
 /// Endpoint configuration (transport-agnostic).
 #[derive(Debug, Clone)]
@@ -103,6 +116,10 @@ pub struct SctpConfig {
     pub max_message_size: usize,
     /// Advertise FORWARD-TSN support and allow partial-reliability sends.
     pub forward_tsn: bool,
+    /// Advertise RFC 6525 stream-reset support and allow channel closes
+    /// (`SctpEndpoint::close_channel`); the peer must advertise it too for a
+    /// close to be accepted.
+    pub stream_reset: bool,
     /// Fixed heartbeat interval; `None` disables (the WebRTC path usually
     /// leans on the DTLS/ICE keepalives instead).
     pub heartbeat_interval: Option<Duration>,
@@ -132,6 +149,7 @@ impl Default for SctpConfig {
             mis_streams: 1024,
             max_message_size: 256 * 1024,
             forward_tsn: true,
+            stream_reset: true,
             heartbeat_interval: None,
             initial_tag: None,
             initial_tsn: None,
@@ -155,6 +173,11 @@ pub enum SctpEvent {
     },
     /// Our DATA_CHANNEL_OPEN was acknowledged by the peer.
     DataChannelAck { stream: u16 },
+    /// The data channel on this stream closed per RFC 8831 §6.7: a stream
+    /// reset completed (we initiated the close and the peer acknowledged, or
+    /// the peer reset the stream and our reciprocal reset completed). The
+    /// stream id is reusable after this event.
+    DataChannelClosed { stream: u16 },
     /// Reassembled user message.
     Message {
         stream: u16,

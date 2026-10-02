@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 644 tests passing across 69 suites in 21 crates;
+**Current state: 656 tests passing across 70 suites in 21 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
@@ -25,7 +25,8 @@ async workers). RFC 5626 Outbound + RFC 5627 GRUU are implemented end to
 end (registrar-side flow detection / `Flow-Timer` / pub-gruu synthesis, and
 the trunk UAC's instance-tagged REGISTER with refresh + CRLF flow
 keep-alives), WebRTC data channels have a complete protocol engine
-(RFC 9260/4960 SCTP + RFC 8832 DCEP + RFC 3758 FORWARD-TSN in `sctp`),
+(RFC 9260/4960 SCTP + RFC 8832 DCEP + RFC 3758 FORWARD-TSN + RFC 6525 stream
+reset in `sctp`),
 the B2BUA now terminates real WebRTC media legs: a UDP/TLS/RTP/SAVPF offer
 is answered with ICE (RFC 8445) → DTLS-SRTP (RFC 5763/5764) → SRTP
 (RFC 3711) over the leg socket, with SRTP-only media (no plaintext fallback)
@@ -47,8 +48,11 @@ even / server odd — a self-roundtrip had pinned the parity inverted; the
 RFC cross-check caught it) follow the negotiated DTLS role, a callee that
 declines the m-line keeps the call audio-only, the bundled offer carries
 `a=mid` on both m-lines plus the session-level `a=group:BUNDLE 0 1`
-(RFC 8843/5888 — one transport, exactly how the engine runs it), and
-integration tests cover the mirror loopback and the decline path.**
+(RFC 8843/5888 — one transport, exactly how the engine runs it), channels
+close per RFC 8831 §6.7 (RFC 6525 stream reset: request → response →
+reciprocal reset, E2 deferred processing, stream ids reusable), and
+integration tests cover the mirror loopback, the decline path and the
+channel close over a live leg.**
 
 ## Workspace layout
 
@@ -73,7 +77,7 @@ integration tests cover the mirror loopback and the decline path.**
 | `crates/api` | Control plane: REST (CDR queries/stats, campaigns, pacing), WebSocket event stream, Prometheus `/metrics`, health/readiness | **Done** |
 | `crates/observ` | In-process observability: Wireshark-openable pcap capture (SIP + RTP), human-readable per-call traces, per-leg media diag counters (rx/tx/lost/jitter/concealed) — everything correlated by SIP Call-ID | **Done** |
 | `crates/rfc3263` | RFC 3263 SIP server discovery: RFC 1035 DNS wire codec (compression-safe name reader, loop-proof pointers), NAPTR protocol selection (RFC 2915 S-flag), RFC 2782 SRV priority + weighted ordering, A/AAAA fallback, UDP with TC→TCP fallback + RFC 5452 bailiwick filtering — pure std, zero deps | **Done** |
-| `crates/sctp` | WebRTC data-channel engine: RFC 9260/4960 SCTP core subset (CRC32c pinned to the RFC 9260 reference table, four-way handshake with HMAC-protected cookie, TSN window + gap-block SACKs, T3-RTX with RFC 6298 RTO, cwnd slow start/CA + a_rwnd flow control, fragmentation, ordered/unordered reassembly), RFC 8832 DCEP channel establishment (stream-id parity per §6, PPID 50 pinned by wire test), RFC 3758 partial reliability (max-retransmits + max-packet-lifetime with FORWARD-TSN), graceful SHUTDOWN/ABORT; the RFC 8261 DTLS seam is live in the B2BUA | **Done** |
+| `crates/sctp` | WebRTC data-channel engine: RFC 9260/4960 SCTP core subset (CRC32c pinned to the RFC 9260 reference table, four-way handshake with HMAC-protected cookie, TSN window + gap-block SACKs, T3-RTX with RFC 6298 RTO, cwnd slow start/CA + a_rwnd flow control, fragmentation, ordered/unordered reassembly), RFC 8832 DCEP channel establishment (stream-id parity per §6, PPID 50 pinned by wire test), RFC 3758 partial reliability (max-retransmits + max-packet-lifetime with FORWARD-TSN), RFC 6525 stream reset (RE-CONFIG wire codec, RFC 8831 §6.7 channel close with reciprocal reset + deferred processing + stream-id reuse), graceful SHUTDOWN/ABORT; the RFC 8261 DTLS seam is live in the B2BUA | **Done** |
 | `crates/zrtc` | The daemon: wires everything into one voice service — UDP/TCP/TLS/WSS SIP listeners, SBC → proxy → registrar, B2BUA + loopback sink, outbound trunk (IP / Digest / Bearer / mTLS, RFC 3263 NAPTR/SRV discovery with connection-time candidate failover; RFC 5626 registration refresh + CRLF/WS-ping flow keep-alives), outbound originator, AI tap, REST API, observability. Config: `zrtc.toml` | **Done** |
 
 ## Quick start
@@ -82,7 +86,7 @@ integration tests cover the mirror loopback and the decline path.**
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 644 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 656 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -297,9 +301,13 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
    call audio-only; mirror-loopback + decline integration tests ship)
    **and the leg-B offer is bundled ✅** (RFC 8843/5888: `a=mid:0/1` on the
    two m-lines + session-level `a=group:BUNDLE 0 1`; a bundling callee's
-   answer echoes the group — pinned by the mirror-loopback test).
-   Remaining: RFC 8831 stream reset (`DATA_CHANNEL_CLOSE` → SSE) for
-   explicit channel close.
+   answer echoes the group — pinned by the mirror-loopback test)
+   **and channels close per RFC 8831 §6.7 ✅** (RFC 6525 RE-CONFIG: Outgoing
+   SSN Reset Request + Response wire codec, reciprocal reset on the
+   answering side, §5.2.2 E2 deferred reset with held data, duplicate-request
+   response replay, re-configuration timer retransmission, stream ids
+   reusable after a reset; the wrong-parity-OPEN guard now closes the bogus
+   channel with a reset instead of dropping it).
 5. SDP hardening — rejected m-lines, port-0 offers, RFC 3264 §6.1 direction
    clamp, extras serialization, **IPv6 answer address types and RFC 8843
    BUNDLE group echo done**. RFC 3263 NAPTR/SRV server discovery — **done**

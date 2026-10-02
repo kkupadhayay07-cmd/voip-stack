@@ -89,7 +89,7 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **644 passing** across 69 suites, `clippy -D warnings`
+`cargo test --workspace` → **656 passing** across 70 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
 **The external audit is fully closed**: every finding at every severity —
@@ -328,3 +328,24 @@ Net after Task 51: **644 tests / 69 suites** (was 639/67) — sctp +1
 (wrong-parity drop), b2bua +2 (sdp_util dc offer tests), +2 integration
 suites; suite inventory re-derived per crate (b2bua 42→49 corrected against
 its own header arithmetic).
+
+---
+
+## Task 53 — RFC 6525 stream reset (RFC 8831 §6.7 channel close)
+
+Scope note: a feature task (the last WebRTC roadmap remainder), not an
+external-audit wave — but the new tests caught two real engine bugs before
+shipping, recorded here with the same discipline.
+
+| ID | Finding | Severity | Fix |
+|----|---------|----------|-----|
+| T53-1 | The new two-pass stream-id allocator presented an OCCUPIED id as free after a fully exhausted first pass: the wrap-around assignment at the end of the scan loop leaked past the final free check, so with every parity id taken the next `open_data_channel` handed out an already-registered stream | **Major** (state corruption) | the scan result is explicit (`found: Option<u16>`); the exhaustion loopback test (6-stream limit → `SendBufferFull` → close one channel → the freed id is handed out again) failed immediately and pins the fix |
+| T53-2 | The close INITIATOR never reset its INBOUND stream: its channel was removed when its own request was acknowledged, so when the peer's reciprocal reset arrived the "known stream" gate (keyed on registered channels only) answered Nothing-to-do and the initiator's expected-SSN never restarted — the first DATA on the reused id was silently dropped by the phase-0 guard | **Major** (spec + interop) | a stream is known if its channel OR its ordered receive buffer exists; the reuse loopback test (re-open the freed id, send, expect delivery) caught it via the missing DataChannelAck |
+| T53-3 | `send_re_config_request` never armed `reconfig_deadline` — a fresh request would never retransmit after a loss (surfaced as a dead-code warning on the unused `now` parameter, the same parsed-but-unconsumed tripwire class as Task 50's `set_remote`) | Minor (liveness) | deadline armed at request emission; `poll_timeout` surfaces it; exhaustion completes the close locally |
+| W1 | The wrong-parity-OPEN action (Task 51's documented drop) is upgraded now that the tool it lacked exists: a parity-violating OPEN is closed with an Outgoing SSN Reset Request (RFC 8831 §6.7 — which also stops the peer's reliable OPEN retransmissions); the drop remains the fallback while one of our resets is in flight or the peer never advertised RFC 6525 | Improvement | implemented in `handle_dcep` with the fallback documented in-code; the Task 51 test re-pinned to assert the reset |
+
+Net after Task 53: **656 tests / 70 suites** (was 644/69) — sctp 52→63
+(4 hand-built RE-CONFIG wire tests + 7 close loopback tests), b2bua 49→50
+(`webrtc_datachan_close`: the channel close over a live leg with the
+association surviving and the CDR completing). No external-audit items
+affected; all previous fixes re-verified green.

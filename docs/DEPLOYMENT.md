@@ -244,7 +244,10 @@ configured bounds. Guidance:
    caller's `m=application` offer is mirrored into the leg-B offer; the
    engine's association role + RFC 8832 §5.1/§6 stream parity follow the
    DTLS role — the previously inverted parity was caught by an RFC
-   cross-check; a port-0 answer keeps the call audio-only).
+   cross-check; a port-0 answer keeps the call audio-only)
+   **and the channel close ✅ shipped** (RFC 8831 §6.7 via RFC 6525 stream
+   reset: request → response → reciprocal reset, E2 deferred processing,
+   stream ids reusable after a reset — the last WebRTC roadmap remainder).
 5. **Container entrypoint** — wire `zrtc` as the image entrypoint with a
    mounted config + real healthcheck.
 6. **SDP hardening** (rejected m-lines, port-0 answers, the RFC 3264 §6.1

@@ -86,12 +86,18 @@ pub enum DataCommand {
         ppid: u32,
         data: Vec<u8>,
     },
+    /// Close the data channel per RFC 8831 §6.7 (RFC 6525 stream reset):
+    /// the engine sends the Outgoing SSN Reset Request, the peer responds
+    /// and reciprocates, and the stream id becomes reusable once the
+    /// exchange completes.
+    CloseChannel { stream: u16 },
 }
 
 /// Shared counters for the end-of-call observability trail.
 #[derive(Debug, Default)]
 pub struct DataChannelStats {
     pub channels_opened: std::sync::atomic::AtomicU64,
+    pub channels_closed: std::sync::atomic::AtomicU64,
     pub messages_rx: std::sync::atomic::AtomicU64,
     pub messages_tx: std::sync::atomic::AtomicU64,
     pub sctp_packets_rx: std::sync::atomic::AtomicU64,
@@ -202,6 +208,12 @@ async fn run(
                         match sctp.send_message(stream, ppid, data, Instant::now()) {
                             Ok(()) => DataChannelStats::add(&stats.messages_tx, 1),
                             Err(e) => tracing::debug!("data channels: send rejected: {e}"),
+                        }
+                    }
+                    Some(DataCommand::CloseChannel { stream }) => {
+                        match sctp.close_channel(stream, Instant::now()) {
+                            Ok(()) => tracing::info!(stream, "data channel: closing (RFC 8831 §6.7 reset)"),
+                            Err(e) => tracing::debug!("data channels: close rejected: {e}"),
                         }
                     }
                     // Application dropped the handle: keep serving the
@@ -346,6 +358,11 @@ async fn handle_event(
         }
         SctpEvent::DataChannelAck { stream } => {
             tracing::info!(stream, "data channel acked by the peer");
+            true
+        }
+        SctpEvent::DataChannelClosed { stream } => {
+            DataChannelStats::add(&stats.channels_closed, 1);
+            tracing::info!(stream, "data channel closed (stream reset completed)");
             true
         }
         SctpEvent::Message {

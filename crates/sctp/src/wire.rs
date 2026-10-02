@@ -24,6 +24,8 @@ pub const CT_COOKIE_ACK: u8 = 11;
 pub const CT_SHUTDOWN_COMPLETE: u8 = 14;
 /// RFC 3758 FORWARD-TSN (chunk types ≥ 0xC0 are "skip and report" class).
 pub const CT_FORWARD_TSN: u8 = 0xC0;
+/// RFC 6525 RE-CONFIG chunk (stream reconfiguration).
+pub const CT_RE_CONFIG: u8 = 130;
 
 /// Parameter types (RFC 9260 §3.3.2.1, RFC 5061).
 pub const PT_HEARTBEAT_INFO: u16 = 1;
@@ -36,8 +38,30 @@ pub const PT_STATE_COOKIE: u16 = 7;
 pub const PT_SUPPORTED_ADDR_TYPES: u16 = 9;
 pub const PT_ECN: u16 = 0x8000;
 /// RFC 5061 Supported Extensions — carries the FORWARD-TSN chunk type to
-/// signal PR-SCTP support (RFC 3758 §3.1).
+/// signal PR-SCTP support (RFC 3758 §3.1) and the RE-CONFIG chunk type to
+/// signal stream-reset support (RFC 6525 §5 — via RFC 5061 signaling per
+/// RFC 8831 §6.1).
 pub const PT_SUPPORTED_EXTENSIONS: u16 = 0x8008;
+
+/// RFC 6525 §4.1 Outgoing SSN Reset Request parameter.
+pub const RC_PARAM_OUTGOING_SSN_RESET: u16 = 13;
+/// RFC 6525 §4.4 Re-configuration Response parameter.
+pub const RC_PARAM_RESPONSE: u16 = 16;
+
+/// RFC 6525 §4.4 Result values.
+pub const RC_RESULT_NOTHING_TO_DO: u32 = 0;
+/// Success — the reset was performed.
+pub const RC_RESULT_PERFORMED: u32 = 1;
+/// The peer refused the reset.
+pub const RC_RESULT_DENIED: u32 = 2;
+/// Error — wrong SSN (stale/invalid request).
+pub const RC_RESULT_WRONG_SSN: u32 = 3;
+/// The peer has its own request in progress.
+pub const RC_RESULT_IN_PROGRESS_PEER: u32 = 4;
+/// Error — bad sequence number.
+pub const RC_RESULT_BAD_SEQ: u32 = 5;
+/// Deferred reset processing is underway (E2); a final response follows.
+pub const RC_RESULT_IN_PROGRESS: u32 = 6;
 
 /// Cause codes for ABORT/ERROR (RFC 9260 §3.3.10). Cause 3 doubles as a
 /// recognized INIT-ACK parameter when a stale state cookie is refreshed
@@ -152,6 +176,12 @@ pub enum Chunk {
         /// Per-stream skips (sid, highest abandoned ssn) for ordered streams.
         streams: Vec<(u16, u16)>,
     },
+    /// RFC 6525 RE-CONFIG: the only chunk that carries stream-reset
+    /// parameters. Only the two parameters the data-channel close needs are
+    /// decoded (Outgoing SSN Reset Request §4.1, Response §4.4); unknown
+    /// parameter types are skipped (they cannot appear mid-chunk before a
+    /// known one in the combinations we emit or accept).
+    ReConfig(ReConfigChunk),
     /// Unrecognized chunk, preserved verbatim so the association can honor
     /// the RFC 9260 §3.3.1 report rules.
     Unknown {
@@ -159,6 +189,33 @@ pub enum Chunk {
         flags: u8,
         body: Vec<u8>,
     },
+}
+
+/// RFC 6525 RE-CONFIG chunk body: one or two re-configuration parameters.
+/// (The chunk has NO ARWND field — §3.1 puts the parameters directly after
+/// the chunk header.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReConfigChunk {
+    pub params: Vec<ReConfigParam>,
+}
+
+/// The decoded RFC 6525 parameters (the close-channel subset).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReConfigParam {
+    /// §4.1 Outgoing SSN Reset Request: reset the SSNs of the listed
+    /// OUTGOING streams of the sender. `rsn` identifies the request (init
+    /// value = the sender's initial TSN); `response_seq` is the next
+    /// expected peer RSN minus 1; `last_tsn` is the sender's last assigned
+    /// TSN (next TSN minus 1). An empty `streams` list means ALL streams.
+    OutgoingSsnReset {
+        rsn: u32,
+        response_seq: u32,
+        last_tsn: u32,
+        streams: Vec<u16>,
+    },
+    /// §4.4 Response: `rsn` is copied from the request; `result` is one of
+    /// the `RC_RESULT_*` values.
+    Response { rsn: u32, result: u32 },
 }
 
 impl Chunk {
@@ -178,6 +235,7 @@ impl Chunk {
             Chunk::CookieEcho { .. } => CT_COOKIE_ECHO,
             Chunk::CookieAck => CT_COOKIE_ACK,
             Chunk::ForwardTsn { .. } => CT_FORWARD_TSN,
+            Chunk::ReConfig(_) => CT_RE_CONFIG,
             Chunk::Unknown { ctype, .. } => *ctype,
         }
     }
@@ -199,6 +257,10 @@ pub enum SctpError {
     WrongState(&'static str),
     #[error("stream {0} is not an open data channel")]
     UnknownStream(u16),
+    #[error("stream {0} is closing (a stream reset is in flight)")]
+    ChannelClosing(u16),
+    #[error("another RFC 6525 stream-reset request is already in flight")]
+    ReconfigBusy,
 }
 
 pub(crate) fn pad4(n: usize) -> usize {
@@ -387,11 +449,102 @@ fn parse_chunk(ctype: u8, flags: u8, body: &[u8]) -> Result<Chunk, SctpError> {
                 streams,
             })
         }
+        CT_RE_CONFIG => {
+            let params = parse_re_config_params(body)?;
+            Ok(Chunk::ReConfig(ReConfigChunk { params }))
+        }
         _ => Ok(Chunk::Unknown {
             ctype,
             flags,
             body: body.to_vec(),
         }),
+    }
+}
+
+/// Parse RE-CONFIG chunk parameters (RFC 6525 §3.1: at least one, at most
+/// two; each is a padded TLV like a chunk param).
+///
+/// Only the two data-channel-close parameters are decoded; unknown types are
+/// skipped but still advance the cursor (the RFC 4960 §3.2.1 upper-bits
+/// reporting classes are folded into that skip — the association reports
+/// nothing for unknown params, matching the documented chunk-level gap).
+/// Per the Task 47 lesson the ADVANCE of the last (possibly padded) param is
+/// bounded: an overrun stops the walk cleanly at the chunk end.
+pub fn parse_re_config_params(mut buf: &[u8]) -> Result<Vec<ReConfigParam>, SctpError> {
+    let mut out = Vec::new();
+    while buf.len() >= 4 {
+        let ptype = be16(buf, 0)?;
+        let plen = be16(buf, 2)? as usize;
+        if plen < 4 || plen > buf.len() {
+            return Err(SctpError::BadChunk("RE-CONFIG param length invalid"));
+        }
+        let value = &buf[4..plen];
+        match (ptype, value.len()) {
+            (RC_PARAM_OUTGOING_SSN_RESET, v) if v >= 12 => {
+                let rsn = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
+                let response_seq = u32::from_be_bytes([value[4], value[5], value[6], value[7]]);
+                let last_tsn = u32::from_be_bytes([value[8], value[9], value[10], value[11]]);
+                // §4.1: stream numbers are 2-byte fields packed adjacently
+                // (no per-stream reserved word); the parameter length is
+                // 16 + 2*N with the TLV header included.
+                let streams = value[12..]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|p| u16::from_be_bytes(*p))
+                    .collect();
+                out.push(ReConfigParam::OutgoingSsnReset {
+                    rsn,
+                    response_seq,
+                    last_tsn,
+                    streams,
+                });
+            }
+            (RC_PARAM_RESPONSE, v) if v >= 8 => {
+                let rsn = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
+                let result = u32::from_be_bytes([value[4], value[5], value[6], value[7]]);
+                out.push(ReConfigParam::Response { rsn, result });
+            }
+            _ => {
+                // Unknown re-configuration parameter: skip it (length was
+                // already validated against the buffer).
+            }
+        }
+        let adv = pad4(plen);
+        if adv >= buf.len() {
+            break;
+        }
+        buf = &buf[adv..];
+    }
+    Ok(out)
+}
+
+/// Encode one RE-CONFIG parameter TLV (header + value + zero padding).
+fn encode_re_config_param(p: &ReConfigParam, out: &mut Vec<u8>) {
+    match p {
+        ReConfigParam::OutgoingSsnReset {
+            rsn,
+            response_seq,
+            last_tsn,
+            streams,
+        } => {
+            let plen = 16 + 2 * streams.len();
+            out.extend_from_slice(&RC_PARAM_OUTGOING_SSN_RESET.to_be_bytes());
+            out.extend_from_slice(&(plen as u16).to_be_bytes());
+            out.extend_from_slice(&rsn.to_be_bytes());
+            out.extend_from_slice(&response_seq.to_be_bytes());
+            out.extend_from_slice(&last_tsn.to_be_bytes());
+            for s in streams {
+                out.extend_from_slice(&s.to_be_bytes());
+            }
+            out.resize(out.len() + pad4(plen) - plen, 0);
+        }
+        ReConfigParam::Response { rsn, result } => {
+            out.extend_from_slice(&RC_PARAM_RESPONSE.to_be_bytes());
+            out.extend_from_slice(&12u16.to_be_bytes());
+            out.extend_from_slice(&rsn.to_be_bytes());
+            out.extend_from_slice(&result.to_be_bytes());
+        }
     }
 }
 
@@ -548,6 +701,13 @@ fn encode_chunk_into(chunk: &Chunk, out: &mut Vec<u8>) {
                 body.extend_from_slice(&ssn.to_be_bytes());
             }
             encode_chunk(CT_FORWARD_TSN, 0, &body, out);
+        }
+        Chunk::ReConfig(rc) => {
+            let mut body = Vec::new();
+            for p in &rc.params {
+                encode_re_config_param(p, &mut body);
+            }
+            encode_chunk(CT_RE_CONFIG, 0, &body, out);
         }
         Chunk::Unknown { ctype, flags, body } => {
             encode_chunk(*ctype, *flags, body, out);
@@ -784,5 +944,188 @@ mod tests {
         let pkt = encode_packet(1, 1, 1, std::slice::from_ref(&f));
         let p = parse_packet(&pkt, true).unwrap();
         assert_eq!(p.chunks[0], f);
+    }
+
+    /// Hand-built RE-CONFIG carrying an Outgoing SSN Reset Request, byte by
+    /// byte per RFC 6525 §3.1 + §4.1: chunk type 130; parameter type 13,
+    /// length 16 + 2*N (= 18 with one stream — stream numbers are packed
+    /// ADJACENTLY, no reserved word per stream), RSN, response-seq, sender's
+    /// last assigned TSN, then the 2-byte stream ids; the odd parameter
+    /// length pads to a 4-byte chunk boundary.
+    #[test]
+    fn hand_built_re_config_outgoing_ssn_reset_layout() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&13u16.to_be_bytes()); // param type 13
+        body.extend_from_slice(&18u16.to_be_bytes()); // param length = 16 + 2*1
+        body.extend_from_slice(&1001u32.to_be_bytes()); // request seq number
+        body.extend_from_slice(&999u32.to_be_bytes()); // response seq number
+        body.extend_from_slice(&1050u32.to_be_bytes()); // sender's last TSN
+        body.extend_from_slice(&2u16.to_be_bytes()); // stream number 2
+        assert_eq!(body.len(), 18);
+        body.push(0); // padding to the 4-byte chunk boundary (chunk len 22)
+        body.push(0);
+
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&1u16.to_be_bytes());
+        pkt.extend_from_slice(&2u16.to_be_bytes());
+        pkt.extend_from_slice(&77u32.to_be_bytes());
+        pkt.extend_from_slice(&0u32.to_be_bytes());
+        encode_chunk(CT_RE_CONFIG, 0, &body, &mut pkt);
+        let csum = crc32c::packet_checksum(&pkt);
+        pkt[8..12].copy_from_slice(&csum.to_be_bytes());
+
+        let p = parse_packet(&pkt, true).unwrap();
+        match &p.chunks[0] {
+            Chunk::ReConfig(rc) => {
+                assert_eq!(rc.params.len(), 1);
+                match &rc.params[0] {
+                    ReConfigParam::OutgoingSsnReset {
+                        rsn,
+                        response_seq,
+                        last_tsn,
+                        streams,
+                    } => {
+                        assert_eq!(*rsn, 1001);
+                        assert_eq!(*response_seq, 999);
+                        assert_eq!(*last_tsn, 1050);
+                        assert_eq!(streams, &[2u16]);
+                    }
+                    other => panic!("expected OutgoingSsnReset, got {other:?}"),
+                }
+            }
+            other => panic!("expected RE-CONFIG, got {other:?}"),
+        }
+    }
+
+    /// Hand-built Re-configuration Response (§4.4): type 16, length 12,
+    /// response-seq copied from the request, result 1 = Success-Performed.
+    #[test]
+    fn hand_built_re_config_response_layout() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&16u16.to_be_bytes());
+        body.extend_from_slice(&12u16.to_be_bytes());
+        body.extend_from_slice(&1001u32.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes());
+
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&1u16.to_be_bytes());
+        pkt.extend_from_slice(&2u16.to_be_bytes());
+        pkt.extend_from_slice(&77u32.to_be_bytes());
+        pkt.extend_from_slice(&0u32.to_be_bytes());
+        encode_chunk(CT_RE_CONFIG, 0, &body, &mut pkt);
+        let csum = crc32c::packet_checksum(&pkt);
+        pkt[8..12].copy_from_slice(&csum.to_be_bytes());
+
+        let p = parse_packet(&pkt, true).unwrap();
+        match &p.chunks[0] {
+            Chunk::ReConfig(rc) => assert_eq!(
+                rc.params,
+                vec![ReConfigParam::Response {
+                    rsn: 1001,
+                    result: 1
+                }]
+            ),
+            other => panic!("expected RE-CONFIG, got {other:?}"),
+        }
+    }
+
+    /// The §3.1 allowed two-parameter combination (Response + Outgoing SSN
+    /// Reset — the reciprocal-close chunk) survives encode→parse verbatim,
+    /// including an odd stream count and an unknown parameter type that must
+    /// be skipped without killing the rest of the chunk.
+    #[test]
+    fn re_config_two_params_and_unknown_skip_roundtrip() {
+        let rc = Chunk::ReConfig(ReConfigChunk {
+            params: vec![
+                ReConfigParam::Response {
+                    rsn: 7,
+                    result: RC_RESULT_PERFORMED,
+                },
+                ReConfigParam::OutgoingSsnReset {
+                    rsn: 8,
+                    response_seq: 7,
+                    last_tsn: 4242,
+                    streams: vec![0, 1, 2],
+                },
+            ],
+        });
+        let pkt = encode_packet(1, 1, 1, std::slice::from_ref(&rc));
+        let p = parse_packet(&pkt, true).unwrap();
+        assert_eq!(p.chunks[0], rc);
+
+        // An unknown parameter type (18, Add Incoming Streams) between the
+        // two known ones is skipped; the known ones still decode.
+        let mut body = Vec::new();
+        encode_re_config_param(&ReConfigParam::Response { rsn: 7, result: 1 }, &mut body);
+        // type 18, plen 8 (header + 4 bytes of payload)
+        body.extend_from_slice(&18u16.to_be_bytes());
+        body.extend_from_slice(&8u16.to_be_bytes());
+        body.extend_from_slice(&[1, 2, 3, 4]);
+        encode_re_config_param(
+            &ReConfigParam::OutgoingSsnReset {
+                rsn: 8,
+                response_seq: 7,
+                last_tsn: 4242,
+                streams: vec![],
+            },
+            &mut body,
+        );
+        let params = parse_re_config_params(&body).unwrap();
+        assert_eq!(
+            params,
+            vec![
+                ReConfigParam::Response { rsn: 7, result: 1 },
+                ReConfigParam::OutgoingSsnReset {
+                    rsn: 8,
+                    response_seq: 7,
+                    last_tsn: 4242,
+                    streams: vec![]
+                },
+            ]
+        );
+    }
+
+    /// The Task 47 advance-validation class, one parser deeper: (a) a
+    /// RE-CONFIG param whose declared length exceeds the buffer errors out
+    /// (never panics); (b) a last param whose PADDED advance overruns the
+    /// tail stops cleanly after decoding it — the same contract
+    /// `parse_params` follows.
+    #[test]
+    fn re_config_trailing_param_edge_shapes() {
+        // (a) truncated tail claiming plen 16 with only 6 bytes present:
+        // a hard error, not a panic.
+        let mut body = Vec::new();
+        encode_re_config_param(&ReConfigParam::Response { rsn: 5, result: 1 }, &mut body);
+        body.extend_from_slice(&13u16.to_be_bytes());
+        body.extend_from_slice(&16u16.to_be_bytes());
+        body.extend_from_slice(&[0xAA, 0xBB]);
+        assert!(parse_re_config_params(&body).is_err());
+
+        // (b) Response param + a final Outgoing reset of plen 18 padded to
+        // 20 with exactly 18 bytes present: the param decodes (1 stream)
+        // and the walk stops at the chunk end.
+        let mut body = Vec::new();
+        encode_re_config_param(&ReConfigParam::Response { rsn: 5, result: 1 }, &mut body);
+        body.extend_from_slice(&13u16.to_be_bytes()); // param type 13
+        body.extend_from_slice(&18u16.to_be_bytes()); // 16 + 2*1
+        body.extend_from_slice(&1001u32.to_be_bytes()); // rsn
+        body.extend_from_slice(&999u32.to_be_bytes()); // response seq
+        body.extend_from_slice(&1050u32.to_be_bytes()); // last TSN
+        body.extend_from_slice(&2u16.to_be_bytes()); // stream 2 (no padding!)
+        assert_eq!(body.len() % 4, 2, "the tail is deliberately unpadded");
+        let params = parse_re_config_params(&body)
+            .expect("legal plen with overrun padding must stop cleanly");
+        assert_eq!(
+            params,
+            vec![
+                ReConfigParam::Response { rsn: 5, result: 1 },
+                ReConfigParam::OutgoingSsnReset {
+                    rsn: 1001,
+                    response_seq: 999,
+                    last_tsn: 1050,
+                    streams: vec![2],
+                },
+            ]
+        );
     }
 }

@@ -265,9 +265,15 @@ window with gap-block SACKs, T3-RTX with RFC 6298 RTO, fragmentation +
 ordered/unordered reassembly, RFC 8832 DCEP channel establishment (OPEN
 rides the ordered pipeline; stream-id parity per §5.1/§6: the DTLS client
 opens EVEN streams, the DTLS server ODD — the initiator follows the DTLS
-role, and a wrong-parity inbound OPEN is dropped without an ACK; both DCEP
+role, and a wrong-parity inbound OPEN is never acked — with RFC 6525 landed
+it is closed per RFC 8831 §6.7 with a stream reset (the Task 51 drop
+remains the fallback while one of our resets is in flight); both DCEP
 messages ride PPID 50 — pinned by wire tests), RFC 3758
-partial reliability with FORWARD-TSN, graceful SHUTDOWN and ABORT. All
+partial reliability with FORWARD-TSN, RFC 6525 stream reconfiguration (the
+RFC 8831 §6.7 close: Outgoing SSN Reset Request retransmitted on the
+re-configuration timer, receiver-side reset + reciprocal reset, §5.2.2 E2
+deferred processing, duplicate-response replay, stream ids reusable after a
+reset), graceful SHUTDOWN and ABORT. All
 timers are caller-driven (`poll_timeout` + `on_timeout(now)`), so the
 engine is testable on a virtual clock.
 
@@ -298,6 +304,12 @@ SCTP role (and stream parity) following the DTLS role the callee's
 `a=setup` picked (callee `active` → the B2BUA is the DTLS server and the
 SCTP responder; `passive` → initiator). A port-0 answer keeps the call
 audio-only. Both legs' engines terminate (echo) channels independently.
+
+Task 53 completes the channel lifecycle: `DataCommand::CloseChannel` runs
+the RFC 8831 §6.7 close on any leg's association — request → response →
+reciprocal reset — the channel is removed on both sides, the stream id
+becomes reusable, the association (and the call) stays up, and the engine
+surfaces `DataChannelClosed` + a `channels_closed` stat for the CDR trail.
 
 ### 5.5 Control & observability
 

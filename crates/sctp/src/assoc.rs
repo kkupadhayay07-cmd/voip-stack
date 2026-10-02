@@ -1,4 +1,5 @@
-//! The SCTP association state machine ([RFC 9260] §4-§8, [RFC 3758]).
+//! The SCTP association state machine ([RFC 9260] §4-§8, [RFC 3758],
+//! [RFC 6525]).
 //!
 //! One [`SctpEndpoint`] is one association. It never touches I/O: inbound
 //! bytes go through [`SctpEndpoint::handle_packet`] (an SCTP packet as a
@@ -14,16 +15,25 @@
 //! estimation (Karn's rule), cwnd slow start / congestion avoidance and
 //! peer-a_rwnd flow control, message fragmentation, ordered/unordered
 //! reassembly, RFC 3758 abandonment (max-retransmits and max-packet-lifetime)
-//! with FORWARD-TSN, heartbeat exchange, graceful SHUTDOWN and ABORT.
+//! with FORWARD-TSN, heartbeat exchange, graceful SHUTDOWN and ABORT, and
+//! the RFC 6525 stream-reset subset RFC 8831 needs for closing a data
+//! channel: Outgoing SSN Reset Request + Re-configuration Response, with
+//! reciprocal reset on the answering side, the §5.2.2 E2 deferred reset
+//! ("In progress" until our cumulative point reaches the peer's last
+//! assigned TSN) and duplicate-request response replay.
 //!
 //! Simplified (each documented where it appears): no multi-homing, no SACK
 //! delay (every DATA packet is SACKed immediately), DCEP establishment
 //! messages are sent reliably+ordered regardless of channel policy, no
 //! association-level idle timeout (reliable data retransmits forever; the
-//! caller can abort).
+//! caller can abort), at most one stream-reset request in flight at a time
+//! (a reciprocal reset demanded while another request is outstanding is
+//! queued and started on completion).
 //!
 //! [RFC 9260]: https://datatracker.ietf.org/doc/html/rfc9260
 //! [RFC 3758]: https://datatracker.ietf.org/doc/html/rfc3758
+//! [RFC 6525]: https://datatracker.ietf.org/doc/html/rfc6525
+//! [RFC 8831]: https://datatracker.ietf.org/doc/html/rfc8831
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,7 +42,11 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::dcep::{self, ChannelType, PPID_DCEP_ACK, PPID_DCEP_OPEN};
-use crate::wire::{self, Chunk, DataChunk, SackBlock, SctpError};
+use crate::wire::{
+    self, Chunk, DataChunk, ReConfigChunk, ReConfigParam, SackBlock, SctpError, CT_FORWARD_TSN,
+    CT_RE_CONFIG, RC_RESULT_IN_PROGRESS, RC_RESULT_IN_PROGRESS_PEER, RC_RESULT_NOTHING_TO_DO,
+    RC_RESULT_PERFORMED,
+};
 use crate::{CloseReason, SctpConfig, SctpEvent};
 
 /// Handshake retransmission budget for T1-INIT / T1-COOKIE (RFC 9260 §4.1).
@@ -97,6 +111,10 @@ fn tsn_le(a: u32, b: u32) -> bool {
 
 fn tsn_gt(a: u32, b: u32) -> bool {
     tsn_lt(b, a)
+}
+
+fn tsn_ge(a: u32, b: u32) -> bool {
+    !tsn_lt(a, b)
 }
 
 fn ssn_lt(a: u16, b: u16) -> bool {
@@ -182,6 +200,13 @@ struct Channel {
     ssn: u16,
     /// We sent DCEP OPEN and are waiting for the peer's ACK.
     awaiting_ack: bool,
+    /// RFC 8831 §6.7 close in progress: no more sends are accepted and the
+    /// stream id is not reusable until the reset completes (the id frees
+    /// when the channel is removed).
+    closing: bool,
+    /// The `DataChannelClosed` event was delivered (an incoming reset or
+    /// our own close completion). Guards single-delivery.
+    closed_notified: bool,
 }
 
 /// One user message being reassembled (a B..E run; classic SCTP never
@@ -259,6 +284,31 @@ struct OutstandingFtsn {
     streams: Vec<(u16, u16)>,
 }
 
+/// RFC 6525 §5.1.1: our Outgoing SSN Reset Request is retransmitted on the
+/// re-configuration timer (RTO backoff) until the peer's Response — or an
+/// E1 implicit acknowledgment (the request's response_seq covering our RSN)
+/// — arrives.
+#[derive(Debug, Clone)]
+struct OutstandingReconfig {
+    rsn: u32,
+    streams: Vec<u16>,
+    attempts: u32,
+}
+
+/// RFC 6525 §5.2.2 E2 deferred reset: the peer's request named a
+/// last-assigned TSN our cumulative point has not reached yet, so data on
+/// the affected streams beyond that TSN is held until it does. One at a
+/// time (a second request while one is deferred answers result 4).
+#[derive(Debug)]
+struct DeferredReset {
+    rsn: u32,
+    last_tsn: u32,
+    /// Affected inbound streams (empty = ALL inbound streams, §4.1).
+    streams: Vec<u16>,
+    /// DATA chunks held beyond `last_tsn` (E2), keyed by TSN.
+    held: BTreeMap<u32, DataChunk>,
+}
+
 /// Counters for observability (exposed via `SctpEndpoint::stats`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AssociationStats {
@@ -275,6 +325,8 @@ pub struct AssociationStats {
     pub ftsn_rx: u64,
     pub ftsn_tx: u64,
     pub abandoned: u64,
+    pub reconfig_rx: u64,
+    pub reconfig_tx: u64,
     pub bytes_rx: u64,
     pub bytes_tx: u64,
 }
@@ -293,6 +345,9 @@ pub struct SctpEndpoint {
     peer_a_rwnd: usize,
     peer_mis: u16,
     peer_forward_tsn: bool,
+    /// Peer advertised RFC 6525 stream-reset support (RE-CONFIG in the
+    /// Supported Extensions parameter).
+    peer_reconfig: bool,
     /// Last INIT seen (server) — lets a stale cookie be refreshed with a new
     /// INIT-ACK without keeping pre-association sessions.
     last_init: Option<wire::InitChunk>,
@@ -302,6 +357,9 @@ pub struct SctpEndpoint {
     t2: Option<T2>,
     /// Retransmission deadline for the outstanding FORWARD-TSN (RFC 3758 §3.5).
     ftsn_deadline: Option<Instant>,
+    /// Retransmission deadline for the outstanding RE-CONFIG request
+    /// (RFC 6525 §5.1.1 re-configuration timer).
+    reconfig_deadline: Option<Instant>,
     rto: Duration,
     srtt: Option<Duration>,
     rttvar: Duration,
@@ -321,6 +379,24 @@ pub struct SctpEndpoint {
     ftsn_reported: HashMap<u16, u16>,
     /// The unacknowledged FORWARD-TSN (RFC 3758 §3.5).
     ftsn_outstanding: Option<OutstandingFtsn>,
+
+    // ---- RFC 6525 stream reset ----
+    /// Next Re-configuration Request Sequence Number (§4.1: initialized to
+    /// the initial TSN, +1 per request).
+    next_rsn: u32,
+    /// The RSN of the last incoming request we processed (duplicate
+    /// detection / response_seq bookkeeping).
+    peer_rsn_seen: Option<u32>,
+    /// The (rsn, result) response we sent last — a retransmitted request
+    /// must be answered with the SAME response (RFC 6525 §5.2.1).
+    last_response: Option<(u32, u32)>,
+    /// Our request awaiting the peer's Response / E1 implicit ack.
+    reconfig_outstanding: Option<OutstandingReconfig>,
+    /// Reciprocal resets (RFC 8831 §6.7) queued while another request is in
+    /// flight; started in order on completion.
+    pending_recip: VecDeque<u16>,
+    /// An E2 deferred reset in progress (peer's request, our hold).
+    deferred_reset: Option<DeferredReset>,
 
     // ---- receive side ----
     cum_tsn: u32,
@@ -416,8 +492,18 @@ impl SctpEndpoint {
             need_sack: false,
             closed: false,
             peer_forward_tsn: false,
+            peer_reconfig: false,
             last_init: None,
             ftsn_outstanding: None,
+            // §4.1: the RSN starts at the initial TSN (re-derived by the
+            // server when the cookie fixes its TSN at establishment).
+            next_rsn: local_tsn,
+            peer_rsn_seen: None,
+            last_response: None,
+            reconfig_outstanding: None,
+            pending_recip: VecDeque::new(),
+            deferred_reset: None,
+            reconfig_deadline: None,
         }
     }
 
@@ -448,15 +534,28 @@ impl SctpEndpoint {
             os: self.cfg.os_streams,
             mis: self.cfg.mis_streams,
             initial_tsn: self.local_tsn,
-            params: if self.cfg.forward_tsn {
-                vec![wire::RawParam {
-                    ptype: wire::PT_SUPPORTED_EXTENSIONS,
-                    value: vec![wire::CT_FORWARD_TSN],
-                }]
-            } else {
-                Vec::new()
-            },
+            params: self.supported_extensions_params(),
         })
+    }
+
+    /// The Supported Extensions parameter (RFC 5061) advertising what this
+    /// endpoint supports — FORWARD-TSN (RFC 3758 §3.1) and RE-CONFIG
+    /// (RFC 6525, signaled per RFC 8831 §6.1).
+    fn supported_extensions_params(&self) -> Vec<wire::RawParam> {
+        if !(self.cfg.forward_tsn || self.cfg.stream_reset) {
+            return Vec::new();
+        }
+        let mut value = Vec::with_capacity(2);
+        if self.cfg.forward_tsn {
+            value.push(CT_FORWARD_TSN);
+        }
+        if self.cfg.stream_reset {
+            value.push(CT_RE_CONFIG);
+        }
+        vec![wire::RawParam {
+            ptype: wire::PT_SUPPORTED_EXTENSIONS,
+            value,
+        }]
     }
 
     fn recv_window_bytes(&self) -> u32 {
@@ -522,7 +621,7 @@ impl SctpEndpoint {
             Chunk::InitAck(init) => self.on_init_ack(init, now, events),
             Chunk::CookieEcho { cookie } => self.on_cookie_echo(cookie, now, events),
             Chunk::CookieAck => self.on_cookie_ack(now, events),
-            Chunk::Data(d) => self.on_data(d, events),
+            Chunk::Data(d) => self.on_data(d, now, events),
             Chunk::Sack(s) => self.on_sack(s, now),
             Chunk::Heartbeat { info } => {
                 self.queue_packet(&[Chunk::HeartbeatAck { info }]);
@@ -531,7 +630,8 @@ impl SctpEndpoint {
             Chunk::ForwardTsn {
                 new_cum_tsn,
                 streams,
-            } => self.on_forward_tsn(new_cum_tsn, &streams),
+            } => self.on_forward_tsn(new_cum_tsn, &streams, now, events),
+            Chunk::ReConfig(rc) => self.on_re_config(rc, now, events),
             Chunk::Abort { causes, .. } => {
                 let raw = (!causes.is_empty()).then(|| {
                     causes
@@ -578,6 +678,7 @@ impl SctpEndpoint {
         self.peer_a_rwnd = init.a_rwnd as usize;
         self.peer_mis = init.mis;
         self.peer_forward_tsn = supports_forward_tsn(&init);
+        self.peer_reconfig = supports_re_config(&init);
         self.cum_tsn = init.initial_tsn.wrapping_sub(1);
         self.peer_cum = self.local_tsn.wrapping_sub(1);
         self.last_init = Some(init.clone());
@@ -587,12 +688,8 @@ impl SctpEndpoint {
             ptype: wire::PT_STATE_COOKIE,
             value: cookie,
         }];
-        if self.cfg.forward_tsn {
-            params.push(wire::RawParam {
-                ptype: wire::PT_SUPPORTED_EXTENSIONS,
-                value: vec![wire::CT_FORWARD_TSN],
-            });
-        }
+        let ext = self.supported_extensions_params();
+        params.extend(ext);
         if let Some(us) = stale_cookie_us {
             // RFC 9260 §5.1.5: a refreshed INIT-ACK carries the Stale Cookie
             // Error cause with the measured staleness in microseconds.
@@ -623,6 +720,7 @@ impl SctpEndpoint {
         self.peer_a_rwnd = init.a_rwnd as usize;
         self.peer_mis = init.mis;
         self.peer_forward_tsn = supports_forward_tsn(&init);
+        self.peer_reconfig = supports_re_config(&init);
         self.cum_tsn = init.initial_tsn.wrapping_sub(1);
         self.peer_cum = self.local_tsn.wrapping_sub(1);
         let cookie = match init.param(wire::PT_STATE_COOKIE) {
@@ -689,11 +787,15 @@ impl SctpEndpoint {
         }
         self.local_tag = parsed.server_tag;
         self.local_tsn = parsed.server_tsn;
+        // The RSN space follows the (possibly cookie-assigned) initial TSN
+        // (RFC 6525 §4.1).
+        self.next_rsn = self.local_tsn;
         self.peer_tag = parsed.client_tag;
         self.peer_initial_tsn = parsed.client_tsn;
         self.peer_a_rwnd = parsed.client_rwnd as usize;
         self.peer_mis = parsed.client_mis;
         self.peer_forward_tsn = parsed.client_forward_tsn;
+        self.peer_reconfig = parsed.client_reconfig;
         self.cum_tsn = parsed.client_tsn.wrapping_sub(1);
         self.peer_cum = parsed.server_tsn.wrapping_sub(1);
         self.state = State::Established;
@@ -704,7 +806,7 @@ impl SctpEndpoint {
 
     // ------------------------------------------------------- data recv
 
-    fn on_data(&mut self, d: DataChunk, events: &mut Vec<SctpEvent>) {
+    fn on_data(&mut self, d: DataChunk, now: Instant, events: &mut Vec<SctpEvent>) {
         if self.state != State::Established && self.state != State::ShutdownSent {
             return;
         }
@@ -720,21 +822,35 @@ impl SctpEndpoint {
             self.record_dup(d.tsn);
             return;
         }
+        // RFC 6525 §5.2.2 E2: while a deferred reset is in progress, data on
+        // the affected streams beyond the peer's last assigned TSN is held
+        // until the cumulative point reaches it.
+        if let Some(def) = self.deferred_reset.as_mut() {
+            if tsn_gt(d.tsn, def.last_tsn)
+                && (def.streams.is_empty() || def.streams.contains(&d.stream))
+            {
+                def.held.insert(d.tsn, d);
+                self.need_sack = true;
+                return;
+            }
+        }
         self.ofo.insert(d.tsn, d.clone());
         // Unordered messages are delivered on arrival — TSN contiguity gates
         // only ordered delivery (RFC 9260 §6.6).
         if d.unordered {
-            self.feed_unordered(d, events);
+            self.feed_unordered(d, now, events);
         }
         // Advance the cumulative point through contiguous TSNs, delivering
         // the ordered messages that become available.
         while let Some(c) = self.ofo.remove(&(self.cum_tsn.wrapping_add(1))) {
             self.cum_tsn = self.cum_tsn.wrapping_add(1);
             if !c.unordered {
-                self.feed_ordered(c, events);
+                self.feed_ordered(c, now, events);
             }
         }
         self.need_sack = true;
+        // The advance may have reached the deferred reset's target.
+        self.check_deferred_reset(now, events);
     }
 
     fn record_dup(&mut self, tsn: u32) {
@@ -745,7 +861,13 @@ impl SctpEndpoint {
         self.need_sack = true;
     }
 
-    fn handle_dcep(&mut self, stream: u16, payload: &[u8], events: &mut Vec<SctpEvent>) {
+    fn handle_dcep(
+        &mut self,
+        stream: u16,
+        payload: &[u8],
+        now: Instant,
+        events: &mut Vec<SctpEvent>,
+    ) {
         match dcep::parse(payload) {
             Ok(Some(open)) => {
                 // RFC 8832 §5.1/§6: the PEER opens EVEN streams when it is
@@ -758,6 +880,22 @@ impl SctpEndpoint {
                 // parity: even iff the peer is the DTLS client (= we are
                 // the association responder).
                 if (stream % 2 == 1) != self.cfg.is_client {
+                    // RFC 8832 §5.1: an invalid OPEN is not acked. Task 51
+                    // documented "drop" because stream reset did not exist
+                    // here yet; with RFC 6525 support the spec action
+                    // (RFC 8831 §6.7 close) is available: reset the stream
+                    // so the peer sees its incoming side reset and closes
+                    // its outgoing side — which also stops the reliable
+                    // OPEN retransmissions. Without free reconfig capacity
+                    // (one request at a time) or peer support, fall back to
+                    // the documented drop: the association survives and the
+                    // retransmitted OPENs keep hitting this guard.
+                    if self.peer_reconfig
+                        && self.cfg.stream_reset
+                        && self.reconfig_outstanding.is_none()
+                    {
+                        self.send_re_config_request(vec![stream], now);
+                    }
                     return;
                 }
                 if self.channels.contains_key(&stream) {
@@ -780,6 +918,8 @@ impl SctpEndpoint {
                         channel_type: open.channel_type,
                         ssn: 0,
                         awaiting_ack: false,
+                        closing: false,
+                        closed_notified: false,
                     },
                 );
                 // The ack goes out reliably+ordered (documented choice). If
@@ -831,7 +971,7 @@ impl SctpEndpoint {
         }
     }
 
-    fn feed_unordered(&mut self, c: DataChunk, events: &mut Vec<SctpEvent>) {
+    fn feed_unordered(&mut self, c: DataChunk, now: Instant, events: &mut Vec<SctpEvent>) {
         if c.begin {
             let mut run = FragRun {
                 ssn: 0,
@@ -843,7 +983,7 @@ impl SctpEndpoint {
             if c.end {
                 run.end_seen = true;
                 if run.complete() {
-                    self.deliver_run(&run, events);
+                    self.deliver_run(&run, now, events);
                     return;
                 }
             }
@@ -862,11 +1002,11 @@ impl SctpEndpoint {
         }
         if run.complete() {
             let run = self.unordered.current.take().unwrap();
-            self.deliver_run(&run, events);
+            self.deliver_run(&run, now, events);
         }
     }
 
-    fn feed_ordered(&mut self, c: DataChunk, events: &mut Vec<SctpEvent>) {
+    fn feed_ordered(&mut self, c: DataChunk, now: Instant, events: &mut Vec<SctpEvent>) {
         let stream = c.stream;
         let ssn = c.ssn;
         // Phase 0 — chunks of a message a FORWARD-TSN already skipped must
@@ -937,7 +1077,7 @@ impl SctpEndpoint {
         };
         // Phase 3 — deliver, then drain parked runs now in order.
         if let Some(run) = completed {
-            self.deliver_run(&run, events);
+            self.deliver_run(&run, now, events);
             loop {
                 let next = self.ordered.get(&stream).map(|b| b.expected).unwrap_or(0);
                 let cand = self
@@ -949,7 +1089,7 @@ impl SctpEndpoint {
                         if let Some(buf) = self.ordered.get_mut(&stream) {
                             buf.expected = next.wrapping_add(1);
                         }
-                        self.deliver_run(&p, events);
+                        self.deliver_run(&p, now, events);
                     }
                     Some(p) => {
                         self.ordered
@@ -965,7 +1105,7 @@ impl SctpEndpoint {
         }
     }
 
-    fn deliver_run(&mut self, run: &FragRun, events: &mut Vec<SctpEvent>) {
+    fn deliver_run(&mut self, run: &FragRun, now: Instant, events: &mut Vec<SctpEvent>) {
         let Some(first) = run.pieces.values().next() else {
             return;
         };
@@ -983,7 +1123,7 @@ impl SctpEndpoint {
         // DCEP rides the ordered pipeline (SSN-accounted like any user
         // message) and is dispatched here, at delivery time.
         if ppid == PPID_DCEP_OPEN || ppid == PPID_DCEP_ACK {
-            self.handle_dcep(stream, &data, events);
+            self.handle_dcep(stream, &data, now, events);
             return;
         }
         // Hold user data until the DCEP OPEN for the stream was seen.
@@ -1036,6 +1176,8 @@ impl SctpEndpoint {
                 channel_type,
                 ssn: 0,
                 awaiting_ack: true,
+                closing: false,
+                closed_notified: false,
             },
         );
         // Establishment messages go reliably+ordered (documented choice).
@@ -1050,13 +1192,29 @@ impl SctpEndpoint {
         } else {
             self.peer_mis.min(self.cfg.os_streams)
         };
+        // Two passes over the parity space: ids freed by a completed
+        // RFC 8831 §6.7 stream reset BELOW the high-water mark are reusable
+        // ("Streams are available for reuse after a reset has been
+        // performed"). A closing channel's id is still occupied (its entry
+        // lives until the reset completes), so it is not handed out twice.
+        // The scan result is explicit: without it, the wrap-around
+        // assignment of a fully exhausted second pass would present an
+        // OCCUPIED id as free (the exhaustion test caught exactly that).
         let mut id = self.next_outbound_stream;
-        while id < limit && self.channels.contains_key(&id) {
-            id = id.wrapping_add(2);
+        let mut found: Option<u16> = None;
+        for _ in 0..2 {
+            while id < limit && self.channels.contains_key(&id) {
+                id = id.wrapping_add(2);
+            }
+            if id < limit {
+                found = Some(id);
+                break;
+            }
+            id = if self.cfg.is_client { 0 } else { 1 };
         }
-        if id >= limit {
+        let Some(id) = found else {
             return Err(SctpError::SendBufferFull);
-        }
+        };
         self.next_outbound_stream = id.wrapping_add(2);
         Ok(id)
     }
@@ -1077,6 +1235,9 @@ impl SctpEndpoint {
             .channels
             .get(&stream)
             .ok_or(SctpError::UnknownStream(stream))?;
+        if ch.closing {
+            return Err(SctpError::ChannelClosing(stream));
+        }
         if data.len() > self.cfg.max_message_size {
             return Err(SctpError::MessageTooLarge(data.len()));
         }
@@ -1523,12 +1684,17 @@ impl SctpEndpoint {
         true
     }
 
-    fn on_forward_tsn(&mut self, new_cum: u32, streams: &[(u16, u16)]) {
+    fn on_forward_tsn(
+        &mut self,
+        new_cum: u32,
+        streams: &[(u16, u16)],
+        now: Instant,
+        events: &mut Vec<SctpEvent>,
+    ) {
         if self.state != State::Established && self.state != State::ShutdownSent {
             return;
         }
         self.stats.ftsn_rx += 1;
-        // Drop out-of-order chunks at or below the new point.
         let stale: Vec<u32> = self
             .ofo
             .keys()
@@ -1568,6 +1734,353 @@ impl SctpEndpoint {
             }
         }
         self.need_sack = true;
+        // FORWARD-TSN also moves the cumulative point — it can complete a
+        // deferred stream reset (RFC 6525 §5.2.2 E2).
+        self.check_deferred_reset(now, events);
+    }
+
+    // -------------------------------------------------- re-config (6525)
+
+    /// Close one data channel per RFC 8831 §6.7: stop sending on it (A1)
+    /// and reset our outgoing stream (Outgoing SSN Reset Request). The
+    /// request is retransmitted until the peer's Response arrives; the
+    /// channel is removed — and its stream id freed — on completion, where
+    /// [`SctpEvent::DataChannelClosed`] fires.
+    pub fn close_channel(&mut self, stream: u16, now: Instant) -> Result<(), SctpError> {
+        if self.state != State::Established {
+            return Err(SctpError::WrongState("not established"));
+        }
+        if !self.cfg.stream_reset {
+            return Err(SctpError::WrongState("stream reset disabled"));
+        }
+        if !self.peer_reconfig {
+            return Err(SctpError::WrongState(
+                "peer does not advertise RFC 6525 support",
+            ));
+        }
+        let ch = self
+            .channels
+            .get(&stream)
+            .ok_or(SctpError::UnknownStream(stream))?;
+        if ch.closing {
+            return Err(SctpError::ChannelClosing(stream));
+        }
+        if self.reconfig_outstanding.is_some() {
+            return Err(SctpError::ReconfigBusy);
+        }
+        // A1: stop assigning new SSNs for the affected stream — sends on it
+        // are rejected from here on.
+        if let Some(ch) = self.channels.get_mut(&stream) {
+            ch.closing = true;
+        }
+        self.send_re_config_request(vec![stream], now);
+        self.flush(now);
+        Ok(())
+    }
+
+    /// §5.1.2 A2–A6: assign the next RSN, put the request into a RE-CONFIG
+    /// chunk and record it for retransmission.
+    fn send_re_config_request(&mut self, streams: Vec<u16>, now: Instant) {
+        let rsn = self.next_rsn;
+        self.next_rsn = self.next_rsn.wrapping_add(1);
+        let response_seq = self
+            .peer_rsn_seen
+            .unwrap_or(self.peer_initial_tsn.wrapping_sub(1));
+        let last_tsn = self.local_tsn.wrapping_sub(1);
+        self.queue_re_config(&[ReConfigParam::OutgoingSsnReset {
+            rsn,
+            response_seq,
+            last_tsn,
+            streams: streams.clone(),
+        }]);
+        self.reconfig_outstanding = Some(OutstandingReconfig {
+            rsn,
+            streams,
+            attempts: 0,
+        });
+        self.reconfig_deadline = Some(now + self.rto);
+        self.stats.reconfig_tx += 1;
+    }
+
+    /// Start the reciprocal reset queued earliest (RFC 8831 §6.7: the side
+    /// that sees an incoming stream reset also resets its outgoing stream).
+    fn start_next_reciprocal(&mut self, now: Instant) {
+        if self.reconfig_outstanding.is_some() {
+            return;
+        }
+        while let Some(stream) = self.pending_recip.pop_front() {
+            if self.channels.contains_key(&stream) {
+                self.send_re_config_request(vec![stream], now);
+                return;
+            }
+        }
+    }
+
+    fn queue_re_config(&mut self, params: &[ReConfigParam]) {
+        self.queue_packet(&[Chunk::ReConfig(ReConfigChunk {
+            params: params.to_vec(),
+        })]);
+    }
+
+    /// §5.1.7 D1–D2: respond to a request, remembering the response so a
+    /// retransmitted request gets the SAME answer (§5.2.1).
+    fn send_re_config_response(&mut self, rsn: u32, result: u32) {
+        self.queue_re_config(&[ReConfigParam::Response { rsn, result }]);
+        self.last_response = Some((rsn, result));
+        self.stats.reconfig_tx += 1;
+    }
+
+    /// RE-CONFIG chunk entry: process the parameters in order. A Response
+    /// (or an E1 implicit acknowledgment) completes OUR outstanding
+    /// request; a request resets the listed inbound streams — immediately
+    /// or deferred (E2) — and is answered.
+    fn on_re_config(&mut self, rc: ReConfigChunk, now: Instant, events: &mut Vec<SctpEvent>) {
+        if self.state != State::Established && self.state != State::ShutdownSent {
+            return;
+        }
+        self.stats.reconfig_rx += 1;
+        for param in rc.params {
+            match param {
+                ReConfigParam::Response { rsn, result } => {
+                    self.on_re_config_response(rsn, result, now, events);
+                }
+                ReConfigParam::OutgoingSsnReset {
+                    rsn,
+                    response_seq,
+                    last_tsn,
+                    streams,
+                } => {
+                    self.on_re_config_request(rsn, response_seq, last_tsn, streams, now, events);
+                }
+            }
+        }
+    }
+
+    /// §5.1.1 E1: the response (or an implicit acknowledgment carried in a
+    /// peer request's response_seq field) completes our request — the close
+    /// finishes, the channels are removed and their ids become reusable.
+    /// Non-terminal results (4 "already in progress" / 6 "in progress")
+    /// keep the request alive for retransmission.
+    fn on_re_config_response(
+        &mut self,
+        rsn: u32,
+        result: u32,
+        now: Instant,
+        events: &mut Vec<SctpEvent>,
+    ) {
+        let matches = self
+            .reconfig_outstanding
+            .as_ref()
+            .is_some_and(|out| out.rsn == rsn);
+        if !matches {
+            return; // stale / unsolicited response
+        }
+        let out = self.reconfig_outstanding.as_ref().unwrap().clone();
+        match result {
+            RC_RESULT_IN_PROGRESS_PEER | RC_RESULT_IN_PROGRESS => {
+                // The peer is working on it (deferred reset on its side);
+                // keep retransmitting until a final answer arrives.
+                return;
+            }
+            RC_RESULT_NOTHING_TO_DO | RC_RESULT_PERFORMED => {
+                // Success: the peer performed (or had already performed)
+                // the reset of our outgoing streams.
+            }
+            _ => {
+                // Denied / errors: the reset never happened on the peer.
+                // The channel is dead for the application either way — we
+                // complete the close locally and free the id (documented
+                // choice; a stream whose peer kept its SSN state cannot be
+                // reused safely, so a DENIED close leaves the id consumed
+                // unless the channel had been removed by a completed
+                // incoming reset as well).
+            }
+        }
+        self.reconfig_outstanding = None;
+        self.reconfig_deadline = None;
+        for s in out.streams {
+            if let Some(ch) = self.channels.get_mut(&s) {
+                if !ch.closed_notified {
+                    ch.closed_notified = true;
+                    events.push(SctpEvent::DataChannelClosed { stream: s });
+                }
+            }
+            self.channels.remove(&s);
+        }
+        self.start_next_reciprocal(now);
+    }
+
+    /// §5.2.2: an incoming Outgoing SSN Reset Request for the streams WE
+    /// RECEIVE on. Duplicate RSNs are answered with the stored response;
+    /// a request whose last_tsn is ahead of our cumulative point enters
+    /// deferred processing (E2, result 6) and completes later.
+    fn on_re_config_request(
+        &mut self,
+        rsn: u32,
+        response_seq: u32,
+        last_tsn: u32,
+        streams: Vec<u16>,
+        now: Instant,
+        events: &mut Vec<SctpEvent>,
+    ) {
+        // E1 first: does this request implicitly acknowledge OUR outstanding
+        // request (response_seq names the last of our RSNs the peer saw)?
+        if let Some(out) = self.reconfig_outstanding.as_ref() {
+            if tsn_ge(response_seq, out.rsn) {
+                let rsn_copy = out.rsn;
+                // Reuse the response path for the bookkeeping (success —
+                // the peer would not advertise having seen our request
+                // otherwise).
+                self.on_re_config_response(rsn_copy, RC_RESULT_PERFORMED, now, events);
+            }
+        }
+        // Duplicate request (retransmission): replay the same response
+        // (§5.2.1). While a deferred reset for this very request is still
+        // pending, the stored response IS the "In progress" one.
+        if self.peer_rsn_seen == Some(rsn) {
+            if let Some((seen, result)) = self.last_response {
+                if seen == rsn {
+                    self.send_re_config_response(rsn, result);
+                }
+            }
+            return;
+        }
+        // A second request while one is already deferred cannot be served
+        // (one deferred reset at a time — documented).
+        if self.deferred_reset.is_some() {
+            self.send_re_config_response(rsn, RC_RESULT_IN_PROGRESS_PEER);
+            return;
+        }
+        self.peer_rsn_seen = Some(rsn);
+        // A request for streams we know nothing about needs no deferral:
+        // nothing can be reset, so answer "Nothing to do" right away (E2
+        // defers only when a reset will actually be performed). A stream is
+        // known when a channel is registered OR receive state exists — the
+        // close INITIATOR has already removed its channel when the
+        // reciprocal reset arrives, but its ordered buffer (expected SSN)
+        // still needs the reset for the id to be safely reusable.
+        let any_known = streams.is_empty()
+            || streams
+                .iter()
+                .any(|s| self.channels.contains_key(s) || self.ordered.contains_key(s));
+        if !any_known {
+            self.send_re_config_response(rsn, RC_RESULT_NOTHING_TO_DO);
+            return;
+        }
+        // E2: deferred reset processing when our cumulative point has not
+        // reached the peer's last assigned TSN yet.
+        if tsn_gt(last_tsn, self.cum_tsn) {
+            self.deferred_reset = Some(DeferredReset {
+                rsn,
+                last_tsn,
+                streams: streams.clone(),
+                held: BTreeMap::new(),
+            });
+            self.send_re_config_response(rsn, RC_RESULT_IN_PROGRESS);
+            return;
+        }
+        // E3–E5: perform the reset now and answer success.
+        let performed = self.perform_incoming_reset(&streams, events);
+        let result = if performed || streams.is_empty() {
+            RC_RESULT_PERFORMED
+        } else {
+            RC_RESULT_NOTHING_TO_DO
+        };
+        self.send_re_config_response(rsn, result);
+        self.start_next_reciprocal(now);
+    }
+
+    /// §5.2.2 E3 (the effect, shared by the immediate and the deferred
+    /// path): reset the listed INBOUND streams — expected SSN back to 0,
+    /// received-but-undelivered data on them discarded — and notify the
+    /// application. Returns whether at least one listed stream was reset.
+    /// Reciprocal resets (RFC 8831 §6.7) are queued for streams we also
+    /// send on and that are not already covered by a request of our own.
+    fn perform_incoming_reset(&mut self, streams: &[u16], events: &mut Vec<SctpEvent>) -> bool {
+        let mut performed = false;
+        let affected: Vec<u16> = if streams.is_empty() {
+            // §4.1: an empty stream list means ALL inbound streams.
+            let mut all: Vec<u16> = self.channels.keys().copied().collect();
+            all.extend(self.ordered.keys().copied());
+            all.sort_unstable();
+            all.dedup();
+            all
+        } else {
+            streams.to_vec()
+        };
+        for stream in affected {
+            performed = true;
+            // Received-but-undelivered data on the stream is discarded.
+            self.pre_dcep.remove(&stream);
+            self.ordered.insert(stream, OrderedBuf::default());
+            let stale: Vec<u32> = self
+                .ofo
+                .iter()
+                .filter(|(_, c)| c.stream == stream)
+                .map(|(t, _)| *t)
+                .collect();
+            for t in stale {
+                self.ofo.remove(&t);
+            }
+            // Application notification: the peer's side of this channel is
+            // gone; sends are rejected from here on.
+            let channel_exists = self.channels.contains_key(&stream);
+            if let Some(ch) = self.channels.get_mut(&stream) {
+                if !ch.closed_notified {
+                    ch.closed_notified = true;
+                    ch.closing = true;
+                    events.push(SctpEvent::DataChannelClosed { stream });
+                }
+            }
+            // RFC 8831 §6.7: we also SEND on this stream, so reset it too —
+            // queued while another request of ours is in flight (documented
+            // simplification: one outstanding request at a time).
+            let in_flight = self
+                .reconfig_outstanding
+                .as_ref()
+                .is_some_and(|r| r.streams.contains(&stream));
+            if channel_exists && !in_flight && !self.pending_recip.contains(&stream) {
+                self.pending_recip.push_back(stream);
+            }
+        }
+        performed
+    }
+
+    /// The deferred-reset completion check (RFC 6525 §5.2.2 E2→E5): once
+    /// our cumulative point reaches the peer's last assigned TSN, the
+    /// affected streams are reset, the held chunks are released into the
+    /// normal receive path and the final success response goes out.
+    fn check_deferred_reset(&mut self, now: Instant, events: &mut Vec<SctpEvent>) {
+        let Some(def) = self.deferred_reset.as_ref() else {
+            return;
+        };
+        if tsn_gt(def.last_tsn, self.cum_tsn) {
+            return; // still ahead of the cumulative point
+        }
+        let def = self.deferred_reset.take().unwrap();
+        let streams = def.streams.clone();
+        self.perform_incoming_reset(&streams, events);
+        // E4: release the queued chunks, in TSN order, through the normal
+        // receive path (they are new-epoch data: SSNs restart at 0).
+        for (_, d) in def.held {
+            if tsn_le(d.tsn, self.cum_tsn) || self.ofo.contains_key(&d.tsn) {
+                continue; // delivered by a retransmission in between
+            }
+            self.ofo.insert(d.tsn, d.clone());
+            if d.unordered {
+                self.feed_unordered(d, now, events);
+            }
+            while let Some(c) = self.ofo.remove(&(self.cum_tsn.wrapping_add(1))) {
+                self.cum_tsn = self.cum_tsn.wrapping_add(1);
+                if !c.unordered {
+                    self.feed_ordered(c, now, events);
+                }
+            }
+        }
+        // E5: the final response for the request — and any reciprocal reset
+        // the reset just queued can start now.
+        self.send_re_config_response(def.rsn, RC_RESULT_PERFORMED);
+        self.start_next_reciprocal(now);
     }
 
     // --------------------------------------------------------- timers
@@ -1585,6 +2098,7 @@ impl SctpEndpoint {
         consider(self.t3_deadline);
         consider(self.heartbeat_deadline);
         consider(self.ftsn_deadline);
+        consider(self.reconfig_deadline);
         if self.peer_forward_tsn && self.cfg.forward_tsn {
             for c in &self.inflight {
                 if c.abandoned {
@@ -1756,6 +2270,47 @@ impl SctpEndpoint {
             }
             self.ftsn_deadline = Some(now + self.rto);
         }
+        // Re-configuration timer (RFC 6525 §5.1.1): retransmit the
+        // outstanding Outgoing SSN Reset Request with RTO backoff.
+        // Exhaustion completes the close locally (the channel is dead for
+        // the application either way; the association survives).
+        let rc_due = self
+            .reconfig_deadline
+            .is_some_and(|d| d <= now && self.reconfig_outstanding.is_some());
+        if rc_due {
+            let out = self.reconfig_outstanding.as_ref().unwrap().clone();
+            if out.attempts >= MAX_INIT_RETRANS {
+                self.reconfig_outstanding = None;
+                self.reconfig_deadline = None;
+                for s in out.streams {
+                    if let Some(ch) = self.channels.get_mut(&s) {
+                        if !ch.closed_notified {
+                            ch.closed_notified = true;
+                            events.push(SctpEvent::DataChannelClosed { stream: s });
+                        }
+                    }
+                    self.channels.remove(&s);
+                }
+            } else {
+                let (rsn, streams) = {
+                    let out = self.reconfig_outstanding.as_mut().unwrap();
+                    out.attempts += 1;
+                    (out.rsn, out.streams.clone())
+                };
+                self.rto = (self.rto * 2).min(self.cfg.rto_max);
+                self.reconfig_deadline = Some(now + self.rto);
+                let response_seq = self
+                    .peer_rsn_seen
+                    .unwrap_or(self.peer_initial_tsn.wrapping_sub(1));
+                self.queue_re_config(&[ReConfigParam::OutgoingSsnReset {
+                    rsn,
+                    response_seq,
+                    last_tsn: self.local_tsn.wrapping_sub(1),
+                    streams,
+                }]);
+                self.stats.reconfig_tx += 1;
+            }
+        }
         // Heartbeat.
         if let Some(deadline) = self.heartbeat_deadline {
             if deadline <= now && self.state == State::Established {
@@ -1892,6 +2447,10 @@ impl SctpEndpoint {
         self.heartbeat_deadline = None;
         self.ftsn_deadline = None;
         self.ftsn_outstanding = None;
+        self.reconfig_outstanding = None;
+        self.reconfig_deadline = None;
+        self.deferred_reset = None;
+        self.pending_recip.clear();
     }
 
     // ------------------------------------------------------------ misc
@@ -1933,10 +2492,12 @@ impl SctpEndpoint {
         buf.extend_from_slice(&init.mis.to_be_bytes()); // 38
         buf.extend_from_slice(&now_unix_ms().to_be_bytes()); // 40..48
         buf.push(u8::from(supports_forward_tsn(init))); // 48
-        buf.extend_from_slice(&[0u8; 3]); // 49..52 (alignment)
-                                          // Random nonce inside the MAC'd region: two cookies issued for the
-                                          // same INIT never share bytes, so a captured COOKIE-ECHO cannot be
-                                          // replayed as a fresh-looking cookie (the MAC binds the exchange).
+                                                        // Byte 49 was padding; it now carries the RE-CONFIG support flag.
+                                                        // Old-version cookies (padding zero) parse as "no stream reset" —
+                                                        // the conservative default — and the MAC still validates, so no
+                                                        // version bump of the cookie magic is needed.
+        buf.push(u8::from(supports_re_config(init))); // 49
+        buf.extend_from_slice(&[0u8; 2]); // 50..52 (alignment)
         let mut nonce = [0u8; 8];
         fill_random(&mut nonce);
         buf.extend_from_slice(&nonce); // 52..60
@@ -1954,6 +2515,7 @@ struct CookieState {
     client_rwnd: u32,
     client_mis: u16,
     client_forward_tsn: bool,
+    client_reconfig: bool,
     issued_ms: u64,
 }
 
@@ -1985,6 +2547,7 @@ fn parse_cookie(buf: &[u8]) -> Result<CookieState, SctpError> {
         client_rwnd: rd32(32),
         client_mis: rd16(38),
         client_forward_tsn: buf[48] != 0,
+        client_reconfig: buf[49] != 0,
         issued_ms,
     })
 }
@@ -2001,6 +2564,12 @@ fn cookie_mac(key: &[u8; 32], data: &[u8]) -> [u8; COOKIE_MAC_LEN] {
 fn supports_forward_tsn(init: &wire::InitChunk) -> bool {
     init.param(wire::PT_SUPPORTED_EXTENSIONS)
         .map(|v| v.contains(&wire::CT_FORWARD_TSN))
+        .unwrap_or(false)
+}
+
+fn supports_re_config(init: &wire::InitChunk) -> bool {
+    init.param(wire::PT_SUPPORTED_EXTENSIONS)
+        .map(|v| v.contains(&CT_RE_CONFIG))
         .unwrap_or(false)
 }
 

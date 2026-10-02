@@ -16,6 +16,9 @@ struct Harness {
     now: Instant,
     /// (dst: true = to server / false = to client, packet bytes)
     net: VecDeque<(bool, Vec<u8>)>,
+    /// Every packet that ever crossed the "network" (assertions can inspect
+    /// wire forms even after `deliver_all` drained them).
+    log: Vec<(bool, Vec<u8>)>,
     client_events: Vec<SctpEvent>,
     server_events: Vec<SctpEvent>,
 }
@@ -55,6 +58,7 @@ impl Harness {
             server,
             now: base,
             net: VecDeque::new(),
+            log: Vec::new(),
             client_events: Vec::new(),
             server_events: Vec::new(),
         };
@@ -92,6 +96,7 @@ impl Harness {
             server,
             now: base,
             net: VecDeque::new(),
+            log: Vec::new(),
             client_events: Vec::new(),
             server_events: Vec::new(),
         };
@@ -101,9 +106,11 @@ impl Harness {
 
     fn drain_to_net(&mut self) {
         for p in self.client.drain_outbound() {
+            self.log.push((true, p.clone()));
             self.net.push_back((true, p));
         }
         for p in self.server.drain_outbound() {
+            self.log.push((false, p.clone()));
             self.net.push_back((false, p));
         }
     }
@@ -277,20 +284,41 @@ fn dcep_open_on_wrong_parity_is_dropped() {
         "wrong-parity OPEN must not register a channel"
     );
     assert!(h.server.is_established(), "association must survive");
-    // No DCEP ACK may leave the server for the dropped OPEN.
+    // No DCEP ACK may leave the server for the dropped OPEN. What DOES
+    // leave it now (Task 53: RFC 6525 landed) is the spec close for the
+    // bogus channel — an Outgoing SSN Reset Request for stream 1 (the
+    // Task 51 "drop" fallback remains only when a reset of ours is already
+    // in flight).
     h.drain_to_net();
+    let mut saw_reset = false;
     for (_, pkt) in &h.net {
         let parsed = parse_packet(pkt, false).unwrap();
         for chunk in parsed.chunks {
-            if let Chunk::Data(d) = chunk {
-                assert_ne!(
-                    d.ppid,
-                    sctp::dcep::PPID_DCEP,
-                    "an invalid OPEN must never be acked"
-                );
+            match chunk {
+                Chunk::Data(d) => {
+                    assert_ne!(
+                        d.ppid,
+                        sctp::dcep::PPID_DCEP,
+                        "an invalid OPEN must never be acked"
+                    );
+                }
+                Chunk::ReConfig(rc) => {
+                    saw_reset = rc.params.iter().any(|p| {
+                        matches!(
+                            p,
+                            sctp::wire::ReConfigParam::OutgoingSsnReset { streams, .. }
+                                if streams.contains(&1)
+                        )
+                    });
+                }
+                _ => {}
             }
         }
     }
+    assert!(
+        saw_reset,
+        "the wrong-parity OPEN must be closed with a stream reset"
+    );
 
     // The correctly-paritied OPEN (even, from the DTLS client) is accepted.
     let good = sctp::wire::encode_packet(
@@ -983,4 +1011,524 @@ fn user_data_on_non_dcep_ppids_is_delivered() {
     for (i, (_, data)) in got.iter().enumerate() {
         assert_eq!(data, &vec![0x55; 40], "message {i} payload intact");
     }
+}
+
+// ------------------------------------------------------------- RFC 6525
+
+/// Extract the Re-configuration parameters from the outbound packets of one
+/// side (drained through the harness "network").
+fn re_config_params(h: &Harness, dst: bool) -> Vec<sctp::wire::ReConfigParam> {
+    let mut out = Vec::new();
+    for (d, pkt) in &h.log {
+        if *d != dst {
+            continue;
+        }
+        if let Ok(parsed) = parse_packet(pkt, false) {
+            for chunk in parsed.chunks {
+                if let Chunk::ReConfig(rc) = chunk {
+                    out.extend(rc.params);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn closed_streams(events: &[SctpEvent]) -> Vec<u16> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            SctpEvent::DataChannelClosed { stream } => Some(*stream),
+            _ => None,
+        })
+        .collect()
+}
+
+/// RFC 8831 §6.7 happy path: the client closes its channel, the server
+/// responds and reciprocates (its own Outgoing SSN Reset for the same
+/// stream), both sides see `DataChannelClosed`, and the stream id is
+/// reusable — a new channel after the close gets the SAME id, and ordered
+/// delivery on it works (SSN restarted at 0 on both ends).
+#[test]
+fn close_channel_completes_both_sides_and_reuses_the_id() {
+    let mut h = Harness::new();
+    h.handshake();
+    let s = h
+        .client
+        .open_data_channel("chat", "", ChannelType::Reliable, h.now)
+        .unwrap();
+    assert_eq!(s, 0);
+    h.drain_to_net();
+    h.deliver_all(); // OPEN → server, ACK → client
+    h.drain_to_net();
+    h.deliver_all();
+    assert!(h
+        .take_client_events()
+        .iter()
+        .any(|e| matches!(e, SctpEvent::DataChannelAck { stream: 0 })));
+
+    // A message crosses before the close.
+    h.client_send(0, b"last words".to_vec());
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+    assert_eq!(
+        msgs(&h.take_server_events()),
+        vec![(0u16, b"last words".to_vec())]
+    );
+
+    // Close.
+    h.client.close_channel(0, h.now).unwrap();
+    h.drain_to_net();
+    h.deliver_all(); // request → server; response + reciprocal request → client
+    h.drain_to_net();
+    h.deliver_all(); // reciprocal response → server
+    h.drain_to_net();
+    h.deliver_all();
+
+    let client_closed = closed_streams(&h.take_client_events());
+    let server_closed = closed_streams(&h.take_server_events());
+    assert_eq!(client_closed, vec![0], "client: close completed");
+    assert_eq!(server_closed, vec![0], "server: incoming stream was reset");
+
+    // The reset responses from the server: Success-Performed for our RSN
+    // (the client's RSN space starts at its initial TSN = 1000).
+    let responses = re_config_params(&h, false);
+    assert!(
+        responses.iter().any(|p| matches!(
+            p,
+            sctp::wire::ReConfigParam::Response {
+                rsn: 1000,
+                result: sctp::wire::RC_RESULT_PERFORMED
+            }
+        )),
+        "server must answer the client's reset with Success-Performed: {responses:?}"
+    );
+    // ... and the reciprocal request for the same stream must have crossed.
+    assert!(responses.iter().any(|p| matches!(
+        p,
+        sctp::wire::ReConfigParam::OutgoingSsnReset { streams, .. } if streams == &vec![0u16]
+    )));
+
+    // Both sides' channels are gone: a new OPEN gets the next parity id
+    // (2 — the allocator hands out ids at the high-water mark, libwebrtc
+    // shape; the freed id itself is proven reusable by the exhaustion test
+    // below). The reset semantics are what matter: the new channel's SSN
+    // starts at 0 and ordered delivery round-trips.
+    let s2 = h
+        .client
+        .open_data_channel("chat-2", "", ChannelType::Reliable, h.now)
+        .unwrap();
+    assert_eq!(s2, 2, "the next parity id after the closed one");
+    h.drain_to_net();
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+    assert!(h
+        .take_client_events()
+        .iter()
+        .any(|e| matches!(e, SctpEvent::DataChannelAck { stream: 2 })));
+    h.client_send(2, b"reborn".to_vec());
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+    assert_eq!(
+        msgs(&h.take_server_events()),
+        vec![(2u16, b"reborn".to_vec())],
+        "ordered delivery works on the new channel"
+    );
+    assert!(h.client.is_established() && h.server.is_established());
+}
+
+/// RFC 6525 guarantees all messages are delivered (or abandoned) before the
+/// reset — even when the close is issued while the last message is still
+/// unacknowledged on the wire.
+#[test]
+fn close_delivers_the_in_flight_message_before_the_reset() {
+    let mut h = Harness::new();
+    h.handshake();
+    h.client
+        .open_data_channel("chat", "", ChannelType::Reliable, h.now)
+        .unwrap();
+    h.drain_to_net();
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+
+    // Send + close in the same pass: both ride the network together.
+    h.client_send(0, b"pre-close".to_vec());
+    h.client.close_channel(0, h.now).unwrap();
+    h.drain_to_net();
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+
+    let server_events = h.take_server_events();
+    let got = msgs(&server_events);
+    assert_eq!(
+        got,
+        vec![(0u16, b"pre-close".to_vec())],
+        "the message must be delivered, not silently dropped by the reset"
+    );
+    assert_eq!(
+        closed_streams(&server_events),
+        vec![0],
+        "and only then does the channel close"
+    );
+    // The event order proves the guarantee: Message BEFORE DataChannelClosed.
+    let mpos = server_events
+        .iter()
+        .position(|e| matches!(e, SctpEvent::Message { .. }))
+        .unwrap();
+    let cpos = server_events
+        .iter()
+        .position(|e| matches!(e, SctpEvent::DataChannelClosed { .. }))
+        .unwrap();
+    assert!(mpos < cpos);
+}
+
+/// §5.2.2 E2: a RE-CONFIG that overtakes its own data (reordering) enters
+/// deferred reset processing — the server answers "In progress" first,
+/// holds the post-reset data, and completes when its cumulative point
+/// reaches the peer's last assigned TSN.
+#[test]
+fn deferred_reset_when_the_request_overtakes_its_data() {
+    let mut h = Harness::new();
+    h.handshake();
+    h.client
+        .open_data_channel("chat", "", ChannelType::Reliable, h.now)
+        .unwrap();
+    h.drain_to_net();
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+    h.take_client_events();
+    h.take_server_events();
+
+    // Data (TSN 1001) queued, then the close — both undelivered.
+    h.client_send(0, b"post-reset data".to_vec());
+    h.client.close_channel(0, h.now).unwrap();
+    h.drain_to_net();
+    assert!(h.net.len() >= 2, "data and request both queued");
+
+    // Reorder: deliver the REQUEST first.
+    let data_pkt = h.net.pop_front().expect("data packet first");
+    h.deliver_all(); // request arrives: last_tsn (1001) > cum (1000) → E2
+    let responses = re_config_params(&h, false);
+    assert!(
+        responses.iter().any(|p| matches!(
+            p,
+            sctp::wire::ReConfigParam::Response {
+                rsn: 1000,
+                result: sctp::wire::RC_RESULT_IN_PROGRESS
+            }
+        )),
+        "the server must defer: {responses:?}"
+    );
+    h.drain_to_net();
+    h.take_client_events();
+
+    // Now the data arrives: cum reaches 1001 → the deferred reset completes
+    // (E3–E5): the message is delivered, the channel closes, and the final
+    // Success response follows.
+    h.net.push_back(data_pkt);
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+
+    let server_events = h.take_server_events();
+    assert_eq!(
+        msgs(&server_events),
+        vec![(0u16, b"post-reset data".to_vec())],
+        "the held chunk must be released and delivered"
+    );
+    assert_eq!(closed_streams(&server_events), vec![0]);
+    let responses = re_config_params(&h, false);
+    assert!(
+        responses.iter().any(|p| matches!(
+            p,
+            sctp::wire::ReConfigParam::Response {
+                rsn: 1000,
+                result: sctp::wire::RC_RESULT_PERFORMED
+            }
+        )),
+        "the final Success response must follow the In-progress one: {responses:?}"
+    );
+    // The client completes its close on the final response.
+    assert_eq!(closed_streams(&h.take_client_events()), vec![0]);
+}
+
+/// §5.2.1: a retransmitted request gets the SAME response, and processing
+/// it again must not re-fire the close event or re-reset the stream.
+#[test]
+fn duplicate_request_is_answered_with_the_same_response() {
+    let mut h = Harness::new();
+    h.handshake();
+    h.client
+        .open_data_channel("chat", "", ChannelType::Reliable, h.now)
+        .unwrap();
+    h.drain_to_net();
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+
+    // Client closes; the full exchange completes.
+    h.client.close_channel(0, h.now).unwrap();
+    h.drain_to_net();
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+    h.take_client_events();
+    h.take_server_events();
+
+    // The log so far holds the original Response + the server's reciprocal
+    // request; scope the replay assertion to what comes AFTER the dup.
+    let params_before = re_config_params(&h, false).len();
+    assert_eq!(params_before, 2);
+
+    // Hand-built retransmission of the client's original request
+    // (RSN 1000 = its initial TSN; the client's last assigned TSN is the
+    // OPEN's 1000. The response_seq echo is irrelevant for the replay).
+    let req = sctp::wire::encode_packet(
+        5000,
+        5000,
+        222,
+        &[Chunk::ReConfig(sctp::wire::ReConfigChunk {
+            params: vec![sctp::wire::ReConfigParam::OutgoingSsnReset {
+                rsn: 1000,
+                response_seq: 1999, // the server's initial TSN minus 1
+                last_tsn: 1000,
+                streams: vec![0],
+            }],
+        })],
+    );
+    let ev = h.server.handle_packet(&req, h.now);
+    assert!(
+        ev.is_empty(),
+        "a retransmitted request must not re-fire events: {ev:?}"
+    );
+    h.drain_to_net();
+    let responses = &re_config_params(&h, false)[params_before..];
+    assert_eq!(
+        responses,
+        vec![sctp::wire::ReConfigParam::Response {
+            rsn: 1000,
+            result: sctp::wire::RC_RESULT_PERFORMED
+        }],
+        "the same response must be replayed — and nothing else (no re-fire, \
+         no second reciprocal reset)"
+    );
+    assert!(
+        !h.server.channels().contains(&0),
+        "and the channel must stay closed"
+    );
+}
+
+/// A request for a stream the server does not know answers
+/// "Success — Nothing to do" (nothing was reset), and the association
+/// survives.
+#[test]
+fn reset_of_an_unknown_stream_answers_nothing_to_do() {
+    let mut h = Harness::new();
+    h.handshake();
+    let req = sctp::wire::encode_packet(
+        5000,
+        5000,
+        222,
+        &[Chunk::ReConfig(sctp::wire::ReConfigChunk {
+            params: vec![sctp::wire::ReConfigParam::OutgoingSsnReset {
+                rsn: 1000,
+                response_seq: 1999,
+                last_tsn: 1005,
+                streams: vec![7],
+            }],
+        })],
+    );
+    let ev = h.server.handle_packet(&req, h.now);
+    assert!(ev.is_empty());
+    h.drain_to_net();
+    let responses = re_config_params(&h, false);
+    assert_eq!(
+        responses,
+        vec![sctp::wire::ReConfigParam::Response {
+            rsn: 1000,
+            result: sctp::wire::RC_RESULT_NOTHING_TO_DO
+        }]
+    );
+    assert!(h.server.is_established());
+}
+
+/// A close against a peer that never advertised RFC 6525 support is
+/// rejected locally (WrongState), and a send on a closing channel is
+/// rejected with ChannelClosing.
+#[test]
+fn close_channel_state_guards() {
+    // Peer without stream-reset support: the server's INIT carries no
+    // RE-CONFIG in Supported Extensions, so the client must refuse.
+    let base = Instant::now();
+    let client = SctpEndpoint::new_client(
+        SctpConfig {
+            is_client: true,
+            rto_initial: RTO,
+            initial_tag: Some(111),
+            initial_tsn: Some(1000),
+            ..SctpConfig::default()
+        },
+        base,
+    )
+    .unwrap();
+    let server = SctpEndpoint::new_server(SctpConfig {
+        is_client: false,
+        rto_initial: RTO,
+        initial_tag: Some(222),
+        initial_tsn: Some(2000),
+        cookie_key: Some([7u8; 32]),
+        stream_reset: false,
+        ..SctpConfig::default()
+    });
+    let mut h = Harness {
+        client,
+        server,
+        now: base,
+        net: VecDeque::new(),
+        log: Vec::new(),
+        client_events: Vec::new(),
+        server_events: Vec::new(),
+    };
+    h.handshake();
+    h.client
+        .open_data_channel("chat", "", ChannelType::Reliable, h.now)
+        .unwrap();
+    h.drain_to_net();
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+    assert!(matches!(
+        h.client.close_channel(0, h.now),
+        Err(SctpError::WrongState(_))
+    ));
+
+    // Closing channel: sends are rejected with the dedicated error.
+    let mut h2 = Harness::new();
+    h2.handshake();
+    h2.client
+        .open_data_channel("chat", "", ChannelType::Reliable, h2.now)
+        .unwrap();
+    h2.drain_to_net();
+    h2.deliver_all();
+    h2.drain_to_net();
+    h2.deliver_all();
+    h2.client.close_channel(0, h2.now).unwrap();
+    assert!(matches!(
+        h2.client.send_message(0, 51, b"no".to_vec(), h2.now),
+        Err(SctpError::ChannelClosing(0))
+    ));
+    assert!(matches!(
+        h2.client.close_channel(0, h2.now),
+        Err(SctpError::ChannelClosing(0))
+    ));
+}
+
+/// The freed stream id is genuinely reusable: with a tiny stream limit the
+/// id space exhausts, and after a completed close the allocator's
+/// wrap-around scan hands the freed id out again (RFC 8831 §6.7: streams
+/// are available for reuse after a reset).
+#[test]
+fn freed_stream_id_is_reused_after_exhaustion() {
+    let base = Instant::now();
+    let client = SctpEndpoint::new_client(
+        SctpConfig {
+            is_client: true,
+            rto_initial: RTO,
+            os_streams: 6,
+            mis_streams: 6,
+            initial_tag: Some(111),
+            initial_tsn: Some(1000),
+            ..SctpConfig::default()
+        },
+        base,
+    )
+    .unwrap();
+    let server = SctpEndpoint::new_server(SctpConfig {
+        is_client: false,
+        rto_initial: RTO,
+        os_streams: 6,
+        mis_streams: 6,
+        initial_tag: Some(222),
+        initial_tsn: Some(2000),
+        cookie_key: Some([7u8; 32]),
+        ..SctpConfig::default()
+    });
+    let mut h = Harness {
+        client,
+        server,
+        now: base,
+        net: VecDeque::new(),
+        log: Vec::new(),
+        client_events: Vec::new(),
+        server_events: Vec::new(),
+    };
+    h.handshake();
+
+    // Exhaust the even-id space: 0, 2, 4 (limit 6).
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let id = h
+            .client
+            .open_data_channel(&format!("ch{i}"), "", ChannelType::Reliable, h.now)
+            .unwrap();
+        ids.push(id);
+        h.drain_to_net();
+        h.deliver_all();
+        h.drain_to_net();
+        h.deliver_all();
+    }
+    assert_eq!(ids, vec![0, 2, 4]);
+    // A fourth open must fail: the space is truly exhausted (nothing freed).
+    assert!(h
+        .client
+        .open_data_channel("ch3", "", ChannelType::Reliable, h.now)
+        .is_err());
+
+    // Close channel 0 (full exchange: request, response + reciprocal,
+    // final response) — the id frees on both sides.
+    h.client.close_channel(0, h.now).unwrap();
+    for _ in 0..3 {
+        h.drain_to_net();
+        h.deliver_all();
+    }
+    assert_eq!(closed_streams(&h.take_client_events()), vec![0]);
+    assert_eq!(closed_streams(&h.take_server_events()), vec![0]);
+
+    // The allocator's wrap-around scan now hands the freed id out again.
+    let id = h
+        .client
+        .open_data_channel("ch4", "", ChannelType::Reliable, h.now)
+        .unwrap();
+    assert_eq!(id, 0, "the freed id must be handed out after the wrap");
+    h.drain_to_net();
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+    assert!(h
+        .take_client_events()
+        .iter()
+        .any(|e| matches!(e, SctpEvent::DataChannelAck { stream: 0 })));
+    h.client_send(0, b"reused".to_vec());
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+    assert_eq!(
+        msgs(&h.take_server_events()),
+        vec![(0u16, b"reused".to_vec())],
+        "ordered delivery on the reused id (SSN restart accepted)"
+    );
 }
