@@ -30,6 +30,11 @@ use tokio::sync::mpsc::UnboundedSender;
 pub struct Route {
     pub prefix: String,
     pub target: String,
+    /// Dial this route with a WebRTC offer (UDP/TLS/RTP/SAVPF over ICE +
+    /// DTLS-SRTP; RFC 5763 offerer side, `setup:actpass`).  The downstream
+    /// MUST be WebRTC-capable: a plain-RTP answer or a failing transport
+    /// tears the call down instead of degrading to plaintext.
+    pub webrtc: bool,
 }
 
 /// Engine configuration.
@@ -117,9 +122,20 @@ struct Leg {
     /// verbatim — same CSeq number and same branch (RFC 3261 §17.1.2).
     last_prack: Option<SentPrack>,
     /// Prepared ICE+DTLS transport when this leg negotiated
-    /// UDP/TLS/RTP/SAVPF (leg A only today).  `rtp` is None until
-    /// [`webrtc::WebRtcMedia::establish`] hands the agent socket over.
+    /// UDP/TLS/RTP/SAVPF as the ANSWERER (leg A today).  `rtp` is None
+    /// until [`webrtc::WebRtcMedia::establish`] hands the agent socket
+    /// over.
     webrtc: Option<webrtc::WebRtcMedia>,
+    /// Prepared ICE+DTLS transport when this leg DIALS WebRTC as the
+    /// OFFERER (leg B on a `webrtc` route).  `rtp` is None until
+    /// [`webrtc::WebRtcOffer::establish`] runs against the answer.
+    webrtc_offer: Option<webrtc::WebRtcOffer>,
+    /// SRTP sessions keyed from this leg's DTLS handshake, staged between
+    /// establishment and pump start (None on plain legs).
+    crypto: Option<media::CryptoPair>,
+    /// The ICE-nominated remote for this leg when it runs WebRTC — the
+    /// pump's send target instead of the answer's c= line.
+    media_remote: Option<SocketAddr>,
     /// Data-channel engine on this leg's established DTLS transport
     /// (RFC 8261). Present only when the offer carried an
     /// `m=application UDP/DTLS/SCTP` m-line and the leg came up.
@@ -1102,15 +1118,22 @@ impl B2bua {
             .ok();
 
         // Route lookup: longest matching prefix on the request-URI user.
+        // The matched route decides the downstream transport: a `webrtc`
+        // route dials leg B over ICE + DTLS-SRTP (we are the offerer).
         let user = req.uri.user.clone().unwrap_or_default();
-        let target = self
+        let target_route = self
             .cfg
             .routes
             .iter()
             .filter(|r| user.starts_with(&r.prefix))
             .max_by_key(|r| r.prefix.len())
-            .map(|r| r.target.clone())
-            .unwrap_or_else(|| self.cfg.default_target.clone());
+            .cloned()
+            .unwrap_or(Route {
+                prefix: String::new(),
+                target: self.cfg.default_target.clone(),
+                webrtc: false,
+            });
+        let target = target_route.target.clone();
         let target_uri = match SipUri::parse(&target) {
             Ok(u) => u,
             Err(_) => {
@@ -1123,20 +1146,69 @@ impl B2bua {
             return;
         };
 
-        // Bind leg B media socket + build offer.
-        let Ok(b_sock) = UdpSocket::bind(("0.0.0.0", self.cfg.media_base_port)).await else {
-            tracing::error!(%call_id, "leg B media bind failed");
-            return;
+        // Bind leg B media transport + build offer.  A `webrtc` route owns
+        // no plain socket — the ICE agent's socket IS the media socket and
+        // its port goes into the offer (same rule as leg A).
+        let (b_sock, b_webrtc, b_port) = if target_route.webrtc {
+            match webrtc::WebRtcOffer::prepare().await {
+                Ok(w) => {
+                    let port = w.local_port().unwrap_or(0);
+                    (None, Some(w), port)
+                }
+                Err(e) => {
+                    tracing::error!(%call_id, "leg B WebRTC transport failed: {e}");
+                    send_staged(
+                        &mut a_tx,
+                        sock,
+                        src,
+                        sip_core::builder::respond_to(
+                            &req,
+                            500,
+                            "Server Internal Error",
+                            Vec::new(),
+                            None,
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else {
+            let Ok(s) = UdpSocket::bind(("0.0.0.0", self.cfg.media_base_port)).await else {
+                tracing::error!(%call_id, "leg B media bind failed");
+                return;
+            };
+            let s = Arc::new(s);
+            let port = s.local_addr().map(|a| a.port()).unwrap_or(0);
+            (Some(s), None, port)
         };
-        let b_sock = Arc::new(b_sock);
-        let b_port = b_sock.local_addr().map(|a| a.port()).unwrap_or(0);
-        let offer_b = sdp_util::build_offer(
-            &self.cfg.media_host,
-            b_port,
-            &self.cfg.codecs,
-            rand::thread_rng().gen(),
-        )
-        .serialize();
+        let offer_b = if target_route.webrtc {
+            let t = b_webrtc
+                .as_ref()
+                .map(|w| w.offer_transport())
+                .expect("webrtc route prepared a transport");
+            sdp_util::build_webrtc_offer(
+                &self.cfg.media_host,
+                b_port,
+                &self.cfg.codecs,
+                rand::thread_rng().gen(),
+                &sdp_util::WebrtcOfferCaps {
+                    ufrag: t.ufrag,
+                    pwd: t.pwd,
+                    fingerprint: t.fingerprint,
+                    candidates: t.candidates,
+                },
+            )
+            .serialize()
+        } else {
+            sdp_util::build_offer(
+                &self.cfg.media_host,
+                b_port,
+                &self.cfg.codecs,
+                rand::thread_rng().gen(),
+            )
+            .serialize()
+        };
 
         // UAC INVITE. Session timers on leg B: mirror the negotiated
         // interval and elect ourselves as refresher (`refresher=uac`) so
@@ -1236,6 +1308,9 @@ impl B2bua {
             timer: leg_a_timer,
             last_prack: None,
             webrtc: a_webrtc,
+            webrtc_offer: None,
+            crypto: None,
+            media_remote: None,
             dc: None,
         };
         call.leg_a = Some(leg_a);
@@ -1251,12 +1326,15 @@ impl B2bua {
             invite: None,
             contact: Some(format!("<{target}>")),
             plan: None,
-            rtp: Some(b_sock),
+            rtp: b_sock,
             media: None,
             confirmed: false,
             timer: None,
             last_prack: None,
             webrtc: None,
+            webrtc_offer: b_webrtc,
+            crypto: None,
+            media_remote: None,
             dc: None,
         });
         b_to_a.insert(b_call_id, call_id.clone());
@@ -1308,33 +1386,101 @@ impl B2bua {
             };
             LegTimers::new(se.max(self.cfg.session_timer_min_se), role)
         });
-        match sdp::parse::parse(&String::from_utf8_lossy(&resp.body)) {
-            Ok(answer_sdp) => {
-                b.plan = stream_plans(&answer_sdp).into_iter().next();
-            }
-            Err(e) => {
-                tracing::warn!(call_id = %a_id, "bad SDP from B: {e}");
-                if let Some(a) = &call.leg_a {
-                    if let Some(invite) = &a.invite {
+        let b_answer_media: Option<sdp::types::MediaDescription> =
+            match sdp::parse::parse(&String::from_utf8_lossy(&resp.body)) {
+                Ok(answer_sdp) => {
+                    // The audio m-line drives both the pump plan and (on a
+                    // `webrtc` route) the ICE/DTLS establishment.
+                    let media = answer_sdp
+                        .medias
+                        .iter()
+                        .find(|m| m.media == "audio")
+                        .cloned();
+                    b.plan = stream_plans(&answer_sdp).into_iter().next();
+                    media
+                }
+                Err(e) => {
+                    tracing::warn!(call_id = %a_id, "bad SDP from B: {e}");
+                    if let Some(a) = &call.leg_a {
+                        if let Some(invite) = &a.invite {
+                            let fail = sip_core::builder::respond_to(
+                                invite,
+                                503,
+                                "Service Unavailable",
+                                Vec::new(),
+                                None,
+                            );
+                            let _ = sock
+                                .send_to(&serialize(&SipMessage::Response(fail)), a.remote_sip)
+                                .await;
+                        }
+                    }
+                    teardown(calls, b_to_a, a_id, "bad SDP from leg B", Some(503));
+                    return;
+                }
+            };
+        if let Some(b) = call.leg_b.as_ref() {
+            let cseq = resp.headers.cseq().map(|c| c.seq).unwrap_or(1);
+            self.send_ack(sock, b, cseq);
+        }
+
+        // WebRTC leg B (RFC 5763 offerer side): we offered `actpass`, so the
+        // answer's `a=setup` picked the DTLS roles.  Establish ICE + DTLS +
+        // SRTP right after the ACK — the pump starts only with keyed crypto
+        // and a failing establishment tears the call down (the same
+        // no-plaintext-fallback rule as leg A).
+        if let Some(w) = call.leg_b.as_mut().and_then(|b| b.webrtc_offer.take()) {
+            let established = match b_answer_media {
+                Some(m) => w.establish(&m).await,
+                // RFC 3264 §6: the answer must carry an audio m-line.
+                None => Err(webrtc::WebRtcError::NoAudioAnswer),
+            };
+            match established {
+                Ok(est) => {
+                    if let Some(b) = call.leg_b.as_mut() {
+                        tracing::info!(
+                            call_id = %a_id,
+                            peer = %est.remote,
+                            "WebRTC leg B up: ICE + DTLS({}) + SRTP",
+                            est.crypto.tx.profile().dtls_name().unwrap_or("?")
+                        );
+                        b.rtp = Some(est.socket);
+                        b.media_remote = Some(est.remote);
+                        b.crypto = Some(est.crypto);
+                    }
+                    // `est.dtls` drops here: no data channel was offered
+                    // on leg B, the association has nothing left to carry.
+                }
+                Err(e) => {
+                    tracing::warn!(call_id = %a_id, "leg B WebRTC establishment failed: {e}");
+                    // Leg A has not been confirmed yet: release it through
+                    // the still-open server INVITE transaction so the 503
+                    // is retransmitted (Timer G/H), not a single raw
+                    // datagram a loss would swallow.
+                    let a_dst = call.leg_a.as_ref().map(|a| a.remote_sip);
+                    let invite = call.leg_a.as_ref().and_then(|a| a.invite.clone());
+                    if let (Some(mut a_tx), Some(invite), Some(dst)) =
+                        (call.a_tx.take(), invite, a_dst)
+                    {
                         let fail = sip_core::builder::respond_to(
-                            invite,
+                            &invite,
                             503,
                             "Service Unavailable",
                             Vec::new(),
                             None,
                         );
-                        let _ = sock
-                            .send_to(&serialize(&SipMessage::Response(fail)), a.remote_sip)
-                            .await;
+                        send_staged(&mut a_tx, sock, dst, fail).await;
                     }
+                    teardown(
+                        calls,
+                        b_to_a,
+                        a_id,
+                        "leg B WebRTC establishment failed",
+                        Some(503),
+                    );
+                    return;
                 }
-                teardown(calls, b_to_a, a_id, "bad SDP from leg B", Some(503));
-                return;
             }
-        }
-        if let Some(b) = call.leg_b.as_ref() {
-            let cseq = resp.headers.cseq().map(|c| c.seq).unwrap_or(1);
-            self.send_ack(sock, b, cseq);
         }
 
         self.cdr
@@ -1451,8 +1597,6 @@ impl B2bua {
         // The leg's pump starts only with established crypto: a negotiated
         // SAVPF leg must never send or accept plaintext media.  Failure
         // tears the call down (488/BYE) instead of degrading.
-        let mut a_crypto: Option<media::CryptoPair> = None;
-        let mut a_pair_remote: Option<SocketAddr> = None;
         let mut a_dtls_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>> = None;
         if let Some(a) = call.leg_a.as_mut() {
             if let Some(w) = a.webrtc.take() {
@@ -1465,8 +1609,8 @@ impl B2bua {
                             est.crypto.tx.profile().dtls_name().unwrap_or("?")
                         );
                         a.rtp = Some(est.socket.clone());
-                        a_pair_remote = Some(est.remote);
-                        a_crypto = Some(est.crypto);
+                        a.media_remote = Some(est.remote);
+                        a.crypto = Some(est.crypto);
                         // Data channels ride the SAME DTLS association
                         // (RFC 8261): hand the endpoint to the engine and
                         // give the pump the DTLS-record forwarder.
@@ -1553,7 +1697,8 @@ impl B2bua {
                             nack: pb.rtcp_fb_nack,
                             twcc_ext: pb.twcc_ext_id,
                             rtcp_interval_ms: 5_000,
-                            // Leg B is a plain RTP/AVP leg: no DTLS seam.
+                            // Leg B today offers no data channel: no DTLS seam.
+                            // (A WebRTC leg still drops inbound DTLS records.)
                             dtls_tx: None,
                         };
                         // Cross-connect the pumps: A's decoded bridge PCM feeds
@@ -1564,26 +1709,32 @@ impl B2bua {
                             .with_leg(observ::event::Leg::A);
                         let sess_b = observ::CallSession::new(a_id, None, None)
                             .with_leg(observ::event::Leg::B);
+                        // Each leg's staged SRTP crypto (None = plain RTP).
+                        let a_crypto = call.leg_a.as_mut().and_then(|l| l.crypto.take());
+                        let b_crypto = call.leg_b.as_mut().and_then(|l| l.crypto.take());
                         match (
                             media::start_with_socket_session_crypto(
-                                cfg_a,
-                                a_sock,
-                                a_crypto.take(),
-                                a_out,
-                                a_in,
-                                sess_a,
+                                cfg_a, a_sock, a_crypto, a_out, a_in, sess_a,
                             ),
-                            media::start_with_socket_session(cfg_b, b_sock, b_out, b_in, sess_b),
+                            media::start_with_socket_session_crypto(
+                                cfg_b, b_sock, b_crypto, b_out, b_in, sess_b,
+                            ),
                         ) {
                             (Ok(ha), Ok(hb)) => {
                                 // A secured (WebRTC) leg routes media at the
                                 // ICE-nominated pair, not the offer's c= line.
-                                if let Some(pair) = a_pair_remote {
+                                let a_remote = call.leg_a.as_ref().and_then(|l| l.media_remote);
+                                let b_remote = call.leg_b.as_ref().and_then(|l| l.media_remote);
+                                if let Some(pair) = a_remote {
                                     *ha.remote.lock().await = Some(pair);
                                 } else {
                                     seed_remote(&ha, &pa).await;
                                 }
-                                seed_remote(&hb, &pb).await;
+                                if let Some(pair) = b_remote {
+                                    *hb.remote.lock().await = Some(pair);
+                                } else {
+                                    seed_remote(&hb, &pb).await;
+                                }
                                 if let Some(a) = call.leg_a.as_mut() {
                                     a.media = Some(ha);
                                 }

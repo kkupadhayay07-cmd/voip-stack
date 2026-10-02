@@ -221,6 +221,11 @@ fn default_b2bua_target() -> String {
 pub struct B2buaRoute {
     pub prefix: String,
     pub target: String,
+    /// Dial the target with a WebRTC offer (UDP/TLS/RTP/SAVPF over ICE +
+    /// DTLS-SRTP).  The downstream MUST be WebRTC-capable: a plain answer
+    /// tears the call down instead of degrading to plaintext.
+    #[serde(default)]
+    pub webrtc: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

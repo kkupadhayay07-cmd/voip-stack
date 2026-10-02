@@ -14,6 +14,20 @@
 //!    DTLS handshake over the selected pair, then export the RFC 5764 §4.2
 //!    keying material into the pump's SRTP sessions.
 //!
+//! Lifecycle on an outbound WebRTC dial (we are the OFFERER — leg B on a
+//! `webrtc` route):
+//!
+//! 1. [`WebRtcOffer::prepare`] — gather a host candidate as the CONTROLLING
+//!    agent (the offerer nominates, RFC 8445 §8.1) and generate the DTLS
+//!    identity whose fingerprint the offer carries.
+//! 2. The INVITE's offer carries [`AnswerTransport`] fields plus
+//!    `a=setup:actpass` — the answer picks active (we become the DTLS
+//!    server) or passive (we become the client), RFC 5763 §5.
+//! 3. [`WebRtcOffer::establish`] — validate the answer (secure proto kept,
+//!    ICE credentials/candidates/fingerprint present, setup active or
+//!    passive), run ICE, then DTLS with the answer's role, then export the
+//!    keying material with the matching client/server streams.
+//!
 //! RFC 7983 demultiplexing on the selected socket: STUN (0–3) is consumed
 //! by ICE, DTLS (20–63) by the handshake, and everything in the RTP/RTCP
 //! range (128–191) is SRTP after keying.
@@ -25,7 +39,7 @@ use std::time::Duration;
 use dtls::{DtlsEndpoint, DtlsRole, SrtpOffers};
 use ice::agent::{AgentConfig, IceAgent};
 use ice::candidate::{Candidate, IceError};
-use sdp::types::MediaDescription;
+use sdp::types::{MediaDescription, SetupRole};
 use tokio::net::UdpSocket;
 
 use crate::media::CryptoPair;
@@ -45,6 +59,12 @@ pub enum WebRtcError {
     UnsupportedHash(String),
     #[error("no usable ICE candidate in offer")]
     NoCandidates,
+    #[error("answer downgraded to {0} — a WebRTC route never falls back to plaintext")]
+    InsecureAnswer(String),
+    #[error("answer carries no audio m-line (RFC 3264 §6)")]
+    NoAudioAnswer,
+    #[error("answer setup must be active or passive (RFC 5763 §5)")]
+    BadSetup,
     #[error("ice: {0}")]
     Ice(String),
     #[error("dtls: {0}")]
@@ -68,7 +88,8 @@ pub struct AnswerTransport {
     pub candidates: Vec<String>,
 }
 
-/// A prepared-but-not-yet-connected WebRTC transport for one leg.
+/// A prepared-but-not-yet-connected WebRTC transport for one leg
+/// (ANSWERER side: prepared from the peer's offer).
 pub struct WebRtcMedia {
     agent: IceAgent,
     dtls: DtlsEndpoint,
@@ -81,8 +102,10 @@ pub struct EstablishedMedia {
     pub remote: SocketAddr,
     /// The leg socket (the ICE agent's), post-handshake.
     pub socket: Arc<UdpSocket>,
-    /// SRTP sessions keyed from the DTLS handshake (we were the DTLS
-    /// client, so the client key material protects our outbound stream).
+    /// SRTP sessions keyed from the DTLS handshake. Whichever DTLS role
+    /// this side ended up with (answerer = client per `setup:active`;
+    /// offerer = server or client per the answer's `a=setup`), the local
+    /// outbound stream uses that role's keying material (RFC 5764 §4.2).
     pub crypto: CryptoPair,
     /// The DTLS endpoint, still alive post-handshake. Application data
     /// (SCTP packets, RFC 8261) flows through `send_app_data` /
@@ -176,8 +199,9 @@ impl WebRtcMedia {
         .await
         .map_err(|_| dtls::DtlsError::Handshake("dtls handshake timed out".into()))??;
 
-        // We are the DTLS client: the client key material protects what WE
-        // send, the server material protects what we receive.
+        // We are the DTLS client here (answerer, `setup:active`): the
+        // client key material protects what WE send, the server material
+        // protects what we receive.
         let keying = self.dtls.export_srtp_keys()?;
         let (tx, rx) = keying.sessions(true)?;
         Ok(EstablishedMedia {
@@ -187,6 +211,129 @@ impl WebRtcMedia {
             // The DTLS association outlives the handshake: data channels
             // (RFC 8261) ride it from here on.
             dtls: self.dtls,
+        })
+    }
+}
+
+/// A prepared-but-not-yet-connected WebRTC transport for the OFFERER side
+/// (leg B on a `webrtc` route): the INVITE's offer carries our ICE
+/// credentials/candidates, our DTLS fingerprint and `a=setup:actpass`, and
+/// [`WebRtcOffer::establish`] finishes the transport once the answer
+/// (200 OK) has picked the DTLS roles.
+pub struct WebRtcOffer {
+    agent: IceAgent,
+    identity: dtls::Identity,
+}
+
+impl WebRtcOffer {
+    /// Prepare the offerer transport: a CONTROLLING ICE agent (the offerer
+    /// nominates, RFC 8445 §8.1) with one gathered host candidate, plus a
+    /// fresh DTLS identity whose fingerprint goes into the offer.
+    pub async fn prepare() -> Result<Self, WebRtcError> {
+        let mut agent = IceAgent::new(AgentConfig {
+            controlling: Some(true),
+            ..AgentConfig::default()
+        })
+        .await?;
+        agent.gather_host()?;
+        let identity = dtls::Identity::generate("b2bua-webrtc")?;
+        Ok(WebRtcOffer { agent, identity })
+    }
+
+    /// Credentials/candidates/fingerprint for the SDP offer. The offer
+    /// itself is built by `sdp_util::build_webrtc_offer` with
+    /// `a=setup:actpass` (RFC 5763 §5 — the answer picks active/passive).
+    pub fn offer_transport(&self) -> AnswerTransport {
+        AnswerTransport {
+            ufrag: self.agent.local_ufrag().to_string(),
+            pwd: self.agent.local_pwd().to_string(),
+            fingerprint: self.identity.fingerprint().to_string(),
+            candidates: self.agent.local_candidates_sdp(),
+        }
+    }
+
+    /// The port our candidate advertises (the agent socket's bound port).
+    pub fn local_port(&self) -> Result<u16, WebRtcError> {
+        Ok(self.agent.local_addr()?.port())
+    }
+
+    /// Run ICE checks (we nominate as the controlling agent), then the
+    /// DTLS handshake with the role the ANSWER chose — `setup:active` in
+    /// the answer means the peer is the DTLS client and we are the server;
+    /// `setup:passive` the reverse (RFC 5763 §5) — then export the SRTP
+    /// keying with the matching client/server streams.
+    ///
+    /// A plain-RTP answer (`RTP/AVP`, a downgrade) is an error: a `webrtc`
+    /// route never falls back to plaintext.
+    pub async fn establish(
+        mut self,
+        answer_media: &MediaDescription,
+    ) -> Result<EstablishedMedia, WebRtcError> {
+        if answer_media.proto != "UDP/TLS/RTP/SAVPF" {
+            return Err(WebRtcError::InsecureAnswer(answer_media.proto.clone()));
+        }
+        let ufrag = answer_media
+            .ice_ufrag
+            .clone()
+            .ok_or(WebRtcError::NoIceCreds)?;
+        let pwd = answer_media
+            .ice_pwd
+            .clone()
+            .ok_or(WebRtcError::NoIceCreds)?;
+        let fp = answer_media
+            .fingerprint
+            .as_ref()
+            .ok_or(WebRtcError::NoFingerprint)?;
+        if fp.hash_func != "sha-256" {
+            return Err(WebRtcError::UnsupportedHash(fp.hash_func.clone()));
+        }
+        let role = match answer_media.setup {
+            // The answerer is the DTLS client → we wait for ClientHello.
+            Some(SetupRole::Active) => DtlsRole::Server,
+            // The answerer is the DTLS server → we send ClientHello.
+            Some(SetupRole::Passive) => DtlsRole::Client,
+            _ => return Err(WebRtcError::BadSetup),
+        };
+        let mut candidates = Vec::new();
+        for line in &answer_media.ice_candidates {
+            if let Ok(c) = Candidate::from_sdp(line) {
+                candidates.push(c);
+            }
+        }
+        if candidates.is_empty() {
+            return Err(WebRtcError::NoCandidates);
+        }
+
+        // Adopt the answer's ICE credentials and candidates BEFORE running
+        // checks — without a remote side ICE has nothing to connect to.
+        self.agent.set_remote(&ufrag, &pwd, &candidates);
+
+        let mut dtls = DtlsEndpoint::new(self.identity, role, SrtpOffers::default_offer())?;
+        dtls.pin_peer_fingerprint(format!("{} {}", fp.hash_func, fp.value));
+
+        let pair = self.agent.connect(ICE_TIMEOUT).await?;
+        // We own the socket from here — the pump inherits it via Arc.
+        // Stray datagrams (late STUN keepalives) are dropped: connectivity
+        // is already established.
+        let mut socket = self.agent.into_socket();
+        let remote = pair.remote;
+        tokio::time::timeout(DTLS_TIMEOUT, async {
+            dtls.handshake_udp(&mut socket, remote, |_, _| {}).await
+        })
+        .await
+        .map_err(|_| dtls::DtlsError::Handshake("dtls handshake timed out".into()))??;
+
+        // RFC 5764 §4.2: the keying material of OUR DTLS role protects
+        // what we send; the peer role's material protects what we receive.
+        let keying = dtls.export_srtp_keys()?;
+        let (tx, rx) = keying.sessions(role == DtlsRole::Client)?;
+        Ok(EstablishedMedia {
+            remote,
+            socket: Arc::new(socket),
+            crypto: CryptoPair { tx, rx },
+            // No data channel is offered on leg B, so the DTLS association
+            // has nothing left to carry — the documented lifecycle drops it.
+            dtls,
         })
     }
 }

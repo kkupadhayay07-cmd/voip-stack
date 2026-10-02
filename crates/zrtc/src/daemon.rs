@@ -212,6 +212,7 @@ pub async fn run(mut cfg: Config) -> Result<(), String> {
                 .map(|r| b2bua::Route {
                     prefix: r.prefix.clone(),
                     target: r.target.clone(),
+                    webrtc: r.webrtc,
                 })
                 .collect(),
             default_target: cfg.b2bua.default_target.clone(),

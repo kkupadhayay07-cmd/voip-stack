@@ -235,6 +235,25 @@ opened BEFORE parsing, an unprotectable datagram is counted and dropped,
 and a leg that negotiated SAVPF has no plaintext fallback. A SAVPF offer
 without ICE credentials is rejected 488.
 
+**Offerer side (Task 50)** — a `Route` with `webrtc: true` dials leg B as
+the RFC 5763 OFFERER: `WebRtcOffer::prepare` gathers a host candidate as
+the CONTROLLING agent (the offerer nominates, RFC 8445 §8.1) and generates
+the DTLS identity; `sdp_util::build_webrtc_offer` upgrades the audio offer
+to `UDP/TLS/RTP/SAVPF` with `setup:actpass` + our ICE/DTLS transport block
+(the sdp serializer emits the m-line's raw attributes, so the transport
+block is pushed as attributes — the typed fields are parse-side mirrors
+only). After the 200 OK is ACKed, `WebRtcOffer::establish` validates the
+answer (secure proto kept, ICE creds/candidates/fingerprint present,
+`a=setup` active-or-passive), adopts the answer's ICE side, runs ICE as
+the controlling agent, then DTLS in the answer-picked role —
+`setup:active` → we are the DTLS server, `setup:passive` → the client —
+and exports the RFC 5764 §4.2 keying with the role's material protecting
+our outbound stream. Per-leg `crypto` + `media_remote` are staged on
+`Leg`, the pump starts only with keyed crypto, and a failed establishment
+releases leg A through the still-open server INVITE transaction
+(retransmitted 503) before teardown — a `webrtc` route never degrades to
+plaintext.
+
 ### 5.4 Data channels (live: SCTP over the B2BUA's established DTLS)
 
 The `sctp` crate holds the full data-channel protocol engine:

@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 634 tests passing across 64 suites in 21 crates;
+**Current state: 639 tests passing across 67 suites in 21 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
@@ -29,7 +29,13 @@ keep-alives), WebRTC data channels have a complete protocol engine
 the B2BUA now terminates real WebRTC media legs: a UDP/TLS/RTP/SAVPF offer
 is answered with ICE (RFC 8445) → DTLS-SRTP (RFC 5763/5764) → SRTP
 (RFC 3711) over the leg socket, with SRTP-only media (no plaintext fallback)
-and an ICE+DTLS+SRTP loopback integration test — **and data channels ride
+and an ICE+DTLS+SRTP loopback integration test — **and the B2BUA also dials
+WebRTC downstream** (`webrtc` routes): the leg-B INVITE carries a SAVPF offer
+with ICE credentials/candidates, our DTLS fingerprint and `setup:actpass`;
+we run ICE as the CONTROLLING agent and take whichever DTLS role the answer
+picks (server on `active`, client on `passive`); a plain-RTP answer or a
+failing transport tears the call down with 503 instead of degrading —
+**and data channels ride
 the same established DTLS (RFC 8261): `m=application UDP/DTLS/SCTP` offers
 are answered per RFC 8841, DCEP channels open across the B2BUA, user
 messages (including fragmented ones) cross end to end, and an SCTP+SRTP
@@ -44,7 +50,7 @@ loopback integration test proves media and data coexist on one socket.**
 | `crates/sdp` | RFC 4566/8866 SDP parser/serializer + RFC 3264 offer/answer engine (`StreamPlan` projection) | **Done** |
 | `crates/rtp` | RTP/RTCP (RFC 3550/3551), adaptive jitter buffer + PLC, loss recovery (RFC 4585 Generic NACK + RFC 4588 RTX), transport-cc congestion feedback, RFC 4733 DTMF, RFC 5761 demux, RFC 8285 extensions, RTCP feedback (PLI/FIR) | **Done** |
 | `crates/codecs` | Full codec suite: **Opus, PCMU, PCMA, G.722, G.729, telephone-event**, L16, CN (RFC 3389), PLC, resampler; G.729 validated against bcg729 oracle vectors | **Done** |
-| `crates/b2bua` | B2BUA call engine: dual-leg SIP driven by `sip-tx` transactions, SDP offer/answer both legs, cross-connected media pumps with 16 kHz transcode bridge (any codec pair), DTMF relay, RTCP channel per leg (RFC 3550 SR/RR, RFC 4585 NACK answer + ask, transport-cc arrival feedback + sender-side ext stamping with feedback→delay/loss correlation), **WebRTC media legs (RFC 5763/5764: ICE answerer + DTLS client + SRTP pump crypto, RFC 7983 demux, SAVPF offers without ICE rejected 488)**, **SCTP data channels over the established DTLS (RFC 8261: `m=application` answered per RFC 8841, DCEP + user-message echo engine on the leg)**, RFC 4028 session timers, RFC 3262 reliable 1xx + PRACK both legs, CDR events, `b2bua-demo` binary, full-loopback integration tests | **Done** |
+| `crates/b2bua` | B2BUA call engine: dual-leg SIP driven by `sip-tx` transactions, SDP offer/answer both legs, cross-connected media pumps with 16 kHz transcode bridge (any codec pair), DTMF relay, RTCP channel per leg (RFC 3550 SR/RR, RFC 4585 NACK answer + ask, transport-cc arrival feedback + sender-side ext stamping with feedback→delay/loss correlation), **WebRTC media legs both directions (RFC 5763/5764: answerer = ICE controlled + DTLS client per `setup:active`; offerer = `webrtc` routes dial SAVPF + `actpass`, ICE controlling, DTLS server or client per the answer's `a=setup`; RFC 7983 demux; SAVPF without ICE rejected 488; plaintext answers on `webrtc` routes rejected 503)**, **SCTP data channels over the established DTLS (RFC 8261: `m=application` answered per RFC 8841, DCEP + user-message echo engine on the leg)**, RFC 4028 session timers, RFC 3262 reliable 1xx + PRACK both legs, CDR events, `b2bua-demo` binary, full-loopback integration tests | **Done** |
 | `crates/srtp` | RFC 3711 (AES-CM + HMAC-SHA1, KDF, replay window, ROC estimation) + RFC 7714 AES-GCM AEAD; validated against RFC 3711 B.2/B.3 and RFC 7714 §16 vectors | **Done** |
 | `crates/dtls` | DTLS-SRTP (RFC 5764/6347) via whitelisted OpenSSL: runtime self-signed ECDSA P-256 certs, RFC 8122 fingerprint pinning, use_srtp negotiation, RFC 5764 §4.2 key export, flight retransmission | **Done** |
 | `crates/ice` | RFC 5389 STUN codec (RFC 5769 vectors), RFC 8445 ICE agent (host/srflx/relay gathering, connectivity checks, nomination), RFC 5766 TURN server (long-term auth, permissions, Send/Data, ChannelBind) | **Done** |
@@ -67,7 +73,7 @@ loopback integration test proves media and data coexist on one socket.**
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 634 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 639 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -113,7 +119,11 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
   ICE+DTLS+SRTP caller completes INVITE → 200 (setup:active + candidates +
   fingerprint) → ICE nomination → DTLS → SRTP media round trip through the
   transcode bridge to a plain PCMA UA and back, with a 488 (no ICE creds,
-  no plaintext fallback) rejection test; **and the data-channel path runs
+  no plaintext fallback) rejection test; **and the B2BUA dials WebRTC end
+  to end** — on a `webrtc` route a plain caller is bridged to a mini SAVPF
+  callee through ICE (we nominate) + DTLS (both `setup:active` → B2BUA as
+  server and `setup:passive` → B2BUA as client are covered) + SRTP, and a
+  plaintext answer releases the call with 503;
   over the same DTLS association (RFC 8261)** — the caller opens a DCEP
   channel (responder-even stream id, RFC 8832 §6), the B2BUA acks and
   echoes user messages byte-for-byte including a 2000 B fragmented one,
@@ -265,8 +275,13 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
    SAVPF offers; SRTP-only media; loopback integration test)
    **and data-channel legs wired ✅** (`m=application UDP/DTLS/SCTP`
    answered per RFC 8841, SCTP association over the established DTLS per
-   RFC 8261, DCEP + message echo engine, loopback integration test).
-   Remaining: offerer-side (leg B) WebRTC.
+   RFC 8261, DCEP + message echo engine, loopback integration test)
+   **and offerer-side (leg B) WebRTC ✅** (`webrtc` routes dial SAVPF +
+   `setup:actpass` downstream: ICE controlling, DTLS server/client per the
+   answer's `a=setup`, SRTP-only, plain answers rejected 503; integration
+   tests cover both DTLS roles).
+   Remaining: data channels on leg B (the B2BUA does not yet offer
+   `m=application` downstream).
 5. SDP hardening — rejected m-lines, port-0 offers, RFC 3264 §6.1 direction
    clamp, extras serialization, **IPv6 answer address types and RFC 8843
    BUNDLE group echo done**. RFC 3263 NAPTR/SRV server discovery — **done**

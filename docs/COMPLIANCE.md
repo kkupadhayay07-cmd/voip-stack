@@ -25,8 +25,9 @@ transport-cc) and SIP RFC 5626 Outbound + RFC 5627 GRUU, WebRTC data
 classes end to end at the protocol layer (RFC 9260/4960 SCTP engine,
 RFC 8832 DCEP, RFC 3758 FORWARD-TSN in the `sctp` crate), and WebRTC MEDIA
 legs in the B2BUA (RFC 5763/5764/8445/3711: SAVPF offers answered with ICE
-→ DTLS-SRTP → SRTP pump crypto); 634 tests green
-across 64 suites — **every audit finding at every severity is fixed**).
+→ DTLS-SRTP → SRTP pump crypto, and `webrtc` routes dialing downstream with
+a SAVPF offer as the ICE-controlling offerer); 639 tests green
+across 67 suites — **every audit finding at every severity is fixed**).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
@@ -70,12 +71,12 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC 8285 | RTP header extensions | **Done** | One-byte and two-byte blocks parse/serialize; `RtpExtension::onebyte` builds single-element one-byte blocks (id 1–14, 1–16 data bytes, length field = len−1) used by the transport-cc sender path — validation is runtime (`Result`), so release builds can never emit malformed wire data. |
 | RFC 3711 | SRTP/SRTCP | **Done** | `srtp` crate: AES-CM + HMAC-SHA1 (80/32 tags), key derivation (labels 0–5, rate semantics), 64-entry replay window (libsrtp-style relative bits), RFC 3711 Appendix A ROC estimation, per-SSRC stream state, SRTCP E-bit/index. Validated against RFC 3711 B.2/B.3 vectors. |
 | RFC 7714 | SRTP AES-GCM | **Done** | AEAD_AES_128/256_GCM (16-byte tags) + 96-bit tag variants; SRTP/SRTCP IV per §8.1/§9.1; E=0 AAD semantics per §9.3 incl. authenticate-only acceptance of unencrypted SRTCP and the §9 tag-before-index wire order; validated against §16.1.1/16.1.2/16.1.4/16.2.1 and §17.1/§17.3 (SRTCP encrypted + tagging-only, tamper-tested) vectors. |
-| RFC 5764 | DTLS-SRTP handshake/usage | **Done** | `dtls` crate: use_srtp negotiation, RFC 8122 fingerprint generation + pinning, RFC 5764 §4.2 keying export (`EXTRACTOR-dtls_srtp`), self-signed runtime ECDSA P-256 identities. **Live in the B2BUA**: the exported keying material keys the leg pump's SRTP sessions on negotiated WebRTC legs (answerer drives the handshake as the DTLS client over the ICE-nominated pair). |
-| RFC 5763 | Connection-oriented media (ICE + DTLS-SRTP offer/answer) | **Done** (answerer) | `b2bua::webrtc`: a `UDP/TLS/RTP/SAVPF` offer with ICE + a sha-256 fingerprint is answered with our ICE credentials + gathered candidate lines + certificate fingerprint, `setup:active` (the answerer is the DTLS client and starts the handshake only after ICE completes — §5), the offer's fingerprint is pinned (handshake fails on mismatch; sha-384 offers rejected — we pin sha-256 only), and DTLS runs over the nominated pair with RFC 7983 filtering. Offerer-side (leg B) WebRTC not yet wired. |
+| RFC 5764 | DTLS-SRTP handshake/usage | **Done** | `dtls` crate: use_srtp negotiation, RFC 8122 fingerprint generation + pinning, RFC 5764 §4.2 keying export (`EXTRACTOR-dtls_srtp`), self-signed runtime ECDSA P-256 identities. **Live in the B2BUA both roles**: the exported keying material keys the leg pump's SRTP sessions on negotiated WebRTC legs — the answerer drives the handshake as the DTLS client over the ICE-nominated pair, and on a `webrtc` route the offerer takes server (answer `setup:active`) or client (answer `setup:passive`), with the role's keying material protecting its outbound stream. |
+| RFC 5763 | Connection-oriented media (ICE + DTLS-SRTP offer/answer) | **Done** (both roles) | `b2bua::webrtc`: ANSWERER — a `UDP/TLS/RTP/SAVPF` offer with ICE + a sha-256 fingerprint is answered with our ICE credentials + gathered candidate lines + certificate fingerprint, `setup:active` (the answerer is the DTLS client and starts the handshake only after ICE completes — §5), the offer's fingerprint is pinned (handshake fails on mismatch; sha-384 offers rejected — we pin sha-256 only), and DTLS runs over the nominated pair with RFC 7983 filtering. OFFERER (`webrtc` routes, `b2bua::WebRtcOffer` + `sdp_util::build_webrtc_offer`) — leg B is dialed with a SAVPF offer carrying our ICE credentials/candidates, our certificate fingerprint and `setup:actpass`; the answer's `a=setup` picks the roles (`active` → we are the DTLS server, `passive` → the client), the answer is validated (secure proto kept, ICE creds/candidates/fingerprint present) before ICE runs as the CONTROLLING agent, and a plain-RTP answer releases the call with 503 — no downgrade to plaintext. |
 | RFC 6347 | DTLS 1.2 | **Done** (via OpenSSL) | DTLS 1.2 only (NO_DTLSV1); handshake driven over a datagram queue transport with our own flight retransmission + 30 s deadline; loss-resilient handshake covered by tests. |
 | RFC 5389 | STUN | **Done** | `ice::stun`: full TLV codec (XOR-MAPPED/PEER/RELAYED, USERNAME, MESSAGE-INTEGRITY, FINGERPRINT, ERROR-CODE, ICE-* attrs, TURN attrs); validated against RFC 5769 §2.1/§2.2. |
 | RFC 8489 | STUN (newer) | **Partial** | 5389 semantics implemented; 8489-only additions (e.g. new error codes, ADDITIONAL-ADDRESS-FAMILY) not modelled. |
-| RFC 8445 | ICE | **Done** (core) | `ice::agent`: candidate gathering (host/srflx/relay), priorities (§5.1.2.1), connectivity checks with short-term creds, role + tie-breaker, USE-CANDIDATE nomination, keepalives, prflx discovery; SDP candidate lines parse IPv6 (bare + bracketed, RFC 8839 §5.1). Triggered-check pacing simplified (all-pairs-at-once; documented). **Live in the B2BUA answerer**: gathers a host candidate, adopts the offer's credentials/candidates, re-issues checks every 500 ms until nomination (the answerer's first burst races the 200 OK carrying the credentials). |
+| RFC 8445 | ICE | **Done** (core) | `ice::agent`: candidate gathering (host/srflx/relay), priorities (§5.1.2.1), connectivity checks with short-term creds, role + tie-breaker, USE-CANDIDATE nomination, keepalives, prflx discovery; SDP candidate lines parse IPv6 (bare + bracketed, RFC 8839 §5.1). Triggered-check pacing simplified (all-pairs-at-once; documented). **Live in the B2BUA both roles**: the answerer gathers a host candidate, adopts the offer's credentials/candidates, re-issues checks every 500 ms until nomination (the answerer's first burst races the 200 OK carrying the credentials); the offerer on a `webrtc` route runs the CONTROLLING agent and nominates aggressively with USE-CANDIDATE. |
 | RFC 5766 | TURN server | **Done** (core) | Allocation (long-term MD5 auth), refresh, CreatePermission, Send/Data indications, ChannelBind; per-allocation relay sockets pumped concurrently; permission enforcement on both paths. TCP allocations, ReservationToken and mobility not implemented. |
 | RFC 5766 | TURN client | **Done** | Agent-side allocation flow: 401 → credentials → verified response (MD5 long-term key pinned by independent known vectors), plus the unauthenticated path with idempotent re-Allocate per RFC 5766 §6.2; used for relay candidate gathering. |
 | RFC 7983 | Demultiplexing STUN/DTLS/RTP | **Done** | First-byte classification in the ICE agent; the media pump drops STUN (0–3) before the RTP/RTCP parsers and forwards DTLS records (20–63) to the data-channel engine when the leg negotiated one (dropping them otherwise); the DTLS handshake driver feeds the state machine only datagrams whose first byte is a DTLS record (20–63), so ICE keepalives on the same address cannot reach OpenSSL. |
@@ -153,12 +154,19 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
   a leg that negotiated SAVPF has NO plaintext fallback; a SAVPF offer
   without ICE credentials is rejected 488). Verified end to end by an
   ICE+DTLS+SRTP loopback integration test through the transcode bridge.
+  **OFFERER side: DONE too** — a `webrtc` route dials downstream with a
+  SAVPF offer (`setup:actpass`), runs ICE as the CONTROLLING agent, and
+  completes DTLS in whichever role the answer picks (server on
+  `setup:active`, client on `setup:passive` — both covered by integration
+  tests, one engine per binary); a plain-RTP answer releases the call with
+  503 instead of degrading.
   **Data channels: DONE over the same leg** — `m=application` answered per
   RFC 8841, the SCTP association rides the established DTLS (RFC 8261),
   DCEP channels open across the B2BUA and messages echo (fragmentation
-  included) while media flows. Remaining: offerer-side (leg B) WebRTC,
-  trickle ICE, data-channel application semantics beyond echo (a real
-  messaging API is engine-level today).
+  included) while media flows. Remaining: data channels on leg B (the
+  B2BUA does not yet offer `m=application` downstream), trickle ICE,
+  data-channel application semantics beyond echo (a real messaging API is
+  engine-level today).
 * **RTCP non-mux addressing (RFC 3550 §11)**: the media pump is mux-only;
   peers that refuse `a=rtcp-mux` would address RTCP at the RTP port+1,
   which we never bind (their feedback would be lost). We now at least
@@ -179,7 +187,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **634 passing across 64 suites**.
+  `cargo test --workspace` → **639 passing across 67 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16 + §17.1/§17.3
   SRTCP AEAD), STUN (RFC 5769 §2.1/§2.2; MD5 long-term keys + MESSAGE-INTEGRITY
   against independent vectors), G.729 (bcg729 oracle), cross-decode by ffmpeg.

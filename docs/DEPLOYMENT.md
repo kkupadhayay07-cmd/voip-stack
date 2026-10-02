@@ -235,8 +235,13 @@ configured bounds. Guidance:
    data channels over DTLS ✅ shipped** (`m=application` answered per
    RFC 8841, the SCTP association rides the established DTLS per RFC 8261,
    DCEP channels open across the B2BUA with message echo, SCTP+SRTP
-   coexistence loopback test);
-   remaining: offerer-side (leg B) WebRTC.
+   coexistence loopback test) **and offerer-side leg-B WebRTC ✅ shipped**
+   (`webrtc` routes dial downstream with a SAVPF offer + `setup:actpass`;
+   ICE controlling; DTLS server/client per the answer's `a=setup`;
+   SRTP-only, plain answers rejected 503; both DTLS roles covered by
+   integration tests);
+   remaining: data channels on leg B (the B2BUA does not yet offer
+   `m=application` downstream).
 5. **Container entrypoint** — wire `zrtc` as the image entrypoint with a
    mounted config + real healthcheck.
 6. **SDP hardening** (rejected m-lines, port-0 answers, the RFC 3264 §6.1

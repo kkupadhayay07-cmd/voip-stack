@@ -89,7 +89,7 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **634 passing** across 64 suites, `clippy -D warnings`
+`cargo test --workspace` → **639 passing** across 67 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
 **The external audit is fully closed**: every finding at every severity —
@@ -290,3 +290,20 @@ two ways:
 Net after Task 49: **634 tests / 64 suites** (was 628/63) — dtls 10→11,
 sdp 31→33, sctp 49→51 (+2 spec pins), b2bua 39→40 + the `webrtc_datachan`
 suite.
+
+## Task 50 — leg-B WebRTC offerer: two wire bugs caught by self-review before shipping
+
+The offerer side (`webrtc` routes dial downstream with a SAVPF offer) was
+built with the Task 48/49 lessons applied up front — and two defects were
+still caught during development, both by tests/warnings rather than by the
+integration loopback:
+
+| ID | Finding | Severity | Fix |
+|----|---------|----------|-----|
+| W1 | `WebRtcOffer::establish` parsed the answer's ICE ufrag/pwd/candidates but never called `agent.set_remote` — ICE would have had no remote side and every `webrtc` route call would have timed out at establishment | **Critical** (dead feature) | `set_remote` called before `connect`; the unused-variable warnings during `cargo check` are what surfaced it (kept as the tripwire — warnings are errors in the gates anyway) |
+| W2 | `build_webrtc_offer` set only the typed SDP fields (`m.ice_ufrag`, `m.setup`, …) — but the sdp serializer emits the m-line's raw `attributes`, so the entire ICE/DTLS transport block was silently absent from the wire while the typed mirror looked correct in-process | **Critical** (wire) | the transport block is pushed as raw attributes too (the same rule `answer_session` follows); the new offer-shape unit tests assert the wire form (`a=setup:actpass`, `a=fingerprint:sha-256`, `a=candidate:…`) and a parse→serialize fixed point |
+| W3 | Three integration engines initially shared one test binary — only the first engine's CDR channel receives `CallEnded` (the CDR sink is a process-global OnceLock), so the second test failed on a missing trail even though the call was fine | **Major** (test infra — Task 48 lesson re-applied) | one engine per test binary: `webrtc_leg_b_active` / `webrtc_leg_b_passive` / `webrtc_leg_b_reject`, sharing a `tests/webrtc_leg_b/common.rs` module |
+| D1 | A failing leg-B establishment (e.g. a plaintext downgrade answer) previously tore the call down without answering leg A through the server INVITE transaction — a single raw datagram a loss would swallow | **Minor** (resilience) | the 503 is staged into the still-open `a_tx` (`send_staged`) so the response is retransmitted (Timer G/H) before teardown |
+
+Net after Task 50: **639 tests / 67 suites** (was 634/64) — b2bua lib 40→42
+(offer-shape unit tests), +3 integration suites.

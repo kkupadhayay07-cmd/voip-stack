@@ -3,7 +3,8 @@
 use codecs::{CodecId, FormatInfo, Registry};
 use sdp::negotiate::{answer_session, CodecCap, IceCreds, MediaCaps, NegotiateError, StreamPlan};
 use sdp::types::{
-    Attribute, Connection, ExtMap, Fingerprint, MediaDescription, Origin, Session, Timing,
+    Attribute, Connection, ExtMap, Fingerprint, MediaDescription, Origin, Session, SetupRole,
+    Timing,
 };
 
 /// Payload types we advertise for dynamic codecs.
@@ -232,6 +233,65 @@ pub const SCTP_PORT: u16 = 5000;
 /// `SctpConfig::default().max_message_size` (256 KiB).
 pub const MAX_MESSAGE_SIZE: u32 = 256 * 1024;
 
+/// Transport fields OUR offer carries for a WebRTC leg (`webrtc::WebRtcOffer::offer_transport`
+/// output): ICE credentials, the DTLS fingerprint and the candidate lines.
+#[derive(Debug, Clone)]
+pub struct WebrtcOfferCaps {
+    pub ufrag: String,
+    pub pwd: String,
+    /// Our certificate fingerprint, bare colon-hex (no `sha-256 ` prefix).
+    pub fingerprint: String,
+    /// Candidate lines in RFC 8839 form (with the `candidate:` prefix,
+    /// without the `a=` — the serializer's convention).
+    pub candidates: Vec<String>,
+}
+
+/// Builds a session-level SDP offer for a WebRTC route (UAC leg B): the
+/// plain audio offer upgraded to `UDP/TLS/RTP/SAVPF` with the ICE
+/// credentials/candidates, the DTLS fingerprint and `a=setup:actpass`
+/// (RFC 5763 §5 — the answer must pick `active` or `passive`).
+pub fn build_webrtc_offer(
+    host: &str,
+    port: u16,
+    codecs: &[CodecId],
+    sess_id: u32,
+    t: &WebrtcOfferCaps,
+) -> Session {
+    let mut session = build_offer(host, port, codecs, sess_id);
+    let m = &mut session.medias[0];
+    m.proto = "UDP/TLS/RTP/SAVPF".into();
+    m.ice_ufrag = Some(t.ufrag.clone());
+    m.ice_pwd = Some(t.pwd.clone());
+    m.fingerprint = Some(Fingerprint {
+        hash_func: "sha-256".to_owned(),
+        value: t.fingerprint.clone(),
+    });
+    m.setup = Some(SetupRole::Actpass);
+    // The serializer emits the m-line's raw `attributes` — the typed ICE/DTLS
+    // fields above are parse-side mirrors only, so the transport block MUST
+    // also be pushed as attributes (the same rule `answer_session` follows).
+    m.attributes
+        .push(Attribute::new("setup", Some("actpass".into())));
+    m.attributes.push(Attribute::new(
+        "fingerprint",
+        Some(format!("sha-256 {}", t.fingerprint)),
+    ));
+    m.attributes
+        .push(Attribute::new("ice-ufrag", Some(t.ufrag.clone())));
+    m.attributes
+        .push(Attribute::new("ice-pwd", Some(t.pwd.clone())));
+    for line in &t.candidates {
+        // `Candidate::to_sdp()` carries the `candidate:` prefix; the
+        // attribute value must not (`a=candidate:<value>`, RFC 8839).
+        let bare = line.strip_prefix("a=").unwrap_or(line);
+        let bare = bare.strip_prefix("candidate:").unwrap_or(bare);
+        m.ice_candidates.push(bare.to_owned());
+        m.attributes
+            .push(Attribute::new("candidate", Some(bare.to_owned())));
+    }
+    session
+}
+
 /// Builds the answer for an inbound offer using local capabilities.
 ///
 /// Every m-line is answered positionally (RFC 3264 §6 — an m-line is never
@@ -393,5 +453,84 @@ mod tests {
             let (name, clock) = static_rtpmap(pt).unwrap();
             assert!(codec_id_for(name, clock).is_some(), "{name}");
         }
+    }
+
+    #[test]
+    fn webrtc_offer_carries_the_transport_block() {
+        let offer = build_webrtc_offer(
+            "127.0.0.1",
+            31000,
+            &[CodecId::Pcmu],
+            9,
+            &WebrtcOfferCaps {
+                ufrag: "ufr7".into(),
+                pwd: "pwdsixtysixcharsxxxxxpwdsixtysixcharsxxxxxpwdsixtysix".into(),
+                fingerprint: vec!["AB"; 32].join(":"),
+                candidates: vec!["candidate:1 1 UDP 2130706431 127.0.0.1 31000 typ host".into()],
+            },
+        );
+        let text = offer.serialize();
+        assert!(
+            text.contains("m=audio 31000 UDP/TLS/RTP/SAVPF 0 101"),
+            "{text}"
+        );
+        assert!(text.contains("a=setup:actpass"), "{text}");
+        assert!(text.contains("a=fingerprint:sha-256 "), "{text}");
+        assert!(text.contains("a=ice-ufrag:ufr7"), "{text}");
+        assert!(text.contains("a=ice-pwd:"), "{text}");
+        assert!(text.contains("a=candidate:1 1 UDP"), "{text}");
+        // The codec/feedback block is inherited from the plain offer.
+        assert!(text.contains("a=rtcp-mux"), "{text}");
+        assert!(text.contains("a=rtcp-fb:0 nack"), "{text}");
+        assert!(text.contains("a=rtcp-fb:0 transport-cc"), "{text}");
+        // parse → serialize → parse is a fixed point.
+        let parsed = sdp::parse::parse(&text).unwrap();
+        assert_eq!(
+            parsed.serialize(),
+            text,
+            "webrtc offer roundtrip not stable"
+        );
+        let m = &parsed.medias[0];
+        assert_eq!(m.setup, Some(SetupRole::Actpass));
+        assert_eq!(m.ice_ufrag.as_deref(), Some("ufr7"));
+        assert_eq!(m.fingerprint.as_ref().unwrap().hash_func, "sha-256");
+        assert_eq!(m.ice_candidates.len(), 1);
+    }
+
+    #[test]
+    fn webrtc_offer_answers_like_a_webrtc_offer() {
+        // Our own answer engine accepts the offer as a WebRTC offer: the
+        // answer mirrors SAVPF and echoes setup (active, the answerer is
+        // the DTLS client).
+        let offer = build_webrtc_offer(
+            "127.0.0.1",
+            31000,
+            &[CodecId::Pcmu],
+            9,
+            &WebrtcOfferCaps {
+                ufrag: "ufr7".into(),
+                pwd: "pwdsixtysixcharsxxxxxpwdsixtysixcharsxxxxxpwdsixtysix".into(),
+                fingerprint: vec!["CD"; 32].join(":"),
+                candidates: vec!["candidate:1 1 UDP 2130706431 127.0.0.1 31000 typ host".into()],
+            },
+        );
+        let parsed = sdp::parse::parse(&offer.serialize()).unwrap();
+        let ans = answer(
+            &parsed,
+            "127.0.0.1",
+            31001,
+            &[CodecId::Pcmu],
+            Some(WebrtcAnswerCaps {
+                ufrag: "ansu".into(),
+                pwd: "anspwdsixtysixcharsxxxxxanspwdsixtysixcharsxxxxxansp".into(),
+                fingerprint: vec!["EF"; 32].join(":"),
+                candidates: vec!["candidate:2 1 UDP 2130706431 127.0.0.1 31001 typ host".into()],
+            }),
+        )
+        .expect("webrtc offer self-answers");
+        let text = ans.serialize();
+        assert!(text.contains("UDP/TLS/RTP/SAVPF"), "{text}");
+        assert!(text.contains("a=setup:active"), "{text}");
+        assert!(text.contains("a=fingerprint:sha-256 EF:"), "{text}");
     }
 }
