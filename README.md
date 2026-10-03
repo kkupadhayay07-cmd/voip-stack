@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 671 tests passing across 74 suites in 22 crates;
+**Current state: 677 tests passing across 74 suites in 22 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
@@ -83,7 +83,7 @@ with the call surviving (leg B rolled back to its original offer).
 | `crates/dtls` | DTLS-SRTP (RFC 5764/6347) via whitelisted OpenSSL: runtime self-signed ECDSA P-256 certs, RFC 8122 fingerprint pinning, use_srtp negotiation, RFC 5764 §4.2 key export, flight retransmission | **Done** |
 | `crates/ice` | RFC 5389 STUN codec (RFC 5769 vectors), RFC 8445 ICE agent (host/srflx/relay gathering, connectivity checks, nomination), RFC 5766 TURN server (long-term auth, permissions, Send/Data, ChannelBind) | **Done** |
 | `crates/registrar` | RFC 3261 §10 registrar: AoR bindings, Digest auth (401 challenge, one-time nonces), wildcard/expiry/CSeq consistency; RFC 5626 Outbound (instance/reg-id bindings, flow detection, `Flow-Timer`) and RFC 5627 pub-gruu synthesis | **Done** |
-| `crates/proxy` | Stateful proxy (RFC 3261 §16): routing, parallel forking, Record-Route (loose router), Via prepend/pop, CANCEL per §9.1, 483 Max-Forwards, NAT response routing (received/rport) | **Done** |
+| `crates/proxy` | Stateful proxy (RFC 3261 §16) on the `sip-tx` transaction layer (§17): routing, parallel forking with a distinct Via branch per leg (§16.6 step 10), per-leg client transactions (Timer A/B retransmit/timeout + non-2xx ACK, §17.1), server transactions for every incoming request (retransmission absorption + response retransmission + fork-timeout 408 per §16.7 step 6), Record-Route (loose router), Via prepend/pop, per-leg CANCEL generation (§9.1), 483 Max-Forwards, NAT response routing (received/rport) | **Done** |
 | `crates/sbc` | Session border controller: CIDR ACL, token-bucket rate limiting, NAT latching, RFC 3581 rport, topology hiding (Call-ID remap + Contact rewrite) | **Done** |
 | `crates/media` | Windowed-sinc resampler (anti-alias, arbitrary ratios), N-way conference mixer (clip protection, mute/gain), RIFF/WAVE recorder, adaptive energy+ZCR VAD with hangover | **Done** |
 | `crates/cdr` | Call Detail Records: lifecycle builder, bounded store, filtered queries, campaign stats, JSON serialization | **Done** |
@@ -101,7 +101,7 @@ with the call surviving (leg B rolled back to its original offer).
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 671 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 677 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -298,7 +298,17 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
    concurrency 20, 100% answered, setup p95 305 ms) are shipped; publish
    the optimized-build numbers next.
 3. Postgres CDR persistence (sqlx) + retention policies.
-4. WebRTC hardening — library layer ✅ (RFC 4585 NACK, RFC 4588 RTX,
+4. Proxy `sip-tx` adoption — ✅ **done** — the stateful proxy now runs on
+   the §17 transaction layer end to end: a distinct Via branch per fork
+   leg (§16.6 step 10), each leg driven by a real client transaction
+   (Timer A/E retransmit, Timer B/F timeout, non-2xx ACK to the leg),
+   server transactions for every incoming request (retransmitted requests
+   absorbed instead of re-forked; locally generated and forwarded finals
+   retransmitted via Timer G/J), fork-wide timeout answered 408 upstream
+   (§16.7 step 6), and the per-leg CANCEL is generated from the forked
+   INVITE so its branch matches what the leg received (§9.1) — the old
+   verbatim forward could never match at the UAS.
+5. WebRTC hardening — library layer ✅ (RFC 4585 NACK, RFC 4588 RTX,
    transport-cc feedback in `crates/rtp`) **and B2BUA RTCP plumbing ✅**
    (SR/RR + NACK answer/ask + TWCC feedback live on every media leg)
    **and sender-side transport-cc ✅** (outbound ext stamping + feedback
@@ -331,14 +341,14 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
    response replay, re-configuration timer retransmission, stream ids
    reusable after a reset; the wrong-parity-OPEN guard now closes the bogus
    channel with a reset instead of dropping it).
-5. SDP hardening — rejected m-lines, port-0 offers, RFC 3264 §6.1 direction
+6. SDP hardening — rejected m-lines, port-0 offers, RFC 3264 §6.1 direction
    clamp, extras serialization, **IPv6 answer address types and RFC 8843
    BUNDLE group echo done**. RFC 3263 NAPTR/SRV server discovery — **done**
    (new `rfc3263` crate, live on the zrtc outbound trunk) with
    **connection-time candidate failover done**; **GRUU/Outbound done ✅**
    (RFC 5626 flow keep-alives + `Flow-Timer` + registration refresh, RFC 5627
    pub-gruu synthesis end to end).
-6. In-dialog SDP renegotiation (RFC 3264 §8) relay in the B2BUA.
+7. In-dialog SDP renegotiation (RFC 3264 §8) relay in the B2BUA.
    ✅ **done** — a caller re-INVITE with a changed offer is relayed to
    leg B (glare 491 while pending, equal-CSeq held), the callee's answer
    completes the caller's 200, the pump re-seeds to a moved media address

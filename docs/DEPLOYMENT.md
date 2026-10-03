@@ -215,15 +215,27 @@ configured bounds. Guidance:
    sequencing and remote-target tracking extracted from the B2BUA; §12.2.2
    out-of-order CSeq rejection (500) + retransmission idempotence +
    in-dialog target refresh live in the engine (`dialog_cseq` integration
-   test). `sip-tx` adoption in the proxy remains open.
-5. **In-dialog SDP renegotiation** (RFC 3264 §8) ✅ shipped — the caller's
+   test).
+2. **Proxy `sip-tx` adoption** (§16 on §17) ✅ shipped — the stateful proxy
+   now runs the real transaction layer: a distinct Via branch per fork leg
+   (§16.6 step 10) each driven by a §17.1 client transaction (Timer A/E
+   retransmit, Timer B/F timeout, non-2xx ACK to the leg), server
+   transactions for every incoming request (retransmitted requests absorbed
+   instead of re-forked, staged finals retransmitted via Timer G/J, ACK
+   confirmation), fork-wide timeout answered 408 upstream (§16.7 step 6 —
+   previously forked INVITEs were only ever cleaned by CANCEL: a leak),
+   and the per-leg CANCEL is generated from the forked INVITE so its top
+   Via branch matches what the leg received (§9.1 — the old verbatim
+   forward carried the upstream branch and could never match at the UAS).
+   `zrtc` advances the timers with a 500 ms pump tick (`Proxy::poll`).
+3. **In-dialog SDP renegotiation** (RFC 3264 §8) ✅ shipped — the caller's
    changed re-INVITE offer is relayed to leg B and the answer completes
    the caller's 200; media-preserving (codec/PT must be unchanged — the
    pumps bake them), pump re-seeds to a moved media address, 488+rollback
    keeps the call alive on a media-changing answer (`renegotiation`
    integration test). Pump codec reconfiguration and WebRTC (ICE/DTLS)
    renegotiation remain 488.
-2. **Load harness** ✅ shipped — `zrtc load` (`--calls`/`--concurrency`/`--pace-ms`,
+4. **Load harness** ✅ shipped — `zrtc load` (`--calls`/`--concurrency`/`--pace-ms`,
    `--json`) drives N concurrent calls through the full pipeline and reports
    setup-latency percentiles + failure breakdowns; `demo/soak.sh` adds a
    port pre-flight, CDR cross-check and panic gate. Sandbox baseline
@@ -231,8 +243,8 @@ configured bounds. Guidance:
    200/200 answered, setup p50 116 ms / p95 305 ms, 5.3 calls/s. The
    release-build 1000-concurrent soak on 8-core hardware remains the
    published follow-up.
-3. **Postgres CDR backend** (sqlx) + retention/archival policies.
-4. **WebRTC hardening** — library layer ✅ shipped in `crates/rtp`
+5. **Postgres CDR backend** (sqlx) + retention/archival policies.
+6. **WebRTC hardening** — library layer ✅ shipped in `crates/rtp`
    (RFC 4585 Generic NACK, RFC 4588 RTX retransmission, transport-cc
    feedback) **and B2BUA RTCP plumbing ✅ live on every media leg**
    (periodic SR/RR, NACK answer from a 512-packet retransmission window +
@@ -259,9 +271,9 @@ configured bounds. Guidance:
    **and the channel close ✅ shipped** (RFC 8831 §6.7 via RFC 6525 stream
    reset: request → response → reciprocal reset, E2 deferred processing,
    stream ids reusable after a reset — the last WebRTC roadmap remainder).
-5. **Container entrypoint** — wire `zrtc` as the image entrypoint with a
+7. **Container entrypoint** — wire `zrtc` as the image entrypoint with a
    mounted config + real healthcheck.
-6. **SDP hardening** (rejected m-lines, port-0 answers, the RFC 3264 §6.1
+8. **SDP hardening** (rejected m-lines, port-0 answers, the RFC 3264 §6.1
    direction clamp, **IPv6 answer address types and RFC 8843 BUNDLE group
    echo are done**) — and **GRUU/Outbound done** (RFC 5626 flow
    keep-alives + registration refresh, RFC 5627 pub-gruu synthesis;

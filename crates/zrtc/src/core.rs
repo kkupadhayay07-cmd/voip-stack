@@ -88,11 +88,15 @@ impl Core {
     }
 
     /// The core pump: consumes every incoming message forever, sweeping
-    /// expired registrar bindings every 30 s. The input channel is bounded:
-    /// listener tasks back-pressure when the pump falls behind.
+    /// expired registrar bindings every 30 s and advancing the proxy's
+    /// RFC 3261 §17 transaction timers every 500 ms (Timer T1). The input
+    /// channel is bounded: listener tasks back-pressure when the pump falls
+    /// behind.
     pub async fn pump(mut self, mut rx: Receiver<Incoming>) {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut tx_ticker = tokio::time::interval(std::time::Duration::from_millis(500));
+        tx_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 item = rx.recv() => {
@@ -103,6 +107,22 @@ impl Core {
                     self.handle(msg, resp).await;
                 }
                 _ = ticker.tick() => self.sweep(),
+                _ = tx_ticker.tick() => {
+                    // Transaction-timer sweep: Timer A/E/G retransmissions,
+                    // Timer B/F/H/I/J/K cleanup (leak-free by construction).
+                    let now = std::time::Instant::now();
+                    for action in self.proxy.poll(now) {
+                        match action {
+                            proxy::Action::Send(SipMessage::Request(r), dst) => {
+                                let bytes = serialize(&SipMessage::Request(r));
+                                self.send_datagram(&bytes, dst).await;
+                            }
+                            proxy::Action::Send(msg, dst) => {
+                                self.send_routed_response(msg, dst).await;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -183,12 +203,13 @@ impl Core {
                         self.clients.insert(call_id, resp.clone());
                     }
                 }
-                for action in self.proxy.process_request(&req, src) {
+                for action in self.proxy.process_request(
+                    &req,
+                    src,
+                    resp.conn.is_some(),
+                    std::time::Instant::now(),
+                ) {
                     match action {
-                        proxy::Action::Buffer(msg) => {
-                            let bytes = serialize(&msg);
-                            self.send_to_responder(&bytes, &resp).await;
-                        }
                         proxy::Action::Send(msg, dst) => {
                             // The proxy's local provisional responses target
                             // the requester: keep them on the arriving
@@ -248,19 +269,31 @@ impl Core {
         // §16.7: pop the proxy's own Via (this used to be skipped entirely
         // when a client endpoint was known, leaving the proxy Via unpopped
         // and making proxy.process_response unreachable dead code).
-        let forwarded = self.proxy.process_response(&resp, from.src);
+        let forwarded = self
+            .proxy
+            .process_response(&resp, from.src, std::time::Instant::now());
 
-        // RFC 3261 §18.2.2: prefer the learned per-call endpoint.
+        // RFC 3261 §18.2.2: prefer the learned per-call endpoint for the
+        // upstream-bound responses; downstream requests (the leg-ACK the
+        // client tx generated) route by address.
         let call_id = resp.headers.call_id().unwrap_or("").to_string();
-        if let Some(client) = self.clients.get(&call_id).cloned() {
-            if let Some(proxy::Action::Send(msg, _)) = forwarded {
-                let bytes = serialize(&msg);
-                self.send_to_responder(&bytes, &client).await;
-                return;
+        let client = self.clients.get(&call_id).cloned();
+        for action in forwarded {
+            let proxy::Action::Send(msg, dst) = action;
+            match &msg {
+                SipMessage::Request(req) => {
+                    let bytes = serialize(&SipMessage::Request(req.clone()));
+                    self.send_datagram(&bytes, dst).await;
+                }
+                SipMessage::Response(_) => {
+                    if let Some(client) = &client {
+                        let bytes = serialize(&msg);
+                        self.send_to_responder(&bytes, client).await;
+                    } else {
+                        self.send_routed_response(msg, dst).await;
+                    }
+                }
             }
-        }
-        if let Some(proxy::Action::Send(msg, dst)) = forwarded {
-            self.send_routed_response(msg, dst).await;
         }
     }
 

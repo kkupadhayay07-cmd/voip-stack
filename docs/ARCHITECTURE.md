@@ -100,7 +100,7 @@ the seam.
 
 | Layer | Crates | Phase |
 |-------|--------|-------|
-| Protocol core | `sip-core` (messages), `sip-tx` (§17 state machines), `dialog` (§12 dialog state: identity, lifecycle, both-direction CSeq sequencing, remote target), `sdp` | 1 |
+| Protocol core | `sip-core` (messages), `sip-tx` (§17 state machines — now also drives the proxy's fork legs and incoming-request server transactions), `dialog` (§12 dialog state: identity, lifecycle, both-direction CSeq sequencing, remote target), `sdp` | 1 |
 | Transport | UDP/TCP/TLS/WS/WSS inside the `zrtc` daemon (message-layer framing in `sip-core`) | 1–2 |
 | Media transport | `rtp` (packets, jitter buffer, DTMF), `srtp`, `dtls`, `ice` (+STUN/TURN), `sctp` (data-channel engine) | 1–2 |
 | Codecs | `codecs` (G.711/G.722/G.729/Opus/L16/CN/PLC/resample) | 1 |

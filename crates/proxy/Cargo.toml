@@ -8,5 +8,6 @@ description = "Stateful SIP proxy (RFC 3261 §16): routing, forking, Record-Rout
 [dependencies]
 observ = { workspace = true }
 sip-core = { workspace = true }
+sip-tx = { workspace = true }
 
 [dev-dependencies]

@@ -89,7 +89,7 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **671 passing** across 74 suites, `clippy -D warnings`
+`cargo test --workspace` → **677 passing** across 74 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
 **The external audit is fully closed**: every finding at every severity —
@@ -388,3 +388,31 @@ correctly rejected as a foreign fork by the Task 54 `on_response` rule
 Net after Task 55: **671 tests / 74 suites** (was 669/73) — b2bua 51→53
 (`renegotiation`, +2). No external-audit items affected; all previous
 fixes re-verified green.
+
+## Task 56 — proxy `sip-tx` adoption (self-audit findings)
+
+Adopting the RFC 3261 §17 transaction layer in the stateful proxy (the
+DEPLOYMENT roadmap's "remains open" item) surfaced five real defects in the
+hand-rolled fork state — all fixed with the adoption and pinned by the
+reworked 15-test proxy suite:
+
+| ID | Finding | Severity | Resolution |
+|---|---|---|---|
+| T56-1 | Forked INVITE transactions were ONLY ever removed by a CANCEL — no expiry, no timer sweep, no response-path cleanup. Every unanswered fork (dead target, no CANCEL) grew the map forever: unbounded memory growth on a network-facing component | **Major** (memory leak, remote-triggerable) | Legs live in §17.1 client transactions; Timer B/F deletes them, the fork-wide timeout path deletes the server tx via Timer H/I/J, and `Proxy::poll` sweeps everything. Pinned by `timer_a_retransmits_per_leg_and_timer_b_cleans_up` (drained proxy asserts) |
+| T56-2 | The CANCEL was forwarded VERBATIM downstream carrying the UPSTREAM's Via stack — a forked UAS matches CANCEL to INVITE by the top-Via branch of the INVITE it received (our proxy hop's branch, §9.1), which the verbatim CANCEL never carried: the CANCEL could never match at the UAS and the INVITE kept running until Timer B | **Major** (spec violation, RFC 3261 §9.1/§16.7 step 2) | The proxy now GENERATES the per-leg CANCEL from the leg's forked INVITE (same Request-URI/Call-ID/From/To/CSeq-seq, the leg's own top-Via branch and Route set). Pinned by `cancel_cancels_fork_and_is_200ed_locally` |
+| T56-3 | A UDP retransmission of the INVITE was processed as a NEW request: re-forked downstream to every target and re-answered 100 — duplicate INVITEs per fork leg and duplicate transaction state | **Major** (§17.2 violation) | Upstream-facing server transactions absorb retransmissions (§17.2: Trying absorbs silently, Proceeding re-sends the last provisional, Completed re-sends the final). Pinned by `retransmitted_invite_does_not_refork` and `max_forwards_zero_rejected_with_483_and_absorbed` |
+| T56-4 | All fork legs shared ONE Via branch — §16.6 step 10 requires a unique branch per fork leg, and per-leg response identity (needed for leg-specific client transactions) was impossible | **Minor** (spec violation) | Every leg gets a fresh `z9hG4bK` branch; the response path resolves the leg by the echoed top-Via branch. Pinned by `invite_forks_to_targets_and_adds_via` (branches unique) |
+| T56-5 | When every fork leg timed out, no final response was ever generated upstream — the caller's client transaction hung until its own Timer B instead of learning the fork failed | **Minor** (§16.7 step 6 violation) | When the last leg of a fork dies and the server tx never reached a final, a 408 Request Timeout is staged and sent through the server tx (Timer G/H then manage it). Pinned by `timer_a_retransmits_per_leg_and_timer_b_cleans_up` |
+| T56-6 | Non-INVITE forwarded requests (BYE, MESSAGE, ...) had NO transaction state: no retransmission, no timeout, single-shot responses; a lost BYE response was never retransmitted | **Minor** (robustness) | Every forwarded request gets a §17.1.2 client transaction; the returned final stages into the §17.2.2 server transaction (retransmitted BYE → staged 200 re-sent). Pinned by `bye_retransmission_absorbed_and_final_retransmitted` |
+
+Also removed: the never-constructed `Action::Buffer` variant (dead public
+API); `ProxyConfig.fork_wait_ms` is now documented as reserved — §16.7
+step 6 best-response buffering remains a documented simplification
+(pass-through forwarding; the upstream client tx absorbs extra finals).
+Reliable-transport nuance: a request arriving over TCP/TLS/WSS creates its
+server transaction with the reliable timer class (Timer G suppressed — no
+retransmission attempts against a connection-oriented peer; Timer H still
+bounds the ACK wait).
+
+Net after Task 56: **677 tests / 74 suites** (was 671/74) — proxy 9→15.
+No external-audit items affected; all previous fixes re-verified green.
