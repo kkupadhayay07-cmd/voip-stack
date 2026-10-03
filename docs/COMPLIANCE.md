@@ -55,7 +55,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC 8866 | SDP v2 | **Partial** | Parser/model cover `rtpmap`/`fmtp`, `ice-*`, `fingerprint`, `bundle`, `extmap`; answers emit IP4/IP6 connection types per the local literal (§4.4); full 8866 grammar validation not complete. |
 | RFC 2617/7616 | Digest auth | **Done** (server side) | `sip-core` helpers + registrar nonce store; `respond_to_challenge` used in tests/clients. |
 | RFC 6140 / 5627 | GRUU | **Done** (pub-gruu) | Registrar synthesizes a public GRUU (`sip:AOR;gr=<instance>`) for every contact registering `+sip.instance`, echoes it (quoted) in the 200 OK with `Supported: gruu`; the trunk UAC advertises the option tag. Quoted generic-params are parser round-trip stable (quote-aware param split). Not done: temp-gruu (temporary opaque GRUUs with lifetime), instance-aware proxy routing (a request to a GRUU forks to all of the user's contacts, not the targeted instance). |
-| RFC 5626 / 6223 | Outbound | **Done** (client + registrar) | Registrar: flow detection via the top Via transport, `+sip.instance`/`reg-id` bindings (per-reg-id de-registration, reg-id=0 → 400), `Flow-Timer` + `Supported: outbound` echo on reliable transports only. Trunk UAC: `Supported: outbound, gruu` on every REGISTER, instance-tagged Contact (stable `[trunk] instance_id` config, process-local generated otherwise), refresh at half the granted expiry on the same Call-ID, CRLF (TCP/TLS) / WS-Ping (WSS) flow keep-alives per `Flow-Timer`; 430 `Flow Failed` reason phrase available. Not done: STUN keep-alives over UDP flows, proxy-side flow tokens / 430 generation on flow loss, `Path` / Service-Route support. |
+| RFC 5626 / 6223 | Outbound | **Done** (client + registrar) | Registrar: flow detection via the top Via transport, `+sip.instance`/`reg-id` bindings (per-reg-id de-registration, reg-id=0 → 400), `Flow-Timer` + `Supported: outbound` echo on reliable transports only. Trunk UAC: `Supported: outbound, gruu` on every REGISTER, instance-tagged Contact (stable `[trunk] instance_id` config, process-local generated otherwise), refresh at half the granted expiry on the same Call-ID, CRLF (TCP/TLS) / WS-Ping (WSS) flow keep-alives per `Flow-Timer`; 430 `Flow Failed` reason phrase available. Proxy-side (RFC 5626 §5.2): fork legs toward flow-registered bindings use the reliable timer class and are delivered over the registered connection; a dead flow generates a **430 Flow Failed** that participates in the fork's best-response selection. Not done: STUN keep-alives over UDP flows, opaque flow TOKENS in the Contact (flows are currently keyed by the binding's source address), `Path` / Service-Route support. |
 | RFC 7118 | SIP over WS | **Done** | WS/WSS listeners wired in the `zrtc` daemon (WSS = WS over TLS); message layer handles text-frame streaming + Content-Length accumulation. |
 
 ## 2. Media transport
@@ -205,7 +205,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **688 passing across 74 suites**.
+  `cargo test --workspace` → **692 passing across 74 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16 + §17.1/§17.3
   SRTCP AEAD), STUN (RFC 5769 §2.1/§2.2; MD5 long-term keys + MESSAGE-INTEGRITY
   against independent vectors), G.729 (bcg729 oracle), cross-decode by ffmpeg.

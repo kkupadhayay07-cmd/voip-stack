@@ -89,7 +89,7 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **688 passing** across 74 suites, `clippy -D warnings`
+`cargo test --workspace` → **692 passing** across 74 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
 **The external audit is fully closed**: every finding at every severity —
@@ -437,4 +437,23 @@ leg and never re-forward (exactly one final per fork); contexts are
 dropped when their server tx dies (no leak).
 
 Net after Task 57: **688 tests / 74 suites** (was 677/74) — proxy 15→25, sip-tx 18→19 (+1 Timer-C unit test).
+No external-audit items affected; all previous fixes re-verified green.
+
+## Task 58 — RFC 5626 §5.2 proxy-side flow delivery (self-audit notes)
+
+No shipped defects this round. Hazards caught before compile: a duplicated
+helper introduced by an anchored edit (the count-assert discipline caught
+it at review), and a moved `String` key borrowed after insertion (caught
+by the borrow checker). Design notes recorded for the next auditor:
+
+- Reliable-class legs never retransmit — the conn write is the delivery,
+  `leg_delivered` (sip-tx `Delivered`) is only called for conn deliveries,
+  so UDP legs keep Timer A retransmissions unchanged.
+- The synthetic 430 is stored in the response context in POPPED form so
+  every stored candidate is uniformly upstream-bound; it participates in
+  §16.7 step 6 selection (a sibling 200 beats it; a lone 430 forwards).
+- Retransmitted INVITEs over a live conn (if any transport ever duplicates)
+  are absorbed by the callee's §17.2.1 server transaction — spec-correct.
+
+Net after Task 58: **692 tests / 74 suites** (was 688/74) — proxy 25→29.
 No external-audit items affected; all previous fixes re-verified green.

@@ -203,28 +203,69 @@ impl Core {
                         self.clients.insert(call_id, resp.clone());
                     }
                 }
-                for action in self.proxy.process_request(
+                // Worklist dispatch: proxy actions may trigger further
+                // proxy calls (RFC 5626 §5.2 flow-failure feedback loops
+                // back through the proxy to forward the best final).
+                let mut queue: Vec<proxy::Action> = self.proxy.process_request(
                     &req,
                     src,
                     resp.conn.is_some(),
                     std::time::Instant::now(),
-                ) {
-                    match action {
-                        proxy::Action::Send(msg, dst) => {
-                            // The proxy's local provisional responses target
-                            // the requester: keep them on the arriving
-                            // transport; everything else routes by address.
-                            if dst == resp.src {
-                                let bytes = serialize(&msg);
-                                self.send_to_responder(&bytes, &resp).await;
-                            } else if let SipMessage::Request(fwd) = &msg {
-                                self.remember_client(fwd, resp.clone());
-                                let bytes = serialize(&msg);
+                );
+                while let Some(action) = queue.pop() {
+                    let proxy::Action::Send(msg, dst) = action;
+                    // The proxy's local provisional responses target
+                    // the requester: keep them on the arriving
+                    // transport; everything else routes by address.
+                    if dst == resp.src {
+                        let bytes = serialize(&msg);
+                        self.send_to_responder(&bytes, &resp).await;
+                    } else if let SipMessage::Request(fwd) = &msg {
+                        self.remember_client(fwd, resp.clone());
+                        // RFC 5626 §5.2: a fork target that is a
+                        // registered reliable flow is delivered over THAT
+                        // connection; a dead flow reports back to the
+                        // proxy (leg_transport_failed → 430 candidate).
+                        let conn = self
+                            .registry
+                            .lock()
+                            .expect("registry lock")
+                            .get(&dst)
+                            .cloned();
+                        let is_flow = self.proxy.reliable_targets.contains(&dst);
+                        match conn {
+                            Some(tx) => {
+                                let bytes = serialize(&SipMessage::Request(fwd.clone()));
+                                match tx.try_send(bytes) {
+                                    Ok(()) => {
+                                        self.proxy.leg_delivered(fwd, std::time::Instant::now());
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(%dst, "flow write failed: {e}");
+                                        queue.extend(
+                                            self.proxy.leg_transport_failed(
+                                                fwd,
+                                                std::time::Instant::now(),
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                            None if is_flow => {
+                                // Registered flow, connection gone: §5.2
+                                // 430 Flow Failed for that branch.
+                                queue.extend(
+                                    self.proxy
+                                        .leg_transport_failed(fwd, std::time::Instant::now()),
+                                );
+                            }
+                            None => {
+                                let bytes = serialize(&SipMessage::Request(fwd.clone()));
                                 self.send_datagram(&bytes, dst).await;
-                            } else {
-                                self.send_routed_response(msg, dst).await;
                             }
                         }
+                    } else {
+                        self.send_routed_response(msg, dst).await;
                     }
                 }
             }
@@ -355,6 +396,7 @@ impl Core {
     /// to a registered AoR fork to the bound contact (the in-process b2bua).
     fn sync_bindings(&mut self) {
         self.proxy.bindings.clear();
+        self.proxy.reliable_targets.clear();
         for (aor, entry) in &self.registrar.aors {
             // Aors are "sip:<user>@<domain>" — the proxy keys bindings by
             // the bare user part (request-URI user), not "sip:<user>".
@@ -365,13 +407,20 @@ impl Core {
                 .next()
                 .unwrap_or(aor)
                 .to_string();
-            let contacts: Vec<String> = entry
-                .active()
-                .into_iter()
-                .map(|b| b.contact.clone())
-                .collect();
+            let active = entry.active();
+            let contacts: Vec<String> = active.iter().map(|b| b.contact.clone()).collect();
             if !contacts.is_empty() {
                 self.proxy.bindings.insert(user, contacts);
+            }
+            // RFC 5626 §5.2: bindings registered over a reliable flow are
+            // delivered over THAT flow — the proxy marks the flow's peer
+            // address as a reliable target (reliable leg timers + §5.2
+            // delivery feedback), and this core routes requests toward it
+            // over the registered connection.
+            for b in active.iter().filter(|b| b.flow) {
+                if let Ok(addr) = b.source.parse::<SocketAddr>() {
+                    self.proxy.reliable_targets.insert(addr);
+                }
             }
         }
     }

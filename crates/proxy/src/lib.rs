@@ -238,6 +238,10 @@ pub struct Proxy {
     /// server-transaction key. Forwarded as the "best" final once every leg
     /// terminates (§16.7 step 6).
     contexts: HashMap<String, Vec<Response>>,
+    /// Fork targets that are RFC 5626 flows (reliable-transport
+    /// registrations): legs toward them use the reliable timer class and
+    /// the transport confirms delivery / reports flow failure (§5.2).
+    pub reliable_targets: std::collections::HashSet<SocketAddr>,
     /// Registrar-fed lookup: user → contact URIs (used before static routes).
     pub bindings: HashMap<String, Vec<String>>,
 }
@@ -250,6 +254,7 @@ impl Proxy {
             legs: HashMap::new(),
             server_txs: HashMap::new(),
             contexts: HashMap::new(),
+            reliable_targets: std::collections::HashSet::new(),
             bindings: HashMap::new(),
         }
     }
@@ -605,7 +610,9 @@ impl Proxy {
         // Fork (§16.6 step 10): one request copy per leg, each with its OWN
         // Via branch, driven by a real client transaction (§17.1). An ACK
         // is forwarded without transaction state (§17.1: no ACK
-        // transactions).
+        // transactions). Legs toward RFC 5626 flow targets use the reliable
+        // timer class (no retransmission timers — the transport layer
+        // confirms delivery or reports flow failure, §5.2).
         for t in &targets {
             let target = resolve_target(t, self.config.default_port);
             let branch = new_branch();
@@ -616,8 +623,13 @@ impl Proxy {
                 continue;
             }
 
+            let transport = if self.reliable_targets.contains(&target) {
+                Transport::Tcp
+            } else {
+                Transport::Udp
+            };
             let (tx, key) = if req.method == Method::Invite {
-                let mut tx = ClientInviteTx::new(fwd.clone(), Transport::Udp);
+                let mut tx = ClientInviteTx::new(fwd.clone(), transport);
                 for a in tx.on_event(TxEvent::Send, now) {
                     if let TxAction::SendRequest(r) = a {
                         actions.push(Action::Send(SipMessage::Request(r), target));
@@ -628,7 +640,7 @@ impl Proxy {
                     Self::leg_key(&call_id, &branch, &Method::Invite),
                 )
             } else {
-                let mut tx = ClientNonInviteTx::new(fwd.clone(), Transport::Udp);
+                let mut tx = ClientNonInviteTx::new(fwd.clone(), transport);
                 for a in tx.on_event(TxEvent::Send, now) {
                     if let TxAction::SendRequest(r) = a {
                         actions.push(Action::Send(SipMessage::Request(r), target));
@@ -943,6 +955,58 @@ impl Proxy {
         Some(actions)
     }
 
+    /// The transport layer CONFIRMED delivery of this fork leg's request
+    /// over a reliable connection (RFC 5626 §5.2 flow delivery): stops the
+    /// leg's retransmission timers (Timer A/E — the sip-tx `Delivered`
+    /// event); the timeout timers keep guarding the leg.
+    pub fn leg_delivered(&mut self, fwd: &Request, now: Instant) {
+        let Some(key) = self.leg_key_from_forked(fwd) else {
+            return;
+        };
+        let Some(leg) = self.legs.get_mut(&key) else {
+            return;
+        };
+        let _ = leg.tx.on_event(TxEvent::Delivered, now);
+    }
+
+    /// The transport layer FAILED to deliver this fork leg's request over
+    /// its RFC 5626 flow (§5.2: the connection was gone or the write
+    /// failed): the leg's client transaction terminates with a
+    /// `TransportError`, and a synthetic **430 Flow Failed** enters the
+    /// fork's response context as a best-response candidate — when the
+    /// fork completes, the upstream receives either another leg's answer
+    /// or the 430. Returns the actions to execute (typically the fork
+    /// completion forward).
+    pub fn leg_transport_failed(&mut self, fwd: &Request, now: Instant) -> Vec<Action> {
+        let Some(key) = self.leg_key_from_forked(fwd) else {
+            return Vec::new();
+        };
+        let Some(mut leg) = self.legs.remove(&key) else {
+            return Vec::new();
+        };
+        // §17.1.1/§17.1.2: a transport error terminates the client tx.
+        let _ = leg.tx.on_event(TxEvent::TransportError, now);
+        let Some(sk) = leg.server_key.clone() else {
+            return Vec::new();
+        };
+        // Synthetic 430 (popped form: our leg via removed — the stored
+        // context holds upstream-bound responses).
+        let resp = respond_to(leg.tx.request(), 430, "Flow Failed", Vec::new(), None);
+        let popped = pop_our_via(resp);
+        self.contexts.entry(sk.clone()).or_default().push(popped);
+        if let Some(acts) = self.maybe_complete_fork(&sk, now) {
+            return acts;
+        }
+        Vec::new()
+    }
+
+    /// The leg key of a forked request (our per-leg branch is its top via).
+    fn leg_key_from_forked(&self, fwd: &Request) -> Option<String> {
+        let branch = fwd.headers.first_via().and_then(|v| v.branch.clone())?;
+        let call_id = fwd.headers.call_id()?;
+        Some(Self::leg_key(call_id, &branch, &fwd.method))
+    }
+
     /// Advance every pending transaction timer whose deadline has passed:
     /// client transactions retransmit their requests to their leg targets
     /// (Timer A/E) and clean up (Timer B/F/D/K); server transactions
@@ -1125,6 +1189,23 @@ fn prepend_via(mut req: Request, via: &str) -> Request {
         req.headers.add("Via", v);
     }
     req
+}
+
+/// Remove exactly the TOP Via header value from a response (the proxy's
+/// own hop, identified by position — we are always the top hop of the
+/// responses we process).
+fn pop_our_via(mut resp: Response) -> Response {
+    let all: Vec<String> = resp
+        .headers
+        .get_all("Via")
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+    resp.headers.remove_all("Via");
+    for v in all.into_iter().skip(1) {
+        resp.headers.add("Via", v);
+    }
+    resp
 }
 
 /// Destination selection for a response whose OUR via has already been

@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 688 tests passing across 74 suites in 22 crates;
+**Current state: 692 tests passing across 74 suites in 22 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
@@ -101,7 +101,7 @@ with the call surviving (leg B rolled back to its original offer).
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 688 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 692 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -317,6 +317,15 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
    Timer C (§16.6 bullet 11, 4 min, reset per non-100 provisional per
    §16.7 step 2) so a leg ringing past Timer B's 32 s survives — a
    Timer-C fire CANCELs a leg that rang and abandons a silent one (§16.8).
+   **And RFC 5626 §5.2 proxy-side flow delivery ✅** (Task 58): fork legs
+   toward bindings registered over a reliable transport (WSS/TCP/TLS)
+   use the reliable timer class, the core delivers them over the
+   registered connection (a confirmed write stops retransmission timers
+   via `leg_delivered`), and a dead flow feeds `leg_transport_failed` —
+   the leg terminates and a synthetic **430 Flow Failed** enters the
+   fork's response context, so the upstream receives another leg's
+   answer or the 430 — the missing piece for real-browser calls through
+   the proxy.
 5. WebRTC hardening — library layer ✅ (RFC 4585 NACK, RFC 4588 RTX,
    transport-cc feedback in `crates/rtp`) **and B2BUA RTCP plumbing ✅**
    (SR/RR + NACK answer/ask + TWCC feedback live on every media leg)

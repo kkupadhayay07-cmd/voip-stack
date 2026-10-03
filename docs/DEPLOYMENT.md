@@ -234,7 +234,11 @@ configured bounds. Guidance:
    408), a 6xx cancels the pending legs, leg 100 never forwards, and each
    proxied INVITE leg is bounded by Timer C (§16.6 bullet 11, reset per
    non-100 provisional) so long-ringing legs survive Timer B's 32 s — a
-   Timer-C fire CANCELs a leg that rang (§16.8).
+   Timer-C fire CANCELs a leg that rang (§16.8). **RFC 5626 §5.2 flow
+   delivery (Task 58)**: fork legs toward reliable-transport bindings ride
+   the registered connection (write-confirmed delivery stops leg
+   retransmissions) and a dead flow becomes a 430 Flow Failed candidate in
+   the fork's best-response context — the path real browsers will use.
 3. **In-dialog SDP renegotiation** (RFC 3264 §8) ✅ shipped — the caller's
    changed re-INVITE offer is relayed to leg B and the answer completes
    the caller's 200; media-preserving (codec/PT must be unchanged — the

@@ -855,3 +855,134 @@ fn non_invite_finals_follow_the_same_best_response_path() {
     assert_eq!(acts.len(), 1);
     assert!(matches!(&acts[0], Action::Send(SipMessage::Response(r), _) if r.code == 480));
 }
+
+#[test]
+fn reliable_leg_never_retransmits() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    let target: SocketAddr = "10.6.6.6:5060".parse().unwrap();
+    proxy.reliable_targets.insert(target);
+    proxy
+        .routes
+        .exact
+        .insert("bob".into(), vec!["10.6.6.6:5060".into()]);
+    let t0 = Instant::now();
+
+    let actions = proxy.process_request(&invite_req("sip:bob@example.com", "bob"), SRC, false, t0);
+    assert_eq!(fork_targets(&actions).len(), 1, "forked once");
+
+    // No Timer A retransmission ever fires toward a flow target (§5.2:
+    // the connection is the retransmission layer; sip-tx suppresses
+    // retransmission timers on reliable transports).
+    assert_eq!(proxy.poll(t0 + T1).len(), 0);
+    assert_eq!(proxy.poll(t0 + T1 * 4).len(), 0);
+
+    // Timer B still bounds the leg: no response at 64·T1 → fork completion
+    // with a 408 (the flow never failed at the transport layer — it just
+    // never answered).
+    let acts = proxy.poll(t0 + T64);
+    assert!(acts
+        .iter()
+        .any(|a| matches!(a, Action::Send(SipMessage::Response(r), _) if r.code == 408)));
+}
+
+#[test]
+fn leg_delivered_stops_udp_retransmissions() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    proxy
+        .routes
+        .exact
+        .insert("bob".into(), vec!["10.7.7.7:5060".into()]);
+    let t0 = Instant::now();
+    let actions = proxy.process_request(&invite_req("sip:bob@example.com", "bob"), SRC, false, t0);
+    let fwd = forked_requests(&actions).remove(0);
+
+    // UDP leg: Timer A retransmits at T1...
+    assert_eq!(
+        fork_targets(&proxy.poll(t0 + T1)).len(),
+        1,
+        "Timer A retransmit"
+    );
+    // ...but a confirmed delivery (the transport reported it) stops it.
+    proxy.leg_delivered(&fwd, t0 + T1);
+    assert_eq!(
+        proxy.poll(t0 + T1 * 2).len(),
+        0,
+        "no retransmission after Delivered"
+    );
+    assert_eq!(proxy.leg_count(), 1, "the leg still waits for an answer");
+}
+
+#[test]
+fn dead_flow_becomes_430_candidate_single_leg_forwards() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    let target: SocketAddr = "10.6.6.6:5060".parse().unwrap();
+    proxy.reliable_targets.insert(target);
+    proxy
+        .routes
+        .exact
+        .insert("bob".into(), vec!["10.6.6.6:5060".into()]);
+    let t0 = Instant::now();
+    let actions = proxy.process_request(&invite_req("sip:bob@example.com", "bob"), SRC, false, t0);
+    let fwd = forked_requests(&actions).remove(0);
+
+    // The flow is gone (conn not in the registry): §5.2 — the leg dies and
+    // a 430 Flow Failed becomes the fork's final (only leg → forwards).
+    let acts = proxy.leg_transport_failed(&fwd, t0);
+    assert_eq!(acts.len(), 1);
+    match &acts[0] {
+        Action::Send(SipMessage::Response(r), _) => {
+            assert_eq!(r.code, 430);
+            // Upstream-bound: our leg via is popped (the upstream's via on top).
+            assert!(!r.headers.get_all("Via")[0].contains("proxy.voip-stack"));
+        }
+        _ => panic!("expected the 430 forward"),
+    }
+    assert_eq!(proxy.leg_count(), 0, "leg removed");
+
+    // The 430's server tx lifecycle: Timer G/H without an ACK → cleanup.
+    proxy.poll(t0 + T64);
+    assert_eq!(proxy.server_tx_count(), 0);
+}
+
+#[test]
+fn dead_flow_430_loses_to_a_sibling_twoxx() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    let flow: SocketAddr = "10.6.6.6:5060".parse().unwrap();
+    proxy.reliable_targets.insert(flow);
+    proxy.routes.exact.insert(
+        "bob".into(),
+        vec!["10.6.6.6:5060".into(), "192.168.1.11:5060".into()],
+    );
+    let t0 = Instant::now();
+    let actions = proxy.process_request(&invite_req("sip:bob@example.com", "bob"), SRC, false, t0);
+    let fwds = forked_requests(&actions);
+    assert_eq!(fwds.len(), 2);
+    // Identify the flow leg by its target: forked requests and targets are
+    // parallel (targets vector order).
+    let flow_fwd = if fwds[0].headers.first_via().and_then(|v| v.branch.clone())
+        != fwds[1].headers.first_via().and_then(|v| v.branch.clone())
+    {
+        // Distinguish by which target each branch answers from is not
+        // possible here — use the fact that actions and targets were
+        // pushed in the same order: fwds[0] → first target (the flow).
+        fwds[0].clone()
+    } else {
+        panic!("branches must differ")
+    };
+
+    // The flow leg fails at the transport layer: 430 stored, no forward
+    // (the sibling is still pending).
+    let acts = proxy.leg_transport_failed(&flow_fwd, t0);
+    assert!(acts.is_empty(), "fork not complete yet — nothing forwards");
+
+    // The sibling answers 200 → forwards immediately; the 430 never does.
+    let sibling = if fwds[0] == flow_fwd {
+        fwds[1].clone()
+    } else {
+        fwds[0].clone()
+    };
+    let resp200 = leg_response(&sibling, 200, "OK");
+    let acts = proxy.process_response(&resp200, "192.168.1.11:5060".parse().unwrap(), t0);
+    assert_eq!(acts.len(), 1);
+    assert!(matches!(&acts[0], Action::Send(SipMessage::Response(r), _) if r.code == 200));
+}
