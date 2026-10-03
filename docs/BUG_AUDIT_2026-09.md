@@ -89,7 +89,7 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **677 passing** across 74 suites, `clippy -D warnings`
+`cargo test --workspace` → **688 passing** across 74 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
 **The external audit is fully closed**: every finding at every severity —
@@ -415,4 +415,26 @@ retransmission attempts against a connection-oriented peer; Timer H still
 bounds the ACK wait).
 
 Net after Task 56: **677 tests / 74 suites** (was 671/74) — proxy 9→15.
+No external-audit items affected; all previous fixes re-verified green.
+
+## Task 57 — §16.7 best-response buffering + Timer C (self-audit findings)
+
+Implementing the real §16.7 steps 4/5/6 (curl-the-RFC lesson, 5th strike:
+the step text differs from what memory insists on — "best" is 6xx-MUST /
+lowest-class / resubmission-preference, and there is NO time-based
+fork-wait anywhere) caught one regression Task 56 was about to ship:
+
+| ID | Finding | Severity | Resolution |
+|---|---|---|---|
+| T57-1 | The Task 56 adoption armed sip-tx Timer B (64·T1 = 32 s) on every fork leg — a leg still RINGING at 32 s (a normal human answering delay) was Timer-B-killed and the fork answered 408, a functional regression vs. both the pre-Task-56 proxy (no timers at all) and RFC 3261, which exists precisely to prevent this: §16.6 bullet 11 + §16.7 step 2 require Timer C (>3 min, reset per non-100 provisional) to bound proxied INVITE legs, NOT Timer B | **Major** (functional regression, caught pre-push by reading the RFC for the best-response work) | New `ClientInviteTx::reset_timer_c(now, d)` in sip-tx extends Timer B to `now + d` once the tx is in Proceeding; the proxy calls it with `ProxyConfig.timer_c` (default 4 min, RFC requires >3) after every non-100 provisional. Pinned by `timer_c_extends_ringing_leg_and_cancels_on_fire` (leg alive at 32 s, CANCEL + 408 at the Timer-C fire) |
+| T57-2 | The Timer C reset was originally invoked BEFORE feeding the provisional into the client tx — the tx was still in Trying, so the Proceeding-gated reset silently no-op'd and T57-1 persisted despite the call appearing in the code. The integration test (leg dead at 32 s) exposed it immediately | **Minor** (ordering, caught by test) | The reset now runs after the `on_event` feed; the test asserts the leg survives Timer B and the comment names the hazard (a state-gated mutation must follow the event that establishes the state) |
+| T57-3 | A stray final whose fork context no longer existed was stored into a phantom context entry (keyed by a derived server key with no live tx) and silently swallowed — the response never forwarded | **Minor** (found by the existing method-scoping test failing) | The store path now requires a LIVE server tx for the key; strays fall through to the pass-through forward |
+
+Behavior changes shipped with the task (not defects — completed spec
+rules): leg-generated 100 Trying is never forwarded; after a final has
+been forwarded on the server tx, late non-2xx responses only re-ACK their
+leg and never re-forward (exactly one final per fork); contexts are
+dropped when their server tx dies (no leak).
+
+Net after Task 57: **688 tests / 74 suites** (was 677/74) — proxy 15→25, sip-tx 18→19 (+1 Timer-C unit test).
 No external-audit items affected; all previous fixes re-verified green.

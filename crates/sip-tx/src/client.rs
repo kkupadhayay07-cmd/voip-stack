@@ -10,7 +10,7 @@ use crate::matching::{self, TxKey};
 use crate::{add, earliest, TimerConfig, Transport, TxAction, TxEvent, TxState};
 use sip_core::headers::HeaderMap;
 use sip_core::message::{Method, Request, Response, SipMessage};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Client transaction for an INVITE (RFC 3261 §17.1.1).
 #[derive(Debug)]
@@ -56,6 +56,20 @@ impl ClientInviteTx {
     pub fn with_timers(mut self, cfg: TimerConfig) -> Self {
         self.cfg = cfg;
         self
+    }
+
+    /// Stateful-proxy Timer C (RFC 3261 §16.6 bullet 11 / §16.7 step 2):
+    /// extend the transaction's total-pending timer (Timer B, the only
+    /// timer in this machine that bounds a pending INVITE) to `now + d`
+    /// once a provisional response has arrived. Without this, Timer B
+    /// (64·T1 = 32 s) kills a leg that is still RINGING — the RFC instead
+    /// lets a proxied INVITE stay pending for Timer C (MUST be > 3 min),
+    /// reset per non-100 provisional. No-op before any response (Timer B
+    /// still guards the silent-target case) and after a final response.
+    pub fn reset_timer_c(&mut self, now: Instant, d: Duration) {
+        if self.state == TxState::Proceeding {
+            self.timer_b = Some(add(now, d));
+        }
     }
 
     /// Current state.

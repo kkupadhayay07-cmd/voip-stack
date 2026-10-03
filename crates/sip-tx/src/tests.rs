@@ -722,3 +722,54 @@ fn timer_f_fires_on_reliable_transport() {
     );
     assert_eq!(tx.state(), TxState::Terminated);
 }
+
+#[test]
+fn reset_timer_c_extends_pending_invite() {
+    // RFC 3261 §16.6 bullet 11 / §16.7 step 2: a proxied INVITE leg is
+    // bounded by Timer C, not Timer B — after a provisional, the total
+    // pending deadline extends to the proxy's Timer C value.
+    let c = Clock::new();
+    let req = base_req(Method::Invite);
+    let mut tx = ClientInviteTx::new(req.clone(), Transport::Udp);
+    tx.on_event(TxEvent::Send, c.at(0));
+    assert_eq!(tx.next_deadline(), Some(c.at(500)), "Timer A first");
+
+    // A provisional moves the tx to Proceeding; Timer C extends Timer B.
+    let resp = resp_for(&req, 180, BRANCH, None);
+    let _ = tx.on_event(TxEvent::Received(resp), c.at(100));
+    tx.reset_timer_c(c.at(100), std::time::Duration::from_secs(240));
+    assert_eq!(tx.next_deadline(), Some(c.at(240_100)), "Timer C deadline");
+
+    // The old Timer B instant (32 s) no longer fires.
+    assert_eq!(tx.on_event(TxEvent::Timeout, c.at(32_000)), Vec::new());
+    assert_eq!(tx.state(), TxState::Proceeding);
+
+    // The Timer C instant terminates the tx (Timer B branch).
+    assert_eq!(
+        tx.on_event(TxEvent::Timeout, c.at(240_100)),
+        vec![TxAction::DeleteTransaction]
+    );
+    assert_eq!(tx.state(), TxState::Terminated);
+
+    // Before any response (Trying) and after a final, the reset is a no-op.
+    let c2 = Clock::new();
+    let mut t2 = ClientInviteTx::new(base_req(Method::Invite), Transport::Udp);
+    t2.on_event(TxEvent::Send, c2.at(0));
+    t2.reset_timer_c(c2.at(10), std::time::Duration::from_secs(240));
+    assert_eq!(
+        t2.next_deadline(),
+        Some(c2.at(500)),
+        "Trying: Timer B stands"
+    );
+    let mut t3 = ClientInviteTx::new(base_req(Method::Invite), Transport::Udp);
+    t3.on_event(TxEvent::Send, c2.at(0));
+    let req3 = t3.request().clone();
+    let final486 = resp_for(&req3, 486, BRANCH, None);
+    let _ = t3.on_event(TxEvent::Received(final486), c2.at(10));
+    t3.reset_timer_c(c2.at(20), std::time::Duration::from_secs(240));
+    assert_eq!(
+        t3.next_deadline(),
+        Some(c2.at(32_010)),
+        "Completed: Timer D stands, reset is a no-op"
+    );
+}

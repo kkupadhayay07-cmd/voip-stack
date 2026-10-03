@@ -424,7 +424,7 @@ fn build_proxy(cfg: &Config) -> proxy::Proxy {
         record_route: Some(format!("{}:{}", cfg.sip.host, cfg.sip.udp_port)),
         record_route_invites: true,
         default_port: cfg.b2bua.port,
-        fork_wait_ms: 500,
+        ..Default::default()
     };
     let mut p = proxy::Proxy::new(config);
     p.routes.default = vec![format!("{}:{}", cfg.sip.host, cfg.b2bua.port)];

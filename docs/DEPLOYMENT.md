@@ -228,6 +228,13 @@ configured bounds. Guidance:
    Via branch matches what the leg received (§9.1 — the old verbatim
    forward carried the upstream branch and could never match at the UAS).
    `zrtc` advances the timers with a 500 ms pump tick (`Proxy::poll`).
+   **§16.7 steps 4/5/6 + Timer C completed in Task 57**: non-2xx finals are
+   stored per fork and the best one forwards at completion (6xx first,
+   lowest class, 401/407/415/420/484 preference, 503-only → 500, none →
+   408), a 6xx cancels the pending legs, leg 100 never forwards, and each
+   proxied INVITE leg is bounded by Timer C (§16.6 bullet 11, reset per
+   non-100 provisional) so long-ringing legs survive Timer B's 32 s — a
+   Timer-C fire CANCELs a leg that rang (§16.8).
 3. **In-dialog SDP renegotiation** (RFC 3264 §8) ✅ shipped — the caller's
    changed re-INVITE offer is relayed to leg B and the answer completes
    the caller's 200; media-preserving (codec/PT must be unchanged — the

@@ -591,3 +591,267 @@ fn reliable_transport_suppresses_retransmissions() {
     assert!(matches!(&acts[0], Action::Send(SipMessage::Response(r), _) if r.code == 200));
     assert_eq!(proxy.server_tx_count(), 0, "2xx ends the server tx at once");
 }
+
+fn forked_at(proxy: &mut Proxy, targets: &[&str]) -> Vec<sip_core::Request> {
+    proxy.routes.exact.insert(
+        "bob".into(),
+        targets.iter().map(|t| t.to_string()).collect(),
+    );
+    let req = invite_req("sip:bob@example.com", "bob");
+    forked_requests(&proxy.process_request(&req, SRC, false, Instant::now()))
+}
+
+#[test]
+fn non2xx_finals_stored_until_fork_completes_twoxx_wins() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    let fwds = forked_at(&mut proxy, &["192.168.1.10:5060", "192.168.1.11:5060"]);
+    assert_eq!(fwds.len(), 2);
+
+    // Leg 1's 486: stored as a candidate — NOT forwarded upstream, while
+    // the ACK still goes downstream (§17.1.1).
+    let resp486 = leg_response(&fwds[0], 486, "Busy Here");
+    let acts = proxy.process_response(
+        &resp486,
+        "192.168.1.10:5060".parse().unwrap(),
+        Instant::now(),
+    );
+    assert_eq!(acts.len(), 1, "only the ACK");
+    assert!(acts
+        .iter()
+        .all(|a| matches!(a, Action::Send(SipMessage::Request(_), _))));
+
+    // Leg 2 answers 200: forwards immediately (§16.7 step 5) — the stored
+    // 486 never forwards.
+    let resp200 = leg_response(&fwds[1], 200, "OK");
+    let acts = proxy.process_response(
+        &resp200,
+        "192.168.1.11:5060".parse().unwrap(),
+        Instant::now(),
+    );
+    assert_eq!(acts.len(), 1);
+    assert!(matches!(&acts[0], Action::Send(SipMessage::Response(r), _) if r.code == 200));
+    assert_eq!(proxy.leg_count(), 2, "Timer D dwells");
+}
+
+#[test]
+fn best_final_sixxx_beats_lower_class() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    let fwds = forked_at(&mut proxy, &["192.168.1.10:5060", "192.168.1.11:5060"]);
+
+    // Leg 1: 486 (stored, Completed). Leg 2: 600 → the 6xx class MUST be
+    // chosen (§16.7 step 6).
+    let r486 = leg_response(&fwds[0], 486, "Busy Here");
+    let _ = proxy.process_response(&r486, "192.168.1.10:5060".parse().unwrap(), Instant::now());
+    let r600 = leg_response(&fwds[1], 600, "Busy Everywhere");
+    let acts = proxy.process_response(&r600, "192.168.1.11:5060".parse().unwrap(), Instant::now());
+    // The forwarded best final is the 600; the ACK for the 600 rides along.
+    let forwarded = acts
+        .iter()
+        .find_map(|a| match a {
+            Action::Send(SipMessage::Response(r), _) => Some(r.code),
+            _ => None,
+        })
+        .expect("best final forwarded at fork completion");
+    assert_eq!(forwarded, 600, "6xx class preferred over 4xx");
+    assert!(acts
+        .iter()
+        .any(|a| matches!(a, Action::Send(SipMessage::Request(r), _) if r.method == Method::Ack)));
+}
+
+#[test]
+fn best_final_prefers_resubmission_helpful_4xx() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    let fwds = forked_at(&mut proxy, &["192.168.1.10:5060", "192.168.1.11:5060"]);
+
+    // Leg 1: 401 (helpful). Leg 2: 480 → completion picks the lowest class
+    // (4xx) and prefers 401 within it.
+    let r401 = leg_response(&fwds[0], 401, "Unauthorized");
+    let _ = proxy.process_response(&r401, "192.168.1.10:5060".parse().unwrap(), Instant::now());
+    let r480 = leg_response(&fwds[1], 480, "Temporarily Unavailable");
+    let acts = proxy.process_response(&r480, "192.168.1.11:5060".parse().unwrap(), Instant::now());
+    let forwarded = acts
+        .iter()
+        .find_map(|a| match a {
+            Action::Send(SipMessage::Response(r), _) => Some(r.code),
+            _ => None,
+        })
+        .expect("best final forwarded");
+    assert_eq!(forwarded, 401, "401 preferred within the 4xx class");
+}
+
+#[test]
+fn fifty_o3_only_fork_generates_500() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    let fwds = forked_at(&mut proxy, &["192.168.1.10:5060", "192.168.1.11:5060"]);
+
+    let r1 = leg_response(&fwds[0], 503, "Service Unavailable");
+    let _ = proxy.process_response(&r1, "192.168.1.10:5060".parse().unwrap(), Instant::now());
+    let r2 = leg_response(&fwds[1], 503, "Service Unavailable");
+    let acts = proxy.process_response(&r2, "192.168.1.11:5060".parse().unwrap(), Instant::now());
+    let forwarded = acts
+        .iter()
+        .find_map(|a| match a {
+            Action::Send(SipMessage::Response(r), _) => Some(r.code),
+            _ => None,
+        })
+        .expect("a final was generated");
+    assert_eq!(forwarded, 500, "503 is never forwarded; 500 generated");
+}
+
+#[test]
+fn sixxx_cancels_still_pending_siblings() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    let fwds = forked_at(&mut proxy, &["192.168.1.10:5060", "192.168.1.11:5060"]);
+
+    // Leg 1 answers 603; leg 2 is still ringing → the proxy CANCELs it
+    // (§16.7 step 5) with leg 2's own branch.
+    let r603 = leg_response(&fwds[0], 603, "Decline");
+    let acts = proxy.process_response(&r603, "192.168.1.10:5060".parse().unwrap(), Instant::now());
+    let cancels: Vec<&sip_core::Request> = acts
+        .iter()
+        .filter_map(|a| match a {
+            Action::Send(SipMessage::Request(r), _) if r.method == Method::Cancel => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cancels.len(), 1, "one CANCEL for the pending sibling");
+    let leg2_branch = fwds[1]
+        .headers
+        .first_via()
+        .and_then(|v| v.branch.clone())
+        .unwrap();
+    assert_eq!(
+        cancels[0]
+            .headers
+            .first_via()
+            .and_then(|v| v.branch.clone())
+            .as_deref(),
+        Some(leg2_branch.as_str()),
+        "CANCEL branch matches the sibling's forked INVITE"
+    );
+}
+
+#[test]
+fn leg_100_is_never_forwarded() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    let fwds = forked_at(&mut proxy, &["10.5.5.5:5060"]);
+
+    // A leg-generated 100 Trying MUST NOT forward (§16.7 step 5).
+    let r100 = leg_response(&fwds[0], 100, "Trying");
+    let acts = proxy.process_response(&r100, "10.5.5.5:5060".parse().unwrap(), Instant::now());
+    assert!(acts.is_empty(), "100 dropped");
+
+    // A 180 forwards immediately.
+    let r180 = leg_response(&fwds[0], 180, "Ringing");
+    let acts = proxy.process_response(&r180, "10.5.5.5:5060".parse().unwrap(), Instant::now());
+    assert_eq!(acts.len(), 1);
+    assert!(matches!(&acts[0], Action::Send(SipMessage::Response(r), _) if r.code == 180));
+}
+
+#[test]
+fn timer_c_extends_ringing_leg_and_cancels_on_fire() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    let fwds = forked_at(&mut proxy, &["10.5.5.5:5060"]);
+    let t0 = Instant::now();
+
+    // The leg rings at t0+1s: Timer C resets the pending deadline to
+    // t0+1s+240s — the leg must SURVIVE Timer B's 32 s (the Task 56
+    // regression this pins).
+    let r180 = leg_response(&fwds[0], 180, "Ringing");
+    let _ = proxy.process_response(
+        &r180,
+        "10.5.5.5:5060".parse().unwrap(),
+        t0 + Duration::from_secs(1),
+    );
+    assert_eq!(
+        proxy.poll(t0 + Duration::from_secs(32)).len(),
+        0,
+        "no Timer B kill at 32 s"
+    );
+    assert_eq!(proxy.leg_count(), 1, "leg still ringing");
+
+    // Timer C fires at t0+241s: §16.8 — the leg RANG, so a CANCEL goes to
+    // it; the fork completes with no finals → 408 upstream.
+    let acts = proxy.poll(t0 + Duration::from_secs(1) + proxy_timer_c() + Duration::from_secs(1));
+    let cancels = acts
+        .iter()
+        .filter(
+            |a| matches!(a, Action::Send(SipMessage::Request(r), _) if r.method == Method::Cancel),
+        )
+        .count();
+    assert_eq!(cancels, 1, "Timer-C fire CANCELs the ringing leg");
+    assert!(acts
+        .iter()
+        .any(|a| matches!(a, Action::Send(SipMessage::Response(r), _) if r.code == 408)));
+    assert_eq!(proxy.leg_count(), 0);
+}
+
+fn proxy_timer_c() -> Duration {
+    Duration::from_secs(240)
+}
+
+#[test]
+fn silent_leg_dies_at_timer_b_without_cancel() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    let _fwds = forked_at(&mut proxy, &["10.5.5.5:5060"]);
+    let t0 = Instant::now();
+
+    // No provisional ever arrived: §16.8 — NO CANCEL, straight to the 408.
+    let acts = proxy.poll(t0 + T64 + T1);
+    assert!(acts.iter().all(
+        |a| !matches!(a, Action::Send(SipMessage::Request(r), _) if r.method == Method::Cancel)
+    ));
+    assert!(acts
+        .iter()
+        .any(|a| matches!(a, Action::Send(SipMessage::Response(r), _) if r.code == 408)));
+}
+
+#[test]
+fn retransmitted_final_after_completion_acks_but_never_reforwards() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    let fwds = forked_at(&mut proxy, &["10.5.5.5:5060"]);
+    let t0 = Instant::now();
+
+    // Single leg: the 486 completes the fork and forwards immediately.
+    let r486 = leg_response(&fwds[0], 486, "Busy Here");
+    let acts = proxy.process_response(&r486, "10.5.5.5:5060".parse().unwrap(), t0);
+    assert!(acts
+        .iter()
+        .any(|a| matches!(a, Action::Send(SipMessage::Response(r), _) if r.code == 486)));
+
+    // The leg retransmits the 486 (our ACK was lost): the client tx
+    // re-ACKs it (§17.1.1.1) but the response does NOT forward upstream
+    // again — exactly one final per fork (§16.7 step 5).
+    let acts = proxy.process_response(&r486, "10.5.5.5:5060".parse().unwrap(), t0);
+    assert!(
+        acts.iter()
+            .all(|a| matches!(a, Action::Send(SipMessage::Request(_), _))),
+        "only the re-ACK leaves"
+    );
+}
+
+#[test]
+fn non_invite_finals_follow_the_same_best_response_path() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    proxy
+        .routes
+        .exact
+        .insert("bob".into(), vec!["10.5.5.5:5060".into()]);
+    let bye = RequestBuilder::new(Method::Bye, SipUri::parse("sip:bob@example.com").unwrap())
+        .via(TransportKind::Udp, "10.0.0.9:5060", Some("z9hG4bKbye"))
+        .from("<sip:bob@example.com>;tag=c1")
+        .to("<sip:bob@example.com>;tag=t9")
+        .call_id(Some("pcall-1"))
+        .cseq(2)
+        .build();
+    let t0 = Instant::now();
+    let actions = proxy.process_request(&bye, SRC, false, t0);
+    let fwd = forked_requests(&actions).remove(0);
+
+    // The leg's 480 completes the non-INVITE fork → forwarded. (No ACK:
+    // §17.1.1 ACK generation is INVITE-only.)
+    let r480 = leg_response(&fwd, 480, "Temporarily Unavailable");
+    let acts = proxy.process_response(&r480, "10.5.5.5:5060".parse().unwrap(), t0);
+    assert_eq!(acts.len(), 1);
+    assert!(matches!(&acts[0], Action::Send(SipMessage::Response(r), _) if r.code == 480));
+}
