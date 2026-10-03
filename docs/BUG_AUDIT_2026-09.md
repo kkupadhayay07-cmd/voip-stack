@@ -89,7 +89,7 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **669 passing** across 73 suites, `clippy -D warnings`
+`cargo test --workspace` → **671 passing** across 74 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
 **The external audit is fully closed**: every finding at every severity —
@@ -367,3 +367,24 @@ same discipline.
 Net after Task 54: **669 tests / 73 suites** (was 656/70) — dialog 0→12
 (new crate), b2bua 50→51 (`dialog_cseq`). No external-audit items affected;
 all previous fixes re-verified green.
+
+## Task 55 — in-dialog SDP renegotiation relay (self-audit findings)
+
+The renegotiation work (RFC 3264 §8 relay in the B2BUA) began with a
+read-through of the existing re-INVITE/refresh/pump plumbing; one real
+defect surfaced in code that predates the feature:
+
+| ID | Finding | Severity | Fix |
+|----|---------|----------|-----|
+| T55-1 | The leg-A media pump's send target was seeded from OUR ANSWER's `c=`/`m=` (which carries our own `media_host:a_port`) instead of the caller's OFFER address — at pump start the B2BUA sent leg A's outbound RTP INTO ITS OWN RECEIVE SOCKET (self-echo) until the first inbound packet latched the pump to the caller's real address. Any caller that speaks was masked by latching; a silent caller (recvonly peer, early hold) would never have received media | **Major** (latent, latching-masked) | The seed is now derived from the caller's OFFER plan (`stream_plans` of the INVITE body) — the answer plan's connection is our own address and was never a valid send target; the renegotiation completion re-seeds from the caller's NEW offer the same way, so a moved media address is followed without waiting for latching. Pinned by the `renegotiation` move test: the caller goes completely silent on both sockets after the renegotiation, so no latch correction is possible, and bridged media still reaches the NEW socket |
+
+Feature-work hazards caught during development (not shipped defects): the
+equal-CSeq retransmission of a parked renegotiation must NOT be answered
+with the cached refresh 200 (the relayed answer does not exist yet) — the
+pending state now holds it; the fake-UAS test harness's tag-less 200 was
+correctly rejected as a foreign fork by the Task 54 `on_response` rule
+(the harness was wrong, the engine was right).
+
+Net after Task 55: **671 tests / 74 suites** (was 669/73) — b2bua 51→53
+(`renegotiation`, +2). No external-audit items affected; all previous
+fixes re-verified green.

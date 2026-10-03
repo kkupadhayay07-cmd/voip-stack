@@ -154,6 +154,32 @@ enum BInviteKind {
     Dial,
     /// A session-timer refresh re-INVITE (RFC 4028 §7.2).
     Refresh,
+    /// An in-dialog renegotiation re-INVITE relaying the caller's new
+    /// offer downstream (RFC 3264 §8) — or, with `b_reneg_rollback` set,
+    /// the roll-back to the original offer after a media-changing answer.
+    Renegotiate,
+}
+
+/// A caller-initiated renegotiation in flight (RFC 3264 §8): the caller's
+/// re-INVITE is held unanswered while our offer travels to leg B.
+struct AReneg {
+    /// The caller's re-INVITE (the eventual 200 is built from it).
+    req: Request,
+    /// Its CSeq — equal-CSeq retransmissions are held silent, higher ones
+    /// glare 491 while the relay is in flight (§14.2).
+    cseq: u32,
+    /// Where the eventual response goes (the request's transport source).
+    src: SocketAddr,
+    /// Our precomputed answer to the caller's new offer (the 200 body).
+    answer: String,
+    /// The offer we put on leg B (becomes `b_offer` on success).
+    b_offer: String,
+    /// The caller's new media plan from OUR answer (a.plan on success).
+    a_plan: Option<StreamPlan>,
+    /// The caller's new plan from ITS offer — where it receives media.
+    /// This (not the answer plan, whose connection is our own media_host)
+    /// is what the leg-A pump's send target must follow.
+    a_offer_plan: Option<StreamPlan>,
 }
 
 struct Call {
@@ -201,6 +227,13 @@ struct Call {
     /// with the transaction; without this a dead caller leaks the call and
     /// both media pumps forever).
     a_ack_deadline: Option<Instant>,
+    /// Pending caller-initiated renegotiation (RFC 3264 §8): the caller's
+    /// re-INVITE is parked until leg B answers our relayed offer.
+    a_reneg: Option<AReneg>,
+    /// The leg-B re-INVITE currently in flight is a ROLLBACK (its answer
+    /// changed the negotiated media): the 2xx restores the original media
+    /// and must NOT be relayed to leg A (already failed 488).
+    b_reneg_rollback: bool,
     created: Instant,
 }
 
@@ -230,6 +263,8 @@ impl Call {
             a_prack_acked: None,
             b_421_retried: false,
             a_ack_deadline: None,
+            a_reneg: None,
+            b_reneg_rollback: false,
             created: Instant::now(),
         }
     }
@@ -415,8 +450,16 @@ impl B2bua {
             // RFC 4028 clocks: refresh at half the interval when we are the
             // refresher (§9), teardown when a leg lets the clock run out
             // (§10).
+            let a_reneg_pending = c.a_reneg.is_some();
             if let Some(a) = c.leg_a.as_mut() {
                 match leg_timer_action(a, now) {
+                    // A caller-initiated renegotiation is mid-relay: a
+                    // self-originated re-INVITE now would glare against the
+                    // parked caller offer (§14.2). The renegotiation's 200
+                    // re-anchors this clock.
+                    Some(TimerAction::Refresh) if a_reneg_pending => {
+                        tracing::debug!(call_id = %id, "leg A refresh deferred: renegotiation pending");
+                    }
                     Some(TimerAction::Refresh) => {
                         let cseq = a.dialog.take_cseq();
                         let body = a
@@ -774,6 +817,9 @@ impl B2bua {
                                     .await;
                             }
                             BInviteKind::Refresh => self.on_b_refreshed(sock, calls, &a_id, &r),
+                            BInviteKind::Renegotiate => {
+                                self.on_b_renegotiated(sock, calls, b_to_a, &a_id, &r).await;
+                            }
                         }
                     } else {
                         // 421 Extension Required on the initial dial: the
@@ -826,6 +872,10 @@ impl B2bua {
                                     }
                                 }
                                 teardown(calls, b_to_a, &a_id, "leg B rejected", Some(r.code));
+                            }
+                            BInviteKind::Renegotiate => {
+                                self.on_b_renegotiation_failed(sock, calls, b_to_a, &a_id, &r)
+                                    .await;
                             }
                             BInviteKind::Refresh => {
                                 // Refresh refused: the session is over
@@ -1751,6 +1801,18 @@ impl B2bua {
             }
         }
 
+        // RFC 3264: the caller's OFFER carries its media address (where we
+        // SEND on leg A); our answer carries our own. The leg-A pump seed
+        // must therefore come from the offer — seeding from the answer
+        // pointed the pump at our own media_host:a_port (self-echo), which
+        // only latching on the first inbound packet used to mask.
+        let a_offer_plan = call
+            .leg_a
+            .as_ref()
+            .and_then(|l| l.invite.as_ref())
+            .and_then(|i| sdp::parse::parse(&String::from_utf8_lossy(&i.body)).ok())
+            .and_then(|o| stream_plans(&o).into_iter().find(|p| p.codec.is_some()));
+
         // Start both media pumps.
         let sockets = (
             call.leg_a.as_ref().and_then(|l| l.rtp.clone()),
@@ -1829,7 +1891,13 @@ impl B2bua {
                                 if let Some(pair) = a_remote {
                                     *ha.remote.lock().await = Some(pair);
                                 } else {
-                                    seed_remote(&ha, &pa).await;
+                                    // Seed from the caller's OFFER address;
+                                    // latching then corrects any stale seed
+                                    // on the first inbound packet.
+                                    match a_offer_plan.as_ref() {
+                                        Some(op) => seed_remote(&ha, op).await,
+                                        None => seed_remote(&ha, &pa).await,
+                                    }
                                 }
                                 if let Some(pair) = b_remote {
                                     *hb.remote.lock().await = Some(pair);
@@ -2216,7 +2284,8 @@ impl B2bua {
 
     /// In-dialog re-INVITE on leg A: refresh (no change) → 200 with the
     /// cached answer; glare (initial transaction unfinished) → 491; SDP
-    /// change → 488 (renegotiation unsupported).
+    /// change → a media-preserving renegotiation relay to leg B (RFC 3264
+    /// §8) — B re-INVITE, answer back, then 200; unsupported changes → 488.
     async fn on_a_reinvite(
         &self,
         sock: &Arc<UdpSocket>,
@@ -2225,6 +2294,9 @@ impl B2bua {
         src: SocketAddr,
         local: SocketAddr,
     ) {
+        // Pending renegotiation CSeq, read before the leg borrow: an equal
+        // CSeq below is held, a higher one glares.
+        let reneg_cseq = call.a_reneg.as_ref().map(|r| r.cseq);
         let Some(a) = call.leg_a.as_mut() else {
             return;
         };
@@ -2273,18 +2345,31 @@ impl B2bua {
         if let Some(c) = req.headers.get("Contact") {
             a.dialog.refresh_target(c.to_string());
         }
+        // Renegotiation mid-relay: an EQUAL CSeq is the same request
+        // retransmitted — it is answered when leg B's answer comes back
+        // (responding now would end the transaction before the relayed
+        // answer exists); a NEW CSeq while our offer is in flight is glare
+        // (§14.2).
+        if let Some(pending) = reneg_cseq {
+            if seq == pending {
+                return;
+            }
+            let resp = sip_core::builder::respond_to(req, 491, "Request Pending", Vec::new(), None);
+            let _ = sock
+                .send_to(&serialize(&SipMessage::Response(resp)), src)
+                .await;
+            return;
+        }
         let original_offer = a
             .invite
             .as_ref()
             .map(|i| i.body.clone())
             .unwrap_or_default();
         if !req.body.is_empty() && req.body != original_offer {
-            tracing::info!(call_id = %a.dialog.call_id(), "re-INVITE SDP change unsupported");
-            let resp =
-                sip_core::builder::respond_to(req, 488, "Not Acceptable Here", Vec::new(), None);
-            let _ = sock
-                .send_to(&serialize(&SipMessage::Response(resp)), src)
-                .await;
+            // A changed offer: attempt a media-preserving renegotiation
+            // relay (RFC 3264 §8) — re-INVITE leg B, relay its answer back,
+            // then 200. `start_reneg_relay` owns every failure answer.
+            self.start_reneg_relay(sock, call, req, seq, src).await;
             return;
         }
         // Successful refresh: re-anchor the RFC 4028 clock on this leg.
@@ -2477,6 +2562,438 @@ impl B2bua {
         let _ = sock
             .send_to(&serialize(&SipMessage::Response(response)), src)
             .await;
+    }
+
+    /// Relays a caller-initiated renegotiation offer to leg B (RFC 3264
+    /// §8). Media-preserving only: the running pumps bake the codec and
+    /// payload types, so a re-offer that changes the negotiated codec/PT
+    /// is rejected 488 (pump reconfiguration is a documented follow-up).
+    /// WebRTC legs reject 488 as well — ICE/DTLS renegotiation is
+    /// unmodelled. The caller's re-INVITE stays UNANSWERED until leg B's
+    /// answer comes back: equal CSeq is held, higher CSeq glares 491.
+    async fn start_reneg_relay(
+        &self,
+        sock: &Arc<UdpSocket>,
+        call: &mut Call,
+        req: &Request,
+        seq: u32,
+        src: SocketAddr,
+    ) {
+        let call_id = call
+            .leg_a
+            .as_ref()
+            .map(|a| a.dialog.call_id().to_string())
+            .unwrap_or_default();
+        // Renegotiation is plain-RTP only today.
+        let webrtc_leg = call
+            .leg_a
+            .as_ref()
+            .is_some_and(|a| a.webrtc.is_some() || a.webrtc_offer.is_some())
+            || call
+                .leg_b
+                .as_ref()
+                .is_some_and(|b| b.webrtc.is_some() || b.webrtc_offer.is_some());
+        if webrtc_leg {
+            tracing::info!(%call_id, "renegotiation on a WebRTC leg unsupported: 488");
+            let resp =
+                sip_core::builder::respond_to(req, 488, "Not Acceptable Here", Vec::new(), None);
+            let _ = sock
+                .send_to(&serialize(&SipMessage::Response(resp)), src)
+                .await;
+            return;
+        }
+        let ports = {
+            let Some(b) = call.leg_b.as_ref() else {
+                let resp = sip_core::builder::respond_to(
+                    req,
+                    488,
+                    "Not Acceptable Here",
+                    Vec::new(),
+                    None,
+                );
+                let _ = sock
+                    .send_to(&serialize(&SipMessage::Response(resp)), src)
+                    .await;
+                return;
+            };
+            if !b.dialog.is_confirmed() || call.b_tx.is_some() {
+                // The callee is mid-dial, mid-refresh or mid-renegotiation:
+                // glare (§14.2).
+                tracing::info!(%call_id, "renegotiation glare with leg B: 491");
+                let resp =
+                    sip_core::builder::respond_to(req, 491, "Request Pending", Vec::new(), None);
+                let _ = sock
+                    .send_to(&serialize(&SipMessage::Response(resp)), src)
+                    .await;
+                return;
+            }
+            let a_port = call
+                .leg_a
+                .as_ref()
+                .and_then(|a| a.rtp.as_ref())
+                .and_then(|s| s.local_addr().ok())
+                .map(|a| a.port())
+                .unwrap_or(0);
+            let b_port = b
+                .rtp
+                .as_ref()
+                .and_then(|s| s.local_addr().ok())
+                .map(|a| a.port())
+                .unwrap_or(0);
+            (a_port, b_port)
+        };
+        let (a_port, b_port) = ports;
+        if a_port == 0 || b_port == 0 {
+            tracing::info!(%call_id, "renegotiation without a bound media socket: 488");
+            let resp =
+                sip_core::builder::respond_to(req, 488, "Not Acceptable Here", Vec::new(), None);
+            let _ = sock
+                .send_to(&serialize(&SipMessage::Response(resp)), src)
+                .await;
+            return;
+        }
+        let offer = match sdp::parse::parse(&String::from_utf8_lossy(&req.body)) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::info!(%call_id, "renegotiation offer unparseable: {e}");
+                let resp = sip_core::builder::respond_to(req, 400, "Bad Request", Vec::new(), None);
+                let _ = sock
+                    .send_to(&serialize(&SipMessage::Response(resp)), src)
+                    .await;
+                return;
+            }
+        };
+        // Answer the caller's offer on the SAME receive socket (the pump
+        // owns it) and require the negotiated media to be unchanged.
+        let answer =
+            match sdp_util::answer(&offer, &self.cfg.media_host, a_port, &self.cfg.codecs, None) {
+                Ok(ans) => ans,
+                Err(e) => {
+                    tracing::info!(%call_id, "renegotiation offer not negotiable: {e:?}");
+                    let resp = sip_core::builder::respond_to(
+                        req,
+                        488,
+                        "Not Acceptable Here",
+                        Vec::new(),
+                        None,
+                    );
+                    let _ = sock
+                        .send_to(&serialize(&SipMessage::Response(resp)), src)
+                        .await;
+                    return;
+                }
+            };
+        let a_plan = stream_plans(&answer)
+            .into_iter()
+            .find(|p| p.codec.is_some());
+        // Where the caller now RECEIVES: its offer's c=/m= line. The pump's
+        // send target follows this (never our answer's connection, which is
+        // our own media_host).
+        let a_offer_plan = stream_plans(&offer).into_iter().find(|p| p.codec.is_some());
+        let media_preserved = match (&call.leg_a.as_ref().and_then(|a| a.plan.clone()), &a_plan) {
+            (Some(cur), Some(np)) => {
+                cur.codec == np.codec
+                    && cur.local_pt == np.local_pt
+                    && cur.telephone_event_pt == np.telephone_event_pt
+            }
+            _ => false,
+        };
+        if !media_preserved {
+            tracing::info!(%call_id, "renegotiation changes the negotiated media: 488");
+            let resp =
+                sip_core::builder::respond_to(req, 488, "Not Acceptable Here", Vec::new(), None);
+            let _ = sock
+                .send_to(&serialize(&SipMessage::Response(resp)), src)
+                .await;
+            return;
+        }
+        // New offer toward leg B on the SAME receive socket, mirroring the
+        // dial path (media_host + b_port + the configured codec list).
+        let offer_b = sdp_util::build_offer(
+            &self.cfg.media_host,
+            b_port,
+            &self.cfg.codecs,
+            rand::thread_rng().gen(),
+        )
+        .serialize();
+        let (cseq, dst) = {
+            let Some(b) = call.leg_b.as_mut() else {
+                return;
+            };
+            (b.dialog.take_cseq(), b.dialog.remote_addr())
+        };
+        let invite = {
+            let Some(b) = call.leg_b.as_ref() else {
+                return;
+            };
+            refresh_reinvite(b, cseq, false, offer_b.clone().into_bytes())
+        };
+        let mut tx = ClientInviteTx::new(invite, TxTransport::Udp);
+        for act in tx.on_event(TxEvent::Send, Instant::now()) {
+            if let TxAction::SendRequest(r) = act {
+                let _ = sock.send_to(&serialize(&SipMessage::Request(r)), dst).await;
+            }
+        }
+        call.b_tx = Some(tx);
+        call.b_tx_kind = BInviteKind::Renegotiate;
+        tracing::info!(%call_id, "renegotiation relayed to leg B (cseq {cseq})");
+        call.a_reneg = Some(AReneg {
+            req: req.clone(),
+            cseq: seq,
+            src,
+            answer: answer.serialize(),
+            b_offer: offer_b,
+            a_plan,
+            a_offer_plan,
+        });
+    }
+
+    /// A 2xx to our renegotiation re-INVITE on leg B: adopt the answer,
+    /// re-point the pump, then complete the parked caller renegotiation
+    /// with a 200. A media-changing answer is the RFC 3264 §8 failure case:
+    /// 488 to the caller (session unchanged) + a roll-back re-INVITE to B.
+    async fn on_b_renegotiated(
+        &self,
+        sock: &Arc<UdpSocket>,
+        calls: &mut HashMap<String, Call>,
+        _b_to_a: &mut HashMap<String, String>,
+        a_id: &str,
+        resp: &Response,
+    ) {
+        let rollback = calls.get(a_id).is_some_and(|c| c.b_reneg_rollback);
+        let Some(call) = calls.get_mut(a_id) else {
+            return;
+        };
+        let Some(b) = call.leg_b.as_mut() else {
+            return;
+        };
+        let to_tag = resp
+            .headers
+            .get("To")
+            .and_then(|t| sip_core::uri::NameAddr::parse(t).ok())
+            .and_then(|n| n.tag);
+        if b.dialog.on_response(to_tag.as_deref()) == DialogMatch::Mismatch {
+            tracing::warn!(call_id = %a_id, "renegotiation 2xx with a foreign To tag ignored");
+            return;
+        }
+        if let Some(c) = resp.headers.get("Contact") {
+            b.dialog.refresh_target(c.to_string());
+        }
+        b.dialog.confirm();
+        if let Some(t) = b.timer.as_mut() {
+            t.anchored = Instant::now();
+            t.pending = None;
+        }
+        if let Some(cseq) = resp.headers.cseq().map(|c| c.seq) {
+            self.send_ack(sock, b, cseq);
+        }
+        if rollback {
+            // B is back on the original media (the same offer it originally
+            // answered produces the same answer); the caller's re-INVITE
+            // was already failed 488 — nothing else to relay.
+            call.b_reneg_rollback = false;
+            tracing::info!(call_id = %a_id, "leg B media rollback confirmed");
+            return;
+        }
+        let Some(reneg) = call.a_reneg.take() else {
+            // No parked caller renegotiation (late 2xx after the caller
+            // gave up): adopt like a refresh — nothing to relay.
+            return;
+        };
+        let answer = sdp::parse::parse(&String::from_utf8_lossy(&resp.body)).ok();
+        let b_plan = answer
+            .as_ref()
+            .and_then(|s| stream_plans(s).into_iter().find(|p| p.codec.is_some()));
+        let media_preserved = match (&call.leg_b.as_ref().and_then(|l| l.plan.clone()), &b_plan) {
+            (Some(cur), Some(np)) => {
+                cur.codec == np.codec
+                    && cur.local_pt == np.local_pt
+                    && cur.telephone_event_pt == np.telephone_event_pt
+            }
+            _ => false,
+        };
+        if !media_preserved {
+            tracing::warn!(
+                call_id = %a_id,
+                "leg B renegotiation changed the media: 488 to caller + roll-back"
+            );
+            self.finish_a_reneg_failed(sock, calls, a_id, 488, "Not Acceptable Here")
+                .await;
+            self.start_b_rollback(sock, calls, a_id).await;
+            return;
+        }
+        // Adopt B's answer, re-point the pump at B's (possibly new) media
+        // address, then complete the caller's renegotiation.
+        if let (Some(np), Some(b)) = (b_plan, call.leg_b.as_mut()) {
+            b.plan = Some(np.clone());
+            if let Some(h) = b.media.as_ref() {
+                seed_remote(h, &np).await;
+            }
+        }
+        call.b_offer = reneg.b_offer.clone();
+        self.finish_a_reneg_ok(sock, calls, a_id, &reneg).await;
+    }
+
+    /// A non-2xx to our renegotiation re-INVITE on leg B.
+    async fn on_b_renegotiation_failed(
+        &self,
+        sock: &Arc<UdpSocket>,
+        calls: &mut HashMap<String, Call>,
+        b_to_a: &mut HashMap<String, String>,
+        a_id: &str,
+        resp: &Response,
+    ) {
+        if calls.get(a_id).is_some_and(|c| c.b_reneg_rollback) {
+            // The roll-back itself failed: B's media is no longer what the
+            // running pumps encode/decode — the call is unrecoverable.
+            tracing::error!(call_id = %a_id, "leg B media roll-back failed with {}", resp.code);
+            teardown(
+                calls,
+                b_to_a,
+                a_id,
+                "leg B media roll-back failed",
+                Some(resp.code),
+            );
+            return;
+        }
+        // A failed re-INVITE leaves the session UNCHANGED (RFC 3264 §8):
+        // fail the caller's re-INVITE with B's code; the call survives.
+        let code = if resp.code < 400 { 500 } else { resp.code };
+        let reason = if resp.reason.is_empty() {
+            "Renegotiation failed"
+        } else {
+            resp.reason.as_str()
+        };
+        self.finish_a_reneg_failed(sock, calls, a_id, code, reason)
+            .await;
+    }
+
+    /// Completes a parked caller renegotiation: 200 with the precomputed
+    /// answer, leg-A state adoption and a pump re-seed toward the caller's
+    /// (possibly moved) media address.
+    async fn finish_a_reneg_ok(
+        &self,
+        sock: &Arc<UdpSocket>,
+        calls: &mut HashMap<String, Call>,
+        a_id: &str,
+        reneg: &AReneg,
+    ) {
+        let Some(call) = calls.get_mut(a_id) else {
+            return;
+        };
+        let Some(a) = call.leg_a.as_mut() else {
+            return;
+        };
+        let mut response = sip_core::builder::respond_to(
+            &reneg.req,
+            200,
+            "OK",
+            reneg.answer.clone().into_bytes(),
+            Some(a.dialog.local_tag()),
+        );
+        response.headers.add("Contact", "<sip:zrtc@b2bua>");
+        response.headers.add("Supported", "timer");
+        if let Some(t) = a.timer.as_ref() {
+            response.headers.add(
+                "Session-Expires",
+                format!(
+                    "{};refresher={}",
+                    t.interval,
+                    timers::refresher_for(t.role, true)
+                ),
+            );
+        }
+        let _ = sock
+            .send_to(&serialize(&SipMessage::Response(response)), reneg.src)
+            .await;
+        // Adopt the new session state and re-anchor the RFC 4028 clock.
+        if let Some(plan) = reneg.a_plan.clone() {
+            a.plan = Some(plan);
+        }
+        if let Some(t) = a.timer.as_mut() {
+            t.anchored = Instant::now();
+            t.pending = None;
+        }
+        // Re-seed the pump toward the caller's NEW media address BEFORE any
+        // media flows: the OFFER plan's c=/m= is where the caller receives
+        // (the answer plan's connection is our own media_host).
+        if let (Some(h), Some(op)) = (a.media.as_ref(), reneg.a_offer_plan.as_ref()) {
+            seed_remote(h, op).await;
+        }
+        if let Some(call) = calls.get_mut(a_id) {
+            call.a_answer = reneg.answer.clone();
+        }
+        tracing::info!(call_id = %a_id, "renegotiation complete: caller answer relayed");
+    }
+
+    /// Fails a parked caller renegotiation (RFC 3264 §8: a failed
+    /// re-INVITE leaves the session unchanged — the call survives with the
+    /// original media).
+    async fn finish_a_reneg_failed(
+        &self,
+        sock: &Arc<UdpSocket>,
+        calls: &mut HashMap<String, Call>,
+        a_id: &str,
+        code: u16,
+        reason: &str,
+    ) {
+        let Some(call) = calls.get_mut(a_id) else {
+            return;
+        };
+        let Some(reneg) = call.a_reneg.take() else {
+            return;
+        };
+        let Some(a) = call.leg_a.as_ref() else {
+            return;
+        };
+        let response = sip_core::builder::respond_to(
+            &reneg.req,
+            code,
+            reason,
+            Vec::new(),
+            Some(a.dialog.local_tag()),
+        );
+        let _ = sock
+            .send_to(&serialize(&SipMessage::Response(response)), reneg.src)
+            .await;
+        tracing::info!(call_id = %a_id, "renegotiation failed with {code}: session unchanged");
+    }
+
+    /// Rolls leg B back to its original offer after a renegotiation whose
+    /// answer changed the negotiated media: a re-INVITE carrying the
+    /// ORIGINAL `b_offer` (the one B originally answered).
+    async fn start_b_rollback(
+        &self,
+        sock: &Arc<UdpSocket>,
+        calls: &mut HashMap<String, Call>,
+        a_id: &str,
+    ) {
+        let Some(call) = calls.get_mut(a_id) else {
+            return;
+        };
+        let offer = call.b_offer.clone();
+        let (cseq, dst) = {
+            let Some(b) = call.leg_b.as_mut() else {
+                return;
+            };
+            (b.dialog.take_cseq(), b.dialog.remote_addr())
+        };
+        let invite = {
+            let Some(b) = call.leg_b.as_ref() else {
+                return;
+            };
+            refresh_reinvite(b, cseq, false, offer.into_bytes())
+        };
+        let mut tx = ClientInviteTx::new(invite, TxTransport::Udp);
+        for act in tx.on_event(TxEvent::Send, Instant::now()) {
+            if let TxAction::SendRequest(r) = act {
+                let _ = sock.send_to(&serialize(&SipMessage::Request(r)), dst).await;
+            }
+        }
+        call.b_tx = Some(tx);
+        call.b_tx_kind = BInviteKind::Renegotiate;
+        call.b_reneg_rollback = true;
+        tracing::info!(call_id = %a_id, "leg B media roll-back sent (cseq {cseq})");
     }
 
     /// RFC 3262 §4 (UAS side): the caller's PRACK for our reliable 1xx.

@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 669 tests passing across 73 suites in 22 crates;
+**Current state: 671 tests passing across 74 suites in 22 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
@@ -60,7 +60,13 @@ requests whose CSeq is BELOW the peer's high-water mark are now rejected
 500 per §12.2.2 (an equal CSeq is answered idempotently as a
 retransmission), Contacts on in-dialog requests refresh the remote target,
 and a 2xx from a foreign To tag (a fork) is ignored instead of clobbering
-the adopted dialog — all pinned by wire-level integration tests.
+the adopted dialog — all pinned by wire-level integration tests.** In-dialog
+SDP renegotiation (RFC 3264 §8) is now relayed end to end on plain-RTP legs:
+a caller re-INVITE with a changed offer is re-offered to leg B, the answer
+comes back as the caller's 200 body, the media pump follows the caller's
+MOVED media address (seeded from the offer's `c=`/`m=` — which also fixed a
+latent self-echo seed bug), and a codec-changing re-offer is rejected 488
+with the call surviving (leg B rolled back to its original offer).
 
 ## Workspace layout
 
@@ -95,7 +101,7 @@ the adopted dialog — all pinned by wire-level integration tests.
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 669 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 671 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -332,6 +338,13 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
    **connection-time candidate failover done**; **GRUU/Outbound done ✅**
    (RFC 5626 flow keep-alives + `Flow-Timer` + registration refresh, RFC 5627
    pub-gruu synthesis end to end).
+6. In-dialog SDP renegotiation (RFC 3264 §8) relay in the B2BUA.
+   ✅ **done** — a caller re-INVITE with a changed offer is relayed to
+   leg B (glare 491 while pending, equal-CSeq held), the callee's answer
+   completes the caller's 200, the pump re-seeds to a moved media address
+   (`renegotiation` integration test pins the move + the 488-survival
+   path); media-preserving only — pump codec reconfiguration and WebRTC
+   (ICE/DTLS) renegotiation remain 488.
 
 ## Documentation
 

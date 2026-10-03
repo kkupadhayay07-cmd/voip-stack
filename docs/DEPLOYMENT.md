@@ -216,6 +216,13 @@ configured bounds. Guidance:
    out-of-order CSeq rejection (500) + retransmission idempotence +
    in-dialog target refresh live in the engine (`dialog_cseq` integration
    test). `sip-tx` adoption in the proxy remains open.
+5. **In-dialog SDP renegotiation** (RFC 3264 §8) ✅ shipped — the caller's
+   changed re-INVITE offer is relayed to leg B and the answer completes
+   the caller's 200; media-preserving (codec/PT must be unchanged — the
+   pumps bake them), pump re-seeds to a moved media address, 488+rollback
+   keeps the call alive on a media-changing answer (`renegotiation`
+   integration test). Pump codec reconfiguration and WebRTC (ICE/DTLS)
+   renegotiation remain 488.
 2. **Load harness** ✅ shipped — `zrtc load` (`--calls`/`--concurrency`/`--pace-ms`,
    `--json`) drives N concurrent calls through the full pipeline and reports
    setup-latency percentiles + failure breakdowns; `demo/soak.sh` adds a

@@ -28,8 +28,8 @@ legs in the B2BUA (RFC 5763/5764/8445/3711: SAVPF offers answered with ICE
 → DTLS-SRTP → SRTP pump crypto, and `webrtc` routes dialing downstream with
 a SAVPF offer as the ICE-controlling offerer, with the RFC 8841 mirror
 policy offering the data channel downstream when the caller did, and
-channels closing per RFC 8831 §6.7 via RFC 6525 stream reset); 669 tests green
-across 73 suites — **every audit finding at every severity is fixed**).
+channels closing per RFC 8831 §6.7 via RFC 6525 stream reset); 671 tests green
+across 74 suites — **every audit finding at every severity is fixed**).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
@@ -130,10 +130,16 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
   early dialogs under one Call-ID) is not tracked — a 2xx from a foreign
   To tag is ignored — and the dialog package does not model a Route set
   (no Record-Route through the B2BUA).
-* **In-dialog SDP renegotiation**: re-INVITEs that would change the session
-  (hold, codec change) are answered 488 instead of renegotiating; only
-  no-change refreshes are accepted. A PRACK carrying an SDP offer is
-  likewise answered 488 (no early-media renegotiation).
+* **In-dialog SDP renegotiation**: caller-initiated re-INVITEs are now
+  RELAYED end to end on plain-RTP legs (RFC 3264 §8) — media-preserving
+  only: the re-offer must keep the negotiated codec/PT (the running pumps
+  bake them), so hold/port moves and direction changes are accepted while
+  a codec change is answered 488 with leg B rolled back to its original
+  offer (the call survives). Not covered: renegotiation on WebRTC legs
+  (ICE/DTLS re-establishment is unmodelled), pump codec reconfiguration
+  mid-call, leg-B-initiated renegotiation relay (a same-media re-INVITE
+  from leg B is answered locally), and a PRACK carrying an SDP offer
+  (answered 488 — no early-media renegotiation).
 * **PRACK/100rel scope**: exactly one reliable 1xx per call attempt (the
   180) — no 183 progress responses, no RSeq sequence across multiple
   provisional responses; reliable 1xx to our own re-INVITEs (session
@@ -199,7 +205,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **669 passing across 73 suites**.
+  `cargo test --workspace` → **671 passing across 74 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16 + §17.1/§17.3
   SRTCP AEAD), STUN (RFC 5769 §2.1/§2.2; MD5 long-term keys + MESSAGE-INTEGRITY
   against independent vectors), G.729 (bcg729 oracle), cross-decode by ffmpeg.

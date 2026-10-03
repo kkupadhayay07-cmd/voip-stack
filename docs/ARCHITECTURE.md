@@ -184,7 +184,15 @@ consume with `take_cseq`; the peer high-water mark checked with
 §12.2.2, an equal CSeq is a retransmission answered idempotently) and the
 remote target with §12.2 request-URI routing. The B2BUA's `Leg` carries
 one; media/transport state (plan, sockets, pumps, WebRTC, crypto) stays
-on the leg beside it.
+on the leg beside it. A caller re-INVITE with a CHANGED offer rides the
+same state: the engine relays it as a leg-B re-INVITE (`BInviteKind::Renegotiate`
+in the leg-B client-transaction slot), holds equal-CSeq retransmissions
+until the relay resolves, glares 491 against new requests, and completes
+the parked request with the precomputed answer — media-preserving only
+(codec/PT must match the running pumps, else 488 + roll-back); the pump's
+send target follows the caller's OFFER `c=`/`m=` (never the answer's,
+which is our own address — seeding from the answer was a self-echo bug,
+T55-1).
 
 ### 5.2 Media (one leg)
 
