@@ -28,8 +28,8 @@ legs in the B2BUA (RFC 5763/5764/8445/3711: SAVPF offers answered with ICE
 → DTLS-SRTP → SRTP pump crypto, and `webrtc` routes dialing downstream with
 a SAVPF offer as the ICE-controlling offerer, with the RFC 8841 mirror
 policy offering the data channel downstream when the caller did, and
-channels closing per RFC 8831 §6.7 via RFC 6525 stream reset); 656 tests green
-across 70 suites — **every audit finding at every severity is fixed**).
+channels closing per RFC 8831 §6.7 via RFC 6525 stream reset); 669 tests green
+across 73 suites — **every audit finding at every severity is fixed**).
 
 Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 
@@ -42,7 +42,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 | RFC 3261 | SIP: stateful proxy (§16) | **Done** (core) | `proxy` crate: request validation (483), Route-set processing, Via prepend/pop, Record-Route, parallel forking, 100 Trying, CANCEL matching (§9.1), response routing (received/rport → sent-by). Fork state is in-memory only (no failover); adopting the `sip-tx` timer state machines in the proxy is a planned hardening step. |
 | RFC 3261 | SIP: transactions (§17) | **Done** (core) | `sip-tx` crate: client INVITE (Timers A/B/D), client non-INVITE (E/F/K), server INVITE (G/H/I), server non-INVITE (J); §17.1.3 response matching + §17.2.3 ACK matching; the non-2xx ACK carries a single top Via plus the original Route set (§17.1.1.2); the non-INVITE server transaction enters Proceeding on a provisional and matches retransmissions by branch+sent-by+CSeq AND method (§17.2.2); pure state machines, fake-clock tests at exact fire instants. The B2BUA drives both call legs through it. Connection-time failover across the trunk's RFC 3263 candidate list is live in the zrtc trunk client (see RFC 3263 row). |
 | RFC 3261 | SIP: transports (§18) | **Done** (core) | UDP/TCP/TLS/WSS listeners wired in the `zrtc` daemon (TLS via whitelisted OpenSSL, self-signed identity at startup, mTLS client certs for trunks); message layer covers datagram + stream framing incl. §18.3 robustness. |
-| RFC 3261 | SIP: dialogs (§12) | **Partial** | B2BUA tracks per-leg dialog state (tags/Call-ID/CSeq); generic dialog package not extracted. |
+| RFC 3261 | SIP: dialogs (§12) | **Done** (core) | `dialog` crate: per-dialog identity (Call-ID + local/remote tags), early→confirmed→terminated lifecycle, CSeq sequencing in both directions (send space §12.2.1.1, receive high-water §12.2.2 with New/Retransmission/OutOfOrder verdicts) and remote-target tracking with §12.2 request-URI routing (Contact-shape tolerant, address fallback). Live in the B2BUA on both legs: §12.2.2 is enforced end to end — in-dialog re-INVITE/UPDATE whose CSeq is BELOW the peer's high-water mark are rejected 500, an EQUAL CSeq is answered idempotently as a retransmission, Contacts on in-dialog requests refresh the remote target, the establishing response's FIRST To tag is adopted (a foreign tag = a fork, ignored not clobbered) — pinned by the `dialog_cseq` integration test. Not claimed: forking (multiple early dialogs per Call-ID are not tracked), Route-set (Record-Route) handling inside the dialog package. |
 | RFC 3262 | PRACK / 100rel | **Done** (core) | B2BUA, both legs. UAS: reliable 180 (`Require: 100rel` + `RSeq` from [1, 2³¹−1], To-tagged early dialog) when the caller advertises 100rel, Timer-G-style retransmission (T1 doubling to T2) until `PRACK`, 64·T1 give-up with 503 + BYE, the final 200 parked until the PRACK arrives (§3), RAck matching with 481/400 verdicts and idempotent 200 for retransmitted PRACKs. UAC: only a 101–199 carrying BOTH `Require: 100rel` and `RSeq` is PRACKed (§4 — never a 100, never an unmarked 1xx), answered with PRACK carrying `RAck` (own dialog CSeq); a retransmitted 1xx (same `RSeq`) is answered by resending the STORED PRACK byte-identically (same CSeq number and branch, RFC 3261 §17.1.2); 421 Extension-Required dial retry once with the demanded extensions merged into `Supported` (§3); non-INVITE responses excluded from the INVITE transaction slot. |
 | RFC 3263 | DNS (NAPTR/SRV) for SIP | **Done** (client discovery) | `rfc3263` crate: RFC 1035 wire codec (name decompression with a strictly-backwards pointer rule + jump cap — loops are structurally rejected), NAPTR (RFC 2915) S-flag protocol selection from the service field (SIP+D2U/D2T, SIPS+D2T) with the replacement key as the next SRV query, SRV (RFC 2782) priority + weighted-random ordering (zero-weight last, seeded xorshift, deterministic in tests), A/AAAA fallback with transport-default ports (5060/5061), explicit-port short-circuit per §4.2, IP-literal fast path (no DNS). Client: UDP with one retransmission, TC→TCP fallback, ID-validated responses. Live on the zrtc outbound trunk: HOST / HOST:PORT / `sip:` URI / IPv6-literal addresses resolve through RFC 3263 into an ordered candidate list (SRV targets whose addresses fail are skipped — client-side failover to the next candidate), with a libc-resolver fallback when no nameserver is configured. **Connection-time failover is live**: `trunk::connect` walks the candidate list in priority order with a 3 s per-candidate connect budget (TCP/TLS/WSS) and pins `target`, keepalives and RTP to the winner. Remaining: NAPTR regexp rewrite (regexp-only NAPTRs are skipped), DNSSEC, mid-dialog re-resolution (an established session that dies does not yet re-resolve). |
 | RFC 3264 | Offer/answer | **Done** | `sdp::negotiate`: full RFC 3264 engine with `StreamPlan` projection. Answer direction is the explicit §6.1 matrix clamped to what the offer permits (sendonly offers can never draw a receiving answer, etc.), rejected m-lines are answered with their own m-line at port 0 and a null `c=` line of the offer's address type (§6), port-0 offers are answered port 0. The answer's own `o=`/`c=` lines pick `IN IP4`/`IN IP6` from the local host literal (RFC 8866 §4.4 — an IPv6 address is never mislabeled IP4); the offer's family never dictates the answer's. |
@@ -125,9 +125,11 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
   per-candidate connect budget, winner pinned for keepalives/RTP). Not yet
   covered: mid-dialog re-resolution for an established session whose peer
   dies, and DNS TTL-driven cache refresh.
-* **Standalone dialog layer (§12)**: the B2BUA tracks per-leg dialog state
-  (tags/Call-ID/CSeq, in-dialog re-INVITE/UPDATE with tag checks); a
-  reusable dialog package has not been extracted yet.
+* **Dialog layer (§12) remainders**: the state package is extracted
+  (`dialog` crate) and §12.2.2 ordering is enforced, but forking (several
+  early dialogs under one Call-ID) is not tracked — a 2xx from a foreign
+  To tag is ignored — and the dialog package does not model a Route set
+  (no Record-Route through the B2BUA).
 * **In-dialog SDP renegotiation**: re-INVITEs that would change the session
   (hold, codec change) are answered 488 instead of renegotiating; only
   no-change refreshes are accepted. A PRACK carrying an SDP offer is
@@ -197,7 +199,7 @@ Legend: **Done** · **Partial** · **Planned** (target phase in parentheses).
 ## 6. Verification methodology
 
 * Every public function carries tests (workspace rule); run
-  `cargo test --workspace` → **656 passing across 70 suites**.
+  `cargo test --workspace` → **669 passing across 73 suites**.
 * RFC conformance vectors: SRTP (RFC 3711 B.2/B.3, RFC 7714 §16 + §17.1/§17.3
   SRTCP AEAD), STUN (RFC 5769 §2.1/§2.2; MD5 long-term keys + MESSAGE-INTEGRITY
   against independent vectors), G.729 (bcg729 oracle), cross-decode by ffmpeg.

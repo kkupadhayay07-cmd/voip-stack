@@ -210,8 +210,12 @@ configured bounds. Guidance:
 
 ## 9. Roadmap
 
-1. **Dialog layer extraction** (§12) from the B2BUA's per-leg state;
-   `sip-tx` adoption in the proxy.
+1. **Dialog layer extraction** (§12) ✅ shipped — `crates/dialog` (the
+   stack's 22nd crate): dialog identity, lifecycle, both-direction CSeq
+   sequencing and remote-target tracking extracted from the B2BUA; §12.2.2
+   out-of-order CSeq rejection (500) + retransmission idempotence +
+   in-dialog target refresh live in the engine (`dialog_cseq` integration
+   test). `sip-tx` adoption in the proxy remains open.
 2. **Load harness** ✅ shipped — `zrtc load` (`--calls`/`--concurrency`/`--pace-ms`,
    `--json`) drives N concurrent calls through the full pipeline and reports
    setup-latency percentiles + failure breakdowns; `demo/soak.sh` adds a

@@ -89,7 +89,7 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **656 passing** across 70 suites, `clippy -D warnings`
+`cargo test --workspace` → **669 passing** across 73 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
 **The external audit is fully closed**: every finding at every severity —
@@ -349,3 +349,21 @@ Net after Task 53: **656 tests / 70 suites** (was 644/69) — sctp 52→63
 (`webrtc_datachan_close`: the channel close over a live leg with the
 association surviving and the CDR completing). No external-audit items
 affected; all previous fixes re-verified green.
+
+---
+
+## Task 54 — RFC 3261 §12 dialog-layer extraction: the ordering gap the extraction closed
+
+Scope note: a refactoring task (extract the per-leg dialog state into a
+reusable `dialog` crate), not an external-audit wave — but the extraction
+surfaced one real spec gap and one latent defect, recorded here with the
+same discipline.
+
+| ID | Finding | Severity | Fix |
+|----|---------|----------|-----|
+| D1 | The B2BUA never enforced RFC 3261 §12.2.2 CSeq ordering on in-dialog requests: a re-INVITE or UPDATE carrying a CSeq BELOW the last one received from the peer was processed as if fresh (the spec requires a 500 Server Internal Error) — a replayed or reordered refresh could re-anchor the RFC 4028 clock or re-answer the session | **Major** (spec + robustness) | `dialog::Dialog::check_remote_seq` tracks the peer's high-water mark per leg; `on_a_reinvite`/`on_b_reinvite`/`on_update` reject OutOfOrder with 500 and answer Retransmission (equal CSeq) idempotently through the normal path; a missing CSeq is a 400 (§8.1.1.5). Pinned by the `dialog_cseq` integration ladder (200 → 500 → 200 → 500 → 200) and 12 crate unit tests |
+| D2 | The leg-B 2xx handler adopted the To tag of EVERY 200 whose Call-ID matched: a second 2xx from a different fork would have silently re-targeted the leg-B dialog at the fork's tag | Minor (single-dialog engine; forking unmodeled) | `dialog::Dialog::on_response` formalizes the §12.2.1.1 rule: first tag adopted, retransmission matches, a foreign tag returns Mismatch and the response is ignored (logged) instead of clobbering the adopted dialog |
+
+Net after Task 54: **669 tests / 73 suites** (was 656/70) — dialog 0→12
+(new crate), b2bua 50→51 (`dialog_cseq`). No external-audit items affected;
+all previous fixes re-verified green.

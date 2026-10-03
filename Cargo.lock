@@ -179,6 +179,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "codecs",
+ "dialog",
  "dtls",
  "ice",
  "observ",
@@ -474,6 +475,13 @@ dependencies = [
  "cdr",
  "thiserror 2.0.21",
  "tokio",
+]
+
+[[package]]
+name = "dialog"
+version = "0.1.0"
+dependencies = [
+ "sip-core",
 ]
 
 [[package]]

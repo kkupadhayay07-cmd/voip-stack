@@ -7,6 +7,7 @@ use crate::sdp_util;
 use crate::timers::{self, LegTimers, Role, UasNegotiation};
 use crate::webrtc;
 use crate::{datachan, CdrEvent, Side};
+use dialog::{Dialog, DialogMatch, SeqCheck};
 use rand::Rng;
 use sdp::negotiate::{stream_plans, StreamPlan};
 use sip_core::builder::RequestBuilder;
@@ -98,23 +99,16 @@ fn via_sent_by() -> String {
 }
 
 struct Leg {
-    call_id: String,
-    local_tag: String,
-    remote_tag: Option<String>,
-    remote_sip: SocketAddr,
-    /// Next CSeq we send in this dialog (our own UAC-side space: leg-B
-    /// refresh/BYE, leg-A UAS-originated in-dialog requests).
-    next_cseq: u32,
+    /// RFC 3261 §12 dialog state: identity (Call-ID + tags), lifecycle,
+    /// CSeq sequencing in both directions, remote target and address.
+    dialog: Dialog,
     /// Leg A: the INVITE we received (source for responses).
     invite: Option<Request>,
-    /// Peer Contact URI text (request-URI for in-dialog requests).
-    contact: Option<String>,
     plan: Option<StreamPlan>,
     /// Bound RTP socket (A: bound on INVITE or handed over by the WebRTC
     /// establishment once ICE+DTLS complete, B: bound on originate).
     rtp: Option<Arc<UdpSocket>>,
     media: Option<PumpHandle>,
-    confirmed: bool,
     /// RFC 4028 session-timer state (engaged legs only).
     timer: Option<LegTimers>,
     /// RFC 3262 (UAC side): the PRACK we sent for the last reliable 1xx.
@@ -338,8 +332,10 @@ impl B2bua {
                         match act {
                             TxAction::SendRequest(r) => {
                                 if let Some(b) = &c.leg_b {
-                                    d.sends
-                                        .push((serialize(&SipMessage::Request(r)), b.remote_sip));
+                                    d.sends.push((
+                                        serialize(&SipMessage::Request(r)),
+                                        b.dialog.remote_addr(),
+                                    ));
                                 }
                             }
                             TxAction::DeleteTransaction
@@ -371,8 +367,10 @@ impl B2bua {
                     for act in tx.on_event(TxEvent::Timeout, now) {
                         if let TxAction::SendResponse(r) = act {
                             if let Some(a) = &c.leg_a {
-                                d.sends
-                                    .push((serialize(&SipMessage::Response(r)), a.remote_sip));
+                                d.sends.push((
+                                    serialize(&SipMessage::Response(r)),
+                                    a.dialog.remote_addr(),
+                                ));
                             }
                         }
                     }
@@ -387,7 +385,7 @@ impl B2bua {
             // leg-A refresher, RFC 4028 §7.2).
             if let Some(a) = c.leg_a.as_ref() {
                 if let Some(tx) = c.a_out_tx.as_mut() {
-                    let dst = a.remote_sip;
+                    let dst = a.dialog.remote_addr();
                     while let Some(dl) = tx.next_deadline() {
                         if now < dl {
                             break;
@@ -420,7 +418,7 @@ impl B2bua {
             if let Some(a) = c.leg_a.as_mut() {
                 match leg_timer_action(a, now) {
                     Some(TimerAction::Refresh) => {
-                        let cseq = take_cseq(a);
+                        let cseq = a.dialog.take_cseq();
                         let body = a
                             .invite
                             .as_ref()
@@ -433,8 +431,10 @@ impl B2bua {
                         let mut tx = ClientInviteTx::new(invite, TxTransport::Udp);
                         for act in tx.on_event(TxEvent::Send, Instant::now()) {
                             if let TxAction::SendRequest(r) = act {
-                                d.sends
-                                    .push((serialize(&SipMessage::Request(r)), a.remote_sip));
+                                d.sends.push((
+                                    serialize(&SipMessage::Request(r)),
+                                    a.dialog.remote_addr(),
+                                ));
                             }
                         }
                         c.a_out_tx = Some(tx);
@@ -448,7 +448,7 @@ impl B2bua {
                 if let Some(b) = c.leg_b.as_mut() {
                     match leg_timer_action(b, now) {
                         Some(TimerAction::Refresh) => {
-                            let cseq = take_cseq(b);
+                            let cseq = b.dialog.take_cseq();
                             let body = c.b_offer.clone().into_bytes();
                             if let Some(t) = b.timer.as_mut() {
                                 t.pending = Some(cseq);
@@ -457,8 +457,10 @@ impl B2bua {
                             let mut tx = ClientInviteTx::new(invite, TxTransport::Udp);
                             for act in tx.on_event(TxEvent::Send, Instant::now()) {
                                 if let TxAction::SendRequest(r) = act {
-                                    d.sends
-                                        .push((serialize(&SipMessage::Request(r)), b.remote_sip));
+                                    d.sends.push((
+                                        serialize(&SipMessage::Request(r)),
+                                        b.dialog.remote_addr(),
+                                    ));
                                 }
                             }
                             c.b_tx = Some(tx);
@@ -478,7 +480,7 @@ impl B2bua {
                 if rel.state.retransmit_due(now) {
                     if let Some(a) = c.leg_a.as_ref() {
                         rel.state.advance(now);
-                        d.sends.push((rel.bytes.clone(), a.remote_sip));
+                        d.sends.push((rel.bytes.clone(), a.dialog.remote_addr()));
                     }
                 }
                 if rel.state.give_up(now) {
@@ -490,7 +492,11 @@ impl B2bua {
             // took the server transaction, which owned the old Timer H) must
             // still be ACKed within 64·T1 or the caller is gone.
             if let Some(dl) = c.a_ack_deadline {
-                let confirmed = c.leg_a.as_ref().map(|a| a.confirmed).unwrap_or(false);
+                let confirmed = c
+                    .leg_a
+                    .as_ref()
+                    .map(|a| a.dialog.is_confirmed())
+                    .unwrap_or(false);
                 if !confirmed && now >= dl {
                     d.ack_timeout = true;
                 }
@@ -531,7 +537,7 @@ impl B2bua {
                             );
                             let bytes = serialize(&SipMessage::Response(resp));
                             let sock = sock.clone();
-                            let dst = a.remote_sip;
+                            let dst = a.dialog.remote_addr();
                             tokio::spawn(async move {
                                 let _ = sock.send_to(&bytes, dst).await;
                             });
@@ -583,9 +589,9 @@ impl B2bua {
                                     503,
                                     "Service Unavailable",
                                     Vec::new(),
-                                    Some(&a.local_tag),
+                                    Some(a.dialog.local_tag()),
                                 ),
-                                a.remote_sip,
+                                a.dialog.remote_addr(),
                             )
                         })
                     });
@@ -597,7 +603,11 @@ impl B2bua {
                             let _ = sock.send_to(&bytes, dst).await;
                         }
                     }
-                    if c.leg_b.as_ref().map(|b| b.confirmed).unwrap_or(false) {
+                    if c.leg_b
+                        .as_ref()
+                        .map(|b| b.dialog.is_confirmed())
+                        .unwrap_or(false)
+                    {
                         if let Some(b) = c.leg_b.as_mut() {
                             Self::send_bye(sock, b).await;
                         }
@@ -608,7 +618,10 @@ impl B2bua {
                         if let Some(b) = c.leg_b.as_ref() {
                             let cancel = build_cancel(b_tx.request());
                             let _ = sock
-                                .send_to(&serialize(&SipMessage::Request(cancel)), b.remote_sip)
+                                .send_to(
+                                    &serialize(&SipMessage::Request(cancel)),
+                                    b.dialog.remote_addr(),
+                                )
                                 .await;
                         }
                     }
@@ -714,7 +727,7 @@ impl B2bua {
                 let mut had_tx = false;
                 if let Some(tx) = call.b_tx.as_mut() {
                     had_tx = true;
-                    let dst = call.leg_b.as_ref().map(|b| b.remote_sip);
+                    let dst = call.leg_b.as_ref().map(|b| b.dialog.remote_addr());
                     for act in tx.on_event(TxEvent::Received(resp.clone()), Instant::now()) {
                         match act {
                             TxAction::PassToTu(SipMessage::Response(r)) => passed.push(r),
@@ -806,7 +819,7 @@ impl B2bua {
                                             let _ = sock
                                                 .send_to(
                                                     &serialize(&SipMessage::Response(fail)),
-                                                    a.remote_sip,
+                                                    a.dialog.remote_addr(),
                                                 )
                                                 .await;
                                         }
@@ -899,12 +912,15 @@ impl B2bua {
                                 200,
                                 "OK",
                                 c.a_answer.clone().into_bytes(),
-                                Some(&a.local_tag),
+                                Some(a.dialog.local_tag()),
                             );
                             response
                                 .headers
                                 .add("Contact", format!("<sip:zrtc@{local}>"));
-                            (serialize(&SipMessage::Response(response)), a.remote_sip)
+                            (
+                                serialize(&SipMessage::Response(response)),
+                                a.dialog.remote_addr(),
+                            )
                         })
                     });
                     if let Some((bytes, dst)) = resent {
@@ -1300,12 +1316,6 @@ impl B2bua {
             UasNegotiation::On { interval, role } => Some(LegTimers::new(interval, role)),
             _ => None,
         };
-        // The UAS's own CSeq space starts above the received INVITE's CSeq.
-        let a_next_cseq = req
-            .headers
-            .cseq()
-            .map(|c| c.seq.saturating_add(1))
-            .unwrap_or(1);
         let mut call = Call::new(answer.serialize(), offer_b);
         // The answer accepted the data channel iff the offer carried one and
         // the leg negotiated WebRTC (the SDP layer answers application
@@ -1317,17 +1327,21 @@ impl B2bua {
         call.b_dc_offered = dc_offer && target_route.webrtc;
         call.a_rel = a_rel;
         let leg_a = Leg {
-            call_id: call_id.clone(),
-            local_tag: a_tag,
-            remote_tag: from_tag,
-            remote_sip: src,
-            next_cseq: a_next_cseq,
+            // UAS side: remote tag = the caller's From tag, remote target =
+            // the INVITE's Contact, and BOTH CSeq spaces seed from the
+            // request (ours starts above its CSeq, §12.2.2).
+            dialog: Dialog::uas(
+                call_id.clone(),
+                a_tag,
+                from_tag,
+                contact,
+                src,
+                req.headers.cseq().map(|c| c.seq).unwrap_or(0),
+            ),
             invite: Some(req),
-            contact,
             plan: a_plan,
             rtp: a_sock,
             media: None,
-            confirmed: false,
             timer: leg_a_timer,
             last_prack: None,
             webrtc: a_webrtc,
@@ -1342,17 +1356,14 @@ impl B2bua {
         call.b_tx = Some(b_tx);
         call.b_se = b_se;
         call.leg_b = Some(Leg {
-            call_id: b_call_id.clone(),
-            local_tag: b_tag,
-            remote_tag: None,
-            remote_sip: dst,
-            next_cseq: 2,
+            // UAC side: the dial INVITE consumed CSeq 1, our next is 2; the
+            // dial target is the initial remote target until the 2xx's
+            // Contact replaces it.
+            dialog: Dialog::uac(b_call_id.clone(), b_tag, format!("<{target}>"), dst, 2),
             invite: None,
-            contact: Some(format!("<{target}>")),
             plan: None,
             rtp: b_sock,
             media: None,
-            confirmed: false,
             timer: None,
             last_prack: None,
             webrtc: None,
@@ -1392,15 +1403,24 @@ impl B2bua {
             return;
         };
         let Some(b) = call.leg_b.as_mut() else { return };
-        b.remote_tag = resp
+        // RFC 3261 §12.2.1.1: the FIRST To tag on the establishing response
+        // is adopted; a retransmission matches; a DIFFERENT tag is a fork
+        // this engine does not model — the response is ignored and the
+        // adopted dialog continues.
+        let to_tag = resp
             .headers
             .get("To")
             .and_then(|t| sip_core::uri::NameAddr::parse(t).ok())
             .and_then(|n| n.tag);
-        if let Some(c) = resp.headers.get("Contact") {
-            b.contact = Some(c.to_string());
+        if b.dialog.on_response(to_tag.as_deref()) == DialogMatch::Mismatch {
+            tracing::warn!(call_id = %a_id, "2xx with a foreign To tag (fork) ignored");
+            return;
         }
-        b.confirmed = true;
+        // §12.2.1.2: the 2xx's Contact refreshes the remote target.
+        if let Some(c) = resp.headers.get("Contact") {
+            b.dialog.refresh_target(c.to_string());
+        }
+        b.dialog.confirm();
         // RFC 4028: adopt what the peer confirmed on leg B — interval from
         // the 200, role from its refresher parameter (default refresher is
         // the UAC, which is us on this leg).
@@ -1446,7 +1466,10 @@ impl B2bua {
                             None,
                         );
                         let _ = sock
-                            .send_to(&serialize(&SipMessage::Response(fail)), a.remote_sip)
+                            .send_to(
+                                &serialize(&SipMessage::Response(fail)),
+                                a.dialog.remote_addr(),
+                            )
                             .await;
                     }
                 }
@@ -1533,7 +1556,7 @@ impl B2bua {
                     // the still-open server INVITE transaction so the 503
                     // is retransmitted (Timer G/H), not a single raw
                     // datagram a loss would swallow.
-                    let a_dst = call.leg_a.as_ref().map(|a| a.remote_sip);
+                    let a_dst = call.leg_a.as_ref().map(|a| a.dialog.remote_addr());
                     let invite = call.leg_a.as_ref().and_then(|a| a.invite.clone());
                     if let (Some(mut a_tx), Some(invite), Some(dst)) =
                         (call.a_tx.take(), invite, a_dst)
@@ -1575,7 +1598,7 @@ impl B2bua {
                 peer: call
                     .leg_b
                     .as_ref()
-                    .map(|l| l.remote_sip)
+                    .map(|l| l.dialog.remote_addr())
                     .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
                 codec: call.leg_b.as_ref().map(Leg::codec_name).unwrap_or_default(),
             },
@@ -1628,7 +1651,7 @@ impl B2bua {
                 200,
                 "OK",
                 call.a_answer.clone().into_bytes(),
-                Some(&a.local_tag),
+                Some(a.dialog.local_tag()),
             );
             response
                 .headers
@@ -1644,7 +1667,7 @@ impl B2bua {
                     ),
                 );
             }
-            let snapshot = (a.local_tag.clone(), a.remote_sip);
+            let snapshot = (a.dialog.local_tag().to_string(), a.dialog.remote_addr());
             (snapshot, response)
         };
         let call = match calls.get_mut(a_id) {
@@ -1836,7 +1859,7 @@ impl B2bua {
                                         peer: call
                                             .leg_a
                                             .as_ref()
-                                            .map(|l| l.remote_sip)
+                                            .map(|l| l.dialog.remote_addr())
                                             .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
                                         codec: format!("{ca:?}"),
                                     },
@@ -1865,8 +1888,8 @@ impl B2bua {
                 }
             }
             if let Some(a) = c.leg_a.as_mut() {
-                if !a.confirmed {
-                    a.confirmed = true;
+                if !a.dialog.is_confirmed() {
+                    a.dialog.confirm();
                     c.a_ack_deadline = None;
                     self.cdr
                         .send(CdrEvent::LegConfirmed {
@@ -1900,8 +1923,16 @@ impl B2bua {
             .unwrap_or_else(|| call_id.clone());
         let from_b = call_id != a_id;
 
-        // Relay BYE to the other leg.
+        // Relay BYE to the other leg; the dialog that received the BYE is
+        // terminated (RFC 3261 §15).
         if let Some(c) = calls.get_mut(&a_id) {
+            if from_b {
+                if let Some(b) = c.leg_b.as_mut() {
+                    b.dialog.terminate();
+                }
+            } else if let Some(a) = c.leg_a.as_mut() {
+                a.dialog.terminate();
+            }
             let other = if from_b {
                 c.leg_a.as_mut()
             } else {
@@ -1958,7 +1989,11 @@ impl B2bua {
         // RFC 3261 §9.2: a CANCEL has no effect on an INVITE whose final
         // response is already out — an answered call must survive it, and
         // the CANCEL belongs to no open transaction (481).
-        if c.leg_a.as_ref().map(|a| a.confirmed).unwrap_or(false) {
+        if c.leg_a
+            .as_ref()
+            .map(|a| a.dialog.is_confirmed())
+            .unwrap_or(false)
+        {
             let resp = sip_core::builder::respond_to(
                 req,
                 481,
@@ -1985,13 +2020,16 @@ impl B2bua {
                     487,
                     "Request Terminated",
                     Vec::new(),
-                    Some(&a.local_tag),
+                    Some(a.dialog.local_tag()),
                 );
                 if let Some(mut a_tx) = c.a_tx.take() {
-                    send_staged(&mut a_tx, sock, a.remote_sip, resp487).await;
+                    send_staged(&mut a_tx, sock, a.dialog.remote_addr(), resp487).await;
                 } else {
                     let _ = sock
-                        .send_to(&serialize(&SipMessage::Response(resp487)), a.remote_sip)
+                        .send_to(
+                            &serialize(&SipMessage::Response(resp487)),
+                            a.dialog.remote_addr(),
+                        )
                         .await;
                 }
             }
@@ -1999,7 +2037,11 @@ impl B2bua {
         // §9.1: CANCEL the outgoing dial INVITE while leg B is still
         // ringing; a leg B that already answered (its 200 is parked on the
         // PRACK, RFC 3262 §3) is confirmed and gets a BYE instead.
-        if c.leg_b.as_ref().map(|b| b.confirmed).unwrap_or(false) {
+        if c.leg_b
+            .as_ref()
+            .map(|b| b.dialog.is_confirmed())
+            .unwrap_or(false)
+        {
             if let Some(b) = c.leg_b.as_mut() {
                 Self::send_bye(sock, b).await;
             }
@@ -2007,7 +2049,10 @@ impl B2bua {
             if let Some(b) = c.leg_b.as_ref() {
                 let cancel = build_cancel(b_tx.request());
                 let _ = sock
-                    .send_to(&serialize(&SipMessage::Request(cancel)), b.remote_sip)
+                    .send_to(
+                        &serialize(&SipMessage::Request(cancel)),
+                        b.dialog.remote_addr(),
+                    )
                     .await;
             }
         }
@@ -2015,24 +2060,17 @@ impl B2bua {
     }
 
     fn send_ack(&self, sock: &Arc<UdpSocket>, b: &Leg, cseq: u32) {
-        let req_uri = b
-            .contact
-            .clone()
-            .and_then(|c| extract_uri(&c))
-            .unwrap_or_else(|| SipUri::parse(&format!("sip:peer@{}", b.remote_sip)).unwrap());
+        let req_uri = b.dialog.request_uri();
         let ack = RequestBuilder::new(Method::Ack, req_uri)
             .via(TransportKind::Udp, &via_sent_by(), Some(&new_branch()))
-            .from(&format!("<sip:zrtc@b2bua>;tag={}", b.local_tag))
-            .to(&format!(
-                "<sip:peer>;tag={}",
-                b.remote_tag.clone().unwrap_or_default()
-            ))
-            .call_id(Some(&b.call_id))
+            .from(&format!("<sip:zrtc@b2bua>;tag={}", b.dialog.local_tag()))
+            .to(&format!("<sip:peer>;tag={}", b.dialog.remote_tag_value()))
+            .call_id(Some(b.dialog.call_id()))
             .cseq(cseq)
             .build();
         let bytes = serialize(&SipMessage::Request(ack));
         let sock = sock.clone();
-        let dst = b.remote_sip;
+        let dst = b.dialog.remote_addr();
         tokio::spawn(async move {
             let _ = sock.send_to(&bytes, dst).await;
         });
@@ -2040,24 +2078,17 @@ impl B2bua {
 
     /// Sends an in-dialog BYE on a leg (consumes one CSeq).
     async fn send_bye(sock: &Arc<UdpSocket>, leg: &mut Leg) {
-        let req_uri = leg
-            .contact
-            .clone()
-            .and_then(|c| extract_uri(&c))
-            .unwrap_or_else(|| SipUri::parse(&format!("sip:peer@{}", leg.remote_sip)).unwrap());
-        let cseq = take_cseq(leg);
+        let req_uri = leg.dialog.request_uri();
+        let cseq = leg.dialog.take_cseq();
         let bye = RequestBuilder::new(Method::Bye, req_uri)
             .via(TransportKind::Udp, &via_sent_by(), Some(&new_branch()))
-            .from(&format!("<sip:zrtc@b2bua>;tag={}", leg.local_tag))
-            .to(&format!(
-                "<sip:peer>;tag={}",
-                leg.remote_tag.clone().unwrap_or_default()
-            ))
-            .call_id(Some(&leg.call_id))
+            .from(&format!("<sip:zrtc@b2bua>;tag={}", leg.dialog.local_tag()))
+            .to(&format!("<sip:peer>;tag={}", leg.dialog.remote_tag_value()))
+            .call_id(Some(leg.dialog.call_id()))
             .cseq(cseq)
             .build();
         let bytes = serialize(&SipMessage::Request(bye));
-        let _ = sock.send_to(&bytes, leg.remote_sip).await;
+        let _ = sock.send_to(&bytes, leg.dialog.remote_addr()).await;
     }
 
     /// A 2xx to our leg-B session-refresh re-INVITE: re-anchor the clock.
@@ -2115,13 +2146,13 @@ impl B2bua {
             };
             // Only responses to our own leg-A refresh: they carry OUR local
             // tag in From (To mirrors the peer's tag).
-            if resp.headers.from().and_then(|f| f.tag).as_deref() != Some(a.local_tag.as_str()) {
+            if resp.headers.from().and_then(|f| f.tag).as_deref() != Some(a.dialog.local_tag()) {
                 return;
             }
             if resp.headers.cseq().map(|c| c.method) != Some(Method::Invite) {
                 return; // e.g. 200 to our BYE — nothing to do
             }
-            let dst = a.remote_sip;
+            let dst = a.dialog.remote_addr();
             let Some(tx) = call.a_out_tx.as_mut() else {
                 return;
             };
@@ -2197,7 +2228,7 @@ impl B2bua {
         let Some(a) = call.leg_a.as_mut() else {
             return;
         };
-        if req.headers.to().and_then(|t| t.tag).as_deref() != Some(a.local_tag.as_str()) {
+        if req.headers.to().and_then(|t| t.tag).as_deref() != Some(a.dialog.local_tag()) {
             let resp = sip_core::builder::respond_to(
                 req,
                 481,
@@ -2218,13 +2249,37 @@ impl B2bua {
                 .await;
             return;
         }
+        // RFC 3261 §8.1.1.5: CSeq is mandatory. §12.2.2: an in-dialog
+        // request whose CSeq is BELOW the last one seen is out of order
+        // (→ 500); an EQUAL one is a retransmission and the normal refresh
+        // path answers it idempotently.
+        let Some(seq) = req.headers.cseq().map(|c| c.seq) else {
+            let resp = sip_core::builder::respond_to(req, 400, "Bad Request", Vec::new(), None);
+            let _ = sock
+                .send_to(&serialize(&SipMessage::Response(resp)), src)
+                .await;
+            return;
+        };
+        if a.dialog.check_remote_seq(seq) == SeqCheck::OutOfOrder {
+            tracing::info!(call_id = %a.dialog.call_id(), "out-of-order re-INVITE (CSeq {seq})");
+            let resp =
+                sip_core::builder::respond_to(req, 500, "Server Internal Error", Vec::new(), None);
+            let _ = sock
+                .send_to(&serialize(&SipMessage::Response(resp)), src)
+                .await;
+            return;
+        }
+        // §12.2.2: a Contact on an in-dialog request refreshes the target.
+        if let Some(c) = req.headers.get("Contact") {
+            a.dialog.refresh_target(c.to_string());
+        }
         let original_offer = a
             .invite
             .as_ref()
             .map(|i| i.body.clone())
             .unwrap_or_default();
         if !req.body.is_empty() && req.body != original_offer {
-            tracing::info!(call_id = %a.call_id, "re-INVITE SDP change unsupported");
+            tracing::info!(call_id = %a.dialog.call_id(), "re-INVITE SDP change unsupported");
             let resp =
                 sip_core::builder::respond_to(req, 488, "Not Acceptable Here", Vec::new(), None);
             let _ = sock
@@ -2242,7 +2297,7 @@ impl B2bua {
             200,
             "OK",
             call.a_answer.clone().into_bytes(),
-            Some(&a.local_tag),
+            Some(a.dialog.local_tag()),
         );
         response
             .headers
@@ -2287,7 +2342,7 @@ impl B2bua {
             return;
         };
         // In-dialog requests from the peer carry OUR local tag in To.
-        if req.headers.to().and_then(|t| t.tag).as_deref() != Some(b.local_tag.as_str()) {
+        if req.headers.to().and_then(|t| t.tag).as_deref() != Some(b.dialog.local_tag()) {
             let resp = sip_core::builder::respond_to(
                 &req,
                 481,
@@ -2300,7 +2355,7 @@ impl B2bua {
                 .await;
             return;
         }
-        if !b.confirmed {
+        if !b.dialog.is_confirmed() {
             // The dial has not completed: glare.
             let resp =
                 sip_core::builder::respond_to(&req, 491, "Request Pending", Vec::new(), None);
@@ -2308,6 +2363,26 @@ impl B2bua {
                 .send_to(&serialize(&SipMessage::Response(resp)), src)
                 .await;
             return;
+        }
+        // §12.2.2 CSeq ordering + Contact target refresh (like leg A).
+        let Some(seq) = req.headers.cseq().map(|c| c.seq) else {
+            let resp = sip_core::builder::respond_to(&req, 400, "Bad Request", Vec::new(), None);
+            let _ = sock
+                .send_to(&serialize(&SipMessage::Response(resp)), src)
+                .await;
+            return;
+        };
+        if b.dialog.check_remote_seq(seq) == SeqCheck::OutOfOrder {
+            tracing::info!(call_id = %a_id, "out-of-order leg-B re-INVITE (CSeq {seq})");
+            let resp =
+                sip_core::builder::respond_to(&req, 500, "Server Internal Error", Vec::new(), None);
+            let _ = sock
+                .send_to(&serialize(&SipMessage::Response(resp)), src)
+                .await;
+            return;
+        }
+        if let Some(c) = req.headers.get("Contact") {
+            b.dialog.refresh_target(c.to_string());
         }
         // Answer body: an empty request is a pure refresh (resend our
         // original offer as the new offer); an offer is answered only when
@@ -2384,7 +2459,7 @@ impl B2bua {
             t.pending = None;
         }
         let mut response =
-            sip_core::builder::respond_to(&req, 200, "OK", answer_body, Some(&b.local_tag));
+            sip_core::builder::respond_to(&req, 200, "OK", answer_body, Some(b.dialog.local_tag()));
         response
             .headers
             .add("Contact", format!("<sip:zrtc@{local}>"));
@@ -2443,7 +2518,11 @@ impl B2bua {
                 .await;
             return;
         };
-        let Some(a_tag) = call.leg_a.as_ref().map(|a| a.local_tag.clone()) else {
+        let Some(a_tag) = call
+            .leg_a
+            .as_ref()
+            .map(|a| a.dialog.local_tag().to_string())
+        else {
             return;
         };
         // In-dialog requests carry OUR local tag in To (§12.2.2).
@@ -2564,30 +2643,22 @@ impl B2bua {
                     "retransmitted 1xx (RSeq {}): resending stored PRACK",
                     stored.rseq
                 );
-                let _ = sock.send_to(&stored.bytes, b.remote_sip).await;
+                let _ = sock.send_to(&stored.bytes, b.dialog.remote_addr()).await;
             }
             rel100::PrackAction::Send { rseq } => {
-                // Early dialog: the 1xx's To tag is the peer's dialog tag.
-                if b.remote_tag.is_none() {
-                    b.remote_tag = r1xx.headers.to().and_then(|t| t.tag);
-                }
+                // Early dialog: the 1xx's To tag is the peer's dialog tag
+                // (adopted once; a foreign tag would be a fork — ignored).
+                let _ = b
+                    .dialog
+                    .on_response(r1xx.headers.to().and_then(|t| t.tag).as_deref());
                 let invite_cseq = r1xx.headers.cseq().map(|c| c.seq).unwrap_or(1);
-                let req_uri = b
-                    .contact
-                    .clone()
-                    .and_then(|c| extract_uri(&c))
-                    .unwrap_or_else(|| {
-                        SipUri::parse(&format!("sip:peer@{}", b.remote_sip)).unwrap()
-                    });
-                let cseq = take_cseq(b);
+                let req_uri = b.dialog.request_uri();
+                let cseq = b.dialog.take_cseq();
                 let prack = RequestBuilder::new(Method::Prack, req_uri)
                     .via(TransportKind::Udp, &via_sent_by(), Some(&new_branch()))
-                    .from(&format!("<sip:zrtc@b2bua>;tag={}", b.local_tag))
-                    .to(&format!(
-                        "<sip:peer>;tag={}",
-                        b.remote_tag.clone().unwrap_or_default()
-                    ))
-                    .call_id(Some(&b.call_id))
+                    .from(&format!("<sip:zrtc@b2bua>;tag={}", b.dialog.local_tag()))
+                    .to(&format!("<sip:peer>;tag={}", b.dialog.remote_tag_value()))
+                    .call_id(Some(b.dialog.call_id()))
                     .cseq(cseq)
                     .header("RAck", &format!("{rseq} {invite_cseq} INVITE"))
                     .build();
@@ -2596,7 +2667,7 @@ impl B2bua {
                     rseq,
                     bytes: bytes.clone(),
                 });
-                let _ = sock.send_to(&bytes, b.remote_sip).await;
+                let _ = sock.send_to(&bytes, b.dialog.remote_addr()).await;
                 tracing::debug!(call_id = %a_id, "PRACK sent for RSeq {rseq}");
             }
         }
@@ -2627,17 +2698,18 @@ impl B2bua {
         let Some(b) = call.leg_b.as_ref() else {
             return false;
         };
-        let Some(target) = b.contact.clone().and_then(|c| extract_uri(&c)) else {
-            tracing::error!(call_id = %a_id, "421 retry: no leg B target");
-            return false;
-        };
+        let target = b.dialog.request_uri();
         let Some(dst) = uri_to_socket(&target).await else {
             tracing::error!(call_id = %a_id, "421 retry: cannot resolve {target}");
             return false;
         };
         let to_text = format!("<{target}>");
-        let (b_local_tag, offer, b_se) = (b.local_tag.clone(), call.b_offer.clone(), call.b_se);
-        let cseq = take_cseq(call.leg_b.as_mut().unwrap());
+        let (b_local_tag, offer, b_se) = (
+            b.dialog.local_tag().to_string(),
+            call.b_offer.clone(),
+            call.b_se,
+        );
+        let cseq = call.leg_b.as_mut().unwrap().dialog.take_cseq();
         // Merge what the 421 demanded into our Supported (keep "100rel" and
         // "timer" — the peer may demand more than it announced so far).
         let base = if b_se.is_some() {
@@ -2716,7 +2788,7 @@ impl B2bua {
             return;
         };
         // In-dialog requests from the peer carry OUR local tag in To.
-        if req.headers.to().and_then(|t| t.tag).as_deref() != Some(leg.local_tag.as_str()) {
+        if req.headers.to().and_then(|t| t.tag).as_deref() != Some(leg.dialog.local_tag()) {
             let resp = sip_core::builder::respond_to(
                 req,
                 481,
@@ -2729,12 +2801,32 @@ impl B2bua {
                 .await;
             return;
         }
-        if !leg.confirmed {
+        if !leg.dialog.is_confirmed() {
             let resp = sip_core::builder::respond_to(req, 491, "Request Pending", Vec::new(), None);
             let _ = sock
                 .send_to(&serialize(&SipMessage::Response(resp)), src)
                 .await;
             return;
+        }
+        // §12.2.2 CSeq ordering + Contact target refresh (like re-INVITE).
+        let Some(seq) = req.headers.cseq().map(|c| c.seq) else {
+            let resp = sip_core::builder::respond_to(req, 400, "Bad Request", Vec::new(), None);
+            let _ = sock
+                .send_to(&serialize(&SipMessage::Response(resp)), src)
+                .await;
+            return;
+        };
+        if leg.dialog.check_remote_seq(seq) == SeqCheck::OutOfOrder {
+            tracing::info!(call_id = %a_id, "out-of-order UPDATE (CSeq {seq})");
+            let resp =
+                sip_core::builder::respond_to(req, 500, "Server Internal Error", Vec::new(), None);
+            let _ = sock
+                .send_to(&serialize(&SipMessage::Response(resp)), src)
+                .await;
+            return;
+        }
+        if let Some(c) = req.headers.get("Contact") {
+            leg.dialog.refresh_target(c.to_string());
         }
         if !req.body.is_empty() {
             let resp =
@@ -2782,17 +2874,14 @@ impl B2bua {
             tracing::info!(call_id = %a_id, "leg B 422 without a Min-SE increase");
             return false;
         }
-        let Some(target) = b.contact.clone().and_then(|c| extract_uri(&c)) else {
-            tracing::error!(call_id = %a_id, "422 retry: no leg B target");
-            return false;
-        };
+        let target = b.dialog.request_uri();
         let Some(dst) = uri_to_socket(&target).await else {
             tracing::error!(call_id = %a_id, "422 retry: cannot resolve {target}");
             return false;
         };
         let to_text = format!("<{target}>");
-        let (b_local_tag, offer) = (b.local_tag.clone(), call.b_offer.clone());
-        let cseq = take_cseq(call.leg_b.as_mut().unwrap());
+        let (b_local_tag, offer) = (b.dialog.local_tag().to_string(), call.b_offer.clone());
+        let cseq = call.leg_b.as_mut().unwrap().dialog.take_cseq();
         tracing::info!(
             call_id = %a_id,
             "leg B 422: retrying with Session-Expires {new_se}"
@@ -2828,13 +2917,6 @@ impl B2bua {
 }
 
 // ---- helpers ---------------------------------------------------------------
-
-/// Consumes the next CSeq for requests we originate on a leg.
-fn take_cseq(leg: &mut Leg) -> u32 {
-    let c = leg.next_cseq;
-    leg.next_cseq = c.saturating_add(1);
-    c
-}
 
 /// Builds the CANCEL for an outstanding INVITE (RFC 3261 §9.1): same
 /// Request-URI, the INVITE's top Via verbatim (so sent-by and branch match
@@ -2873,7 +2955,7 @@ enum TimerAction {
 /// not been established, so the session interval has not started.
 fn leg_timer_action(leg: &Leg, now: Instant) -> Option<TimerAction> {
     let t = leg.timer.as_ref()?;
-    if !leg.confirmed {
+    if !leg.dialog.is_confirmed() {
         return None;
     }
     if t.refresh_due(now) {
@@ -2888,19 +2970,12 @@ fn leg_timer_action(leg: &Leg, now: Instant) -> Option<TimerAction> {
 /// Builds a no-change session-refresh re-INVITE (RFC 4028 §7.2) for a leg.
 /// The body, when present, is the leg's original offer byte-for-byte.
 fn refresh_reinvite(leg: &Leg, cseq: u32, we_are_uas: bool, offer: Vec<u8>) -> Request {
-    let req_uri = leg
-        .contact
-        .clone()
-        .and_then(|c| extract_uri(&c))
-        .unwrap_or_else(|| SipUri::parse(&format!("sip:peer@{}", leg.remote_sip)).unwrap());
+    let req_uri = leg.dialog.request_uri();
     let mut invite = RequestBuilder::new(Method::Invite, req_uri)
         .via(TransportKind::Udp, &via_sent_by(), Some(&new_branch()))
-        .from(&format!("<sip:zrtc@b2bua>;tag={}", leg.local_tag))
-        .to(&format!(
-            "<sip:peer>;tag={}",
-            leg.remote_tag.clone().unwrap_or_default()
-        ))
-        .call_id(Some(&leg.call_id))
+        .from(&format!("<sip:zrtc@b2bua>;tag={}", leg.dialog.local_tag()))
+        .to(&format!("<sip:peer>;tag={}", leg.dialog.remote_tag_value()))
+        .call_id(Some(leg.dialog.call_id()))
         .cseq(cseq)
         .contact("<sip:zrtc@b2bua>")
         .header("Supported", "timer, 100rel")
@@ -2975,18 +3050,6 @@ async fn uri_to_socket(uri: &SipUri) -> Option<SocketAddr> {
             .await
             .ok()?
             .next(),
-    }
-}
-
-fn extract_uri(contact: &str) -> Option<SipUri> {
-    let inner = contact.trim().trim_start_matches('<').trim_end_matches('>');
-    match SipUri::parse(inner) {
-        Ok(u) => Some(u),
-        Err(_) => contact
-            .split('<')
-            .nth(1)
-            .and_then(|rest| rest.split('>').next())
-            .and_then(|u| SipUri::parse(u).ok()),
     }
 }
 

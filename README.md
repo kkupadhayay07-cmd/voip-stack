@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 656 tests passing across 70 suites in 21 crates;
+**Current state: 669 tests passing across 73 suites in 22 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
@@ -52,7 +52,15 @@ declines the m-line keeps the call audio-only, the bundled offer carries
 close per RFC 8831 §6.7 (RFC 6525 stream reset: request → response →
 reciprocal reset, E2 deferred processing, stream ids reusable), and
 integration tests cover the mirror loopback, the decline path and the
-channel close over a live leg.**
+channel close over a live leg.** RFC 3261 §12 dialog state is now a
+standalone package (`crates/dialog`: dialog identity, early→confirmed
+lifecycle, CSeq sequencing in both directions, remote-target tracking) and
+the B2BUA runs on it — closing a real gap while extracting: in-dialog
+requests whose CSeq is BELOW the peer's high-water mark are now rejected
+500 per §12.2.2 (an equal CSeq is answered idempotently as a
+retransmission), Contacts on in-dialog requests refresh the remote target,
+and a 2xx from a foreign To tag (a fork) is ignored instead of clobbering
+the adopted dialog — all pinned by wire-level integration tests.
 
 ## Workspace layout
 
@@ -60,6 +68,7 @@ channel close over a live leg.**
 |-------|---------|--------|
 | `crates/sip-core` | RFC 3261 message layer: parser, serializer, URI/headers, Digest helpers (RFC 2617/7616) | **Done** |
 | `crates/sip-tx` | RFC 3261 §17 transaction state machines: client/server INVITE + non-INVITE (Timers A/B/D, E/F/K, G/H/I, J), §17.1.3/§17.2.3 matching, ACK rules; pure state machines — no I/O, fake-clock tested | **Done** |
+| `crates/dialog` | RFC 3261 §12 dialog state extracted from the B2BUA: dialog identity (Call-ID + local/remote tags), early→confirmed→terminated lifecycle, CSeq sequencing in both directions (§12.2.1.1 send space, §12.2.2 receive high-water with out-of-order/retransmission verdicts), remote-target tracking with in-dialog request-URI routing (Contact-shape tolerant, address fallback); pure state — no I/O | **Done** |
 | `crates/sdp` | RFC 4566/8866 SDP parser/serializer + RFC 3264 offer/answer engine (`StreamPlan` projection) | **Done** |
 | `crates/rtp` | RTP/RTCP (RFC 3550/3551), adaptive jitter buffer + PLC, loss recovery (RFC 4585 Generic NACK + RFC 4588 RTX), transport-cc congestion feedback, RFC 4733 DTMF, RFC 5761 demux, RFC 8285 extensions, RTCP feedback (PLI/FIR) | **Done** |
 | `crates/codecs` | Full codec suite: **Opus, PCMU, PCMA, G.722, G.729, telephone-event**, L16, CN (RFC 3389), PLC, resampler; G.729 validated against bcg729 oracle vectors | **Done** |
@@ -86,7 +95,7 @@ channel close over a live leg.**
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 656 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 669 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -270,6 +279,14 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
 ## Roadmap (next)
 
 1. Dialog layer extraction (§12) from the B2BUA's per-leg state.
+   ✅ **done** — new `crates/dialog` package (identity, lifecycle, CSeq
+   sequencing both directions, remote-target tracking + request-URI
+   routing); the engine runs on it and §12.2.2 is enforced end to end:
+   out-of-order in-dialog requests (CSeq below the peer high-water mark)
+   are rejected 500, equal-CSeq retransmissions are answered idempotently,
+   in-dialog Contacts refresh the remote target, foreign-To-tag 2xx forks
+   are ignored (`dialog_cseq` integration test pins the whole ordering
+   ladder: 200 / 500 / 200 / 500 / 200 / BYE-200).
 2. Release-mode soak on 8-core hardware — the load harness (`zrtc load` +
    `demo/soak.sh`) and the debug-build sandbox baseline (200 calls at
    concurrency 20, 100% answered, setup p95 305 ms) are shipped; publish

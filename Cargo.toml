@@ -22,6 +22,7 @@ members = [
     "crates/observ",
     "crates/rfc3263",
     "crates/sctp",
+    "crates/dialog",
 ]
 
 [workspace.package]
@@ -69,6 +70,7 @@ registrar = { path = "crates/registrar" }
 observ = { path = "crates/observ" }
 rfc3263 = { path = "crates/rfc3263" }
 sctp = { path = "crates/sctp" }
+dialog = { path = "crates/dialog" }
 
 [profile.release]
 lto = "thin"

@@ -105,8 +105,8 @@ System: Rewrites system prompt based on past failed calls.
 │ L3 · AI PIPELINE                                                 │
 │ STT · LLM · TTS · VAD · Barge-in · Fallbacks · <200ms P95        │
 ├──────────────────────────────────────────────────────────────────┤
-│ L2 · TELEPHONY  <- we are here, ~78% done                        │
-│ Trunk · GRUU · WebRTC legs+close · SCTP channels both legs [done]│
+│ L2 · TELEPHONY  <- we are here, ~80% done                        │
+│ Trunk · GRUU · WebRTC legs+close · dialog §12 layer [done]       │
 │ Postgres CDR · release soak [pending] · M1 [x] · M2 in reach     │
 ├──────────────────────────────────────────────────────────────────┤
 │ L1 · FOUNDATION — complete (M1 verified: 400+ gate, release)     │

@@ -39,7 +39,7 @@ this repository's code.
 
 ## 2. Crate graph
 
-### 2.1 Current tree (as built — 21 crates)
+### 2.1 Current tree (as built — 22 crates)
 
 ```text
    ops/assembly ┌─────────────┐  ┌──────────────┐
@@ -100,7 +100,7 @@ the seam.
 
 | Layer | Crates | Phase |
 |-------|--------|-------|
-| Protocol core | `sip-core` (messages → transactions → dialogs), `sip-tx` (§17 state machines), `sdp` | 1 |
+| Protocol core | `sip-core` (messages), `sip-tx` (§17 state machines), `dialog` (§12 dialog state: identity, lifecycle, both-direction CSeq sequencing, remote target), `sdp` | 1 |
 | Transport | UDP/TCP/TLS/WS/WSS inside the `zrtc` daemon (message-layer framing in `sip-core`) | 1–2 |
 | Media transport | `rtp` (packets, jitter buffer, DTMF), `srtp`, `dtls`, `ice` (+STUN/TURN), `sctp` (data-channel engine) | 1–2 |
 | Codecs | `codecs` (G.711/G.722/G.729/Opus/L16/CN/PLC/resample) | 1 |
@@ -175,6 +175,16 @@ wire ──► transport task ──► parse_stream/parse_message
 Parser hard limits (64 KiB message, 128 headers, 8 KiB/header line,
 2 KiB URI) are enforced *inside* the parser, so every downstream consumer
 inherits the bound.
+
+**Dialog state (§12) lives in the `dialog` crate**: one `Dialog` per leg
+owns the identity (Call-ID + local/remote tags), the early→confirmed
+lifecycle, the CSeq sequences in BOTH directions (the send space we
+consume with `take_cseq`; the peer high-water mark checked with
+`check_remote_seq` — out-of-order in-dialog requests are rejected 500 per
+§12.2.2, an equal CSeq is a retransmission answered idempotently) and the
+remote target with §12.2 request-URI routing. The B2BUA's `Leg` carries
+one; media/transport state (plan, sockets, pumps, WebRTC, crypto) stays
+on the leg beside it.
 
 ### 5.2 Media (one leg)
 

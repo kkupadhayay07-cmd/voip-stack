@@ -1,0 +1,9 @@
+[package]
+name = "dialog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RFC 3261 section 12 dialog state: dialog identity (Call-ID + tags), early/confirmed lifecycle, CSeq sequencing for both directions, remote-target tracking and in-dialog request routing"
+
+[dependencies]
+sip-core = { workspace = true }

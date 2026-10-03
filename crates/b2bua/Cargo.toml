@@ -20,6 +20,7 @@ srtp = { workspace = true }
 ice = { workspace = true }
 dtls = { workspace = true }
 sctp = { workspace = true }
+dialog = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
