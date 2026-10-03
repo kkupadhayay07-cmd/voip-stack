@@ -65,6 +65,12 @@ pub struct Core {
     /// originated in-dialog requests (e.g. a callee-side BYE) reach the
     /// right client connection.
     clients: HashMap<String, Responder>,
+    /// RFC 5626 flow alias: CONTACT-resolved address → the flow's registered
+    /// source address. A flow-registered endpoint's Contact host:port often
+    /// differs from its connection's peer address (NAT / WebRTC), so fork
+    /// targets resolved from the Contact must be mapped back to the actual
+    /// connection before the registry lookup.
+    flow_alias: HashMap<SocketAddr, SocketAddr>,
 }
 
 impl Core {
@@ -84,6 +90,7 @@ impl Core {
             registry,
             b2bua_addr,
             clients: HashMap::new(),
+            flow_alias: HashMap::new(),
         }
     }
 
@@ -112,15 +119,8 @@ impl Core {
                     // Timer B/F/H/I/J/K cleanup (leak-free by construction).
                     let now = std::time::Instant::now();
                     for action in self.proxy.poll(now) {
-                        match action {
-                            proxy::Action::Send(SipMessage::Request(r), dst) => {
-                                let bytes = serialize(&SipMessage::Request(r));
-                                self.send_datagram(&bytes, dst).await;
-                            }
-                            proxy::Action::Send(msg, dst) => {
-                                self.send_routed_response(msg, dst).await;
-                            }
-                        }
+                        let proxy::Action::Send(msg, dst) = action;
+                        self.dispatch_proxy_action(msg, dst).await;
                     }
                 }
             }
@@ -142,10 +142,17 @@ impl Core {
                 return;
             };
             if let Some(client) = self.clients.get(&call_id).cloned() {
-                let bytes = serialize(&SipMessage::Request(req));
+                let bytes = serialize(&SipMessage::Request(req.clone()));
                 self.send_to_responder(&bytes, &client).await;
             } else {
                 tracing::debug!(%call_id, "no client endpoint for core request; dropped");
+            }
+            // A core→client BYE/CANCEL ends the call from the CALLEE side:
+            // drop the learned endpoint here too (the caller-side path drops
+            // it in route()); otherwise every callee hangup leaks one
+            // Responder (a writer-channel handle) until restart.
+            if matches!(req.method, Method::Bye | Method::Cancel) {
+                self.clients.remove(&call_id);
             }
             return;
         }
@@ -217,53 +224,17 @@ impl Core {
                     // The proxy's local provisional responses target
                     // the requester: keep them on the arriving
                     // transport; everything else routes by address.
-                    if dst == resp.src {
+                    if dst == resp.src && matches!(msg, SipMessage::Response(_)) {
                         let bytes = serialize(&msg);
                         self.send_to_responder(&bytes, &resp).await;
                     } else if let SipMessage::Request(fwd) = &msg {
                         self.remember_client(fwd, resp.clone());
-                        // RFC 5626 §5.2: a fork target that is a
-                        // registered reliable flow is delivered over THAT
-                        // connection; a dead flow reports back to the
-                        // proxy (leg_transport_failed → 430 candidate).
-                        let conn = self
-                            .registry
-                            .lock()
-                            .expect("registry lock")
-                            .get(&dst)
-                            .cloned();
-                        let is_flow = self.proxy.reliable_targets.contains(&dst);
-                        match conn {
-                            Some(tx) => {
-                                let bytes = serialize(&SipMessage::Request(fwd.clone()));
-                                match tx.try_send(bytes) {
-                                    Ok(()) => {
-                                        self.proxy.leg_delivered(fwd, std::time::Instant::now());
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(%dst, "flow write failed: {e}");
-                                        queue.extend(
-                                            self.proxy.leg_transport_failed(
-                                                fwd,
-                                                std::time::Instant::now(),
-                                            ),
-                                        );
-                                    }
-                                }
-                            }
-                            None if is_flow => {
-                                // Registered flow, connection gone: §5.2
-                                // 430 Flow Failed for that branch.
-                                queue.extend(
-                                    self.proxy
-                                        .leg_transport_failed(fwd, std::time::Instant::now()),
-                                );
-                            }
-                            None => {
-                                let bytes = serialize(&SipMessage::Request(fwd.clone()));
-                                self.send_datagram(&bytes, dst).await;
-                            }
-                        }
+                        let delivered = self.send_leg_request(fwd.clone(), dst).await;
+                        // Flow-failure feedback re-enters the proxy (the
+                        // §5.2 430 / best-final forward) through the same
+                        // worklist — the loop that can re-enter its
+                        // producer must be a worklist (Task 58 lesson).
+                        queue.extend(delivered);
                     } else {
                         self.send_routed_response(msg, dst).await;
                     }
@@ -279,6 +250,69 @@ impl Core {
             return;
         };
         self.clients.insert(call_id, resp);
+    }
+
+    /// Dispatch one proxy action: forked requests/leg ACKs/CANCELs go
+    /// through the flow-aware request sender, responses through the Via
+    /// routed sender. Used by the pump ticker, the request worklist and the
+    /// response path so EVERY proxy-generated request reaches flow (RFC
+    /// 5626 §5.2) targets over their registered connection — not just the
+    /// initial fork.
+    async fn dispatch_proxy_action(&mut self, msg: SipMessage, dst: SocketAddr) {
+        match msg {
+            SipMessage::Request(req) => {
+                self.send_leg_request(req, dst).await;
+            }
+            resp @ SipMessage::Response(_) => {
+                self.send_routed_response(resp, dst).await;
+            }
+        }
+    }
+
+    /// Deliver a proxy-generated REQUEST to its leg target: RFC 5626 §5.2
+    /// flow targets (matched on the CONTACT-resolved address, aliased to
+    /// the flow's registered source for the connection lookup) go over
+    /// THAT connection with delivery/failure feedback; everything else
+    /// goes out the shared UDP socket. Returns the proxy actions produced
+    /// by flow-failure feedback (typically the fork's best-final forward).
+    async fn send_leg_request(&mut self, fwd: Request, dst: SocketAddr) -> Vec<proxy::Action> {
+        // Map a Contact-resolved fork target back to the flow's actual
+        // connection peer (NAT/WebRTC: Contact host:port ≠ conn peer).
+        let peer = self.flow_alias.get(&dst).copied().unwrap_or(dst);
+        let conn = self
+            .registry
+            .lock()
+            .expect("registry lock")
+            .get(&peer)
+            .cloned();
+        let is_flow = self.proxy.reliable_targets.contains(&peer);
+        match conn {
+            Some(tx) => {
+                let bytes = serialize(&SipMessage::Request(fwd.clone()));
+                match tx.try_send(bytes) {
+                    Ok(()) => {
+                        self.proxy.leg_delivered(&fwd, std::time::Instant::now());
+                        Vec::new()
+                    }
+                    Err(e) => {
+                        tracing::warn!(%dst, "flow write failed: {e}");
+                        self.proxy
+                            .leg_transport_failed(&fwd, std::time::Instant::now())
+                    }
+                }
+            }
+            None if is_flow => {
+                // Registered flow, connection gone: §5.2 430 Flow Failed
+                // for that branch.
+                self.proxy
+                    .leg_transport_failed(&fwd, std::time::Instant::now())
+            }
+            None => {
+                let bytes = serialize(&SipMessage::Request(fwd));
+                self.send_datagram(&bytes, dst).await;
+                Vec::new()
+            }
+        }
     }
 
     async fn handle_response(&mut self, resp: Response, from: Responder) {
@@ -316,15 +350,16 @@ impl Core {
 
         // RFC 3261 §18.2.2: prefer the learned per-call endpoint for the
         // upstream-bound responses; downstream requests (the leg-ACK the
-        // client tx generated) route by address.
+        // client tx generated, §16.8 CANCELs from a Timer-C fire) route
+        // flow-aware — a leg toward a registered flow gets them over the
+        // connection, not as a doomed UDP datagram.
         let call_id = resp.headers.call_id().unwrap_or("").to_string();
         let client = self.clients.get(&call_id).cloned();
         for action in forwarded {
             let proxy::Action::Send(msg, dst) = action;
             match &msg {
-                SipMessage::Request(req) => {
-                    let bytes = serialize(&SipMessage::Request(req.clone()));
-                    self.send_datagram(&bytes, dst).await;
+                SipMessage::Request(_) => {
+                    self.dispatch_proxy_action(msg, dst).await;
                 }
                 SipMessage::Response(_) => {
                     if let Some(client) = &client {
@@ -397,6 +432,7 @@ impl Core {
     fn sync_bindings(&mut self) {
         self.proxy.bindings.clear();
         self.proxy.reliable_targets.clear();
+        self.flow_alias.clear();
         for (aor, entry) in &self.registrar.aors {
             // Aors are "sip:<user>@<domain>" — the proxy keys bindings by
             // the bare user part (request-URI user), not "sip:<user>".
@@ -413,13 +449,18 @@ impl Core {
                 self.proxy.bindings.insert(user, contacts);
             }
             // RFC 5626 §5.2: bindings registered over a reliable flow are
-            // delivered over THAT flow — the proxy marks the flow's peer
-            // address as a reliable target (reliable leg timers + §5.2
-            // delivery feedback), and this core routes requests toward it
-            // over the registered connection.
+            // delivered over THAT flow. Mark BOTH the flow's peer source
+            // AND the Contact-resolved address as reliable targets — the
+            // proxy resolves fork targets from the CONTACT (§16.6 step 5),
+            // which in the NAT/WebRTC case differs from the connection's
+            // peer address; flow_alias maps one back to the other so the
+            // delivery finds the actual connection.
             for b in active.iter().filter(|b| b.flow) {
                 if let Ok(addr) = b.source.parse::<SocketAddr>() {
                     self.proxy.reliable_targets.insert(addr);
+                    let contact_addr = proxy::resolve_target(&b.contact, 5060);
+                    self.proxy.reliable_targets.insert(contact_addr);
+                    self.flow_alias.insert(contact_addr, addr);
                 }
             }
         }

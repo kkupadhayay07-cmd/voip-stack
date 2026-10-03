@@ -1532,3 +1532,133 @@ fn freed_stream_id_is_reused_after_exhaustion() {
         "ordered delivery on the reused id (SSN restart accepted)"
     );
 }
+
+/// Harness with a bounded outbound stream space on both sides so the
+/// allocator's wrap-around second pass reuses a freed parity id.
+fn new_with_os_streams(os: u16) -> Harness {
+    let base = Instant::now();
+    let client = SctpEndpoint::new_client(
+        SctpConfig {
+            is_client: true,
+            rto_initial: RTO,
+            rto_min: Duration::from_millis(50),
+            os_streams: os,
+            initial_tag: Some(111),
+            initial_tsn: Some(1000),
+            ..SctpConfig::default()
+        },
+        base,
+    )
+    .unwrap();
+    let server = SctpEndpoint::new_server(SctpConfig {
+        is_client: false,
+        rto_initial: RTO,
+        rto_min: Duration::from_millis(50),
+        os_streams: os,
+        initial_tag: Some(222),
+        initial_tsn: Some(2000),
+        cookie_key: Some([7u8; 32]),
+        ..SctpConfig::default()
+    });
+    let mut h = Harness {
+        client,
+        server,
+        now: base,
+        net: VecDeque::new(),
+        log: Vec::new(),
+        client_events: Vec::new(),
+        server_events: Vec::new(),
+    };
+    h.drain_to_net();
+    h
+}
+
+/// Audit round (Task 59) — RFC 3758 × RFC 6525 interaction: a stale
+/// FORWARD-TSN skip point recorded BEFORE a stream reset must not suppress
+/// the REUSED stream id's skips. Without the `ftsn_reported` invalidation,
+/// the reused channel's abandoned ssn-0 message is never announced and the
+/// peer parks every later ordered message forever.
+#[test]
+fn forward_tsn_skip_survives_stream_id_reuse() {
+    let mut h = new_with_os_streams(4);
+    h.handshake();
+
+    // Channel A on stream 0 (parity space is {0, 2} with os_streams 4).
+    let a = h
+        .client
+        .open_data_channel("a", "", ChannelType::MaxRetransmits(0), h.now)
+        .unwrap();
+    assert_eq!(a, 0);
+    h.drain_to_net();
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+
+    // An ordered PR message is lost, then abandoned at T3: the client
+    // announces the FORWARD-TSN skip and records ftsn_reported[0] = 0.
+    h.client_send(0, b"dead".to_vec());
+    assert!(h.drop_first(true));
+    h.deliver_all();
+    h.advance(RTO);
+    h.drain_to_net();
+    h.deliver_all();
+    let ftsn_after_loss = h.client.stats().ftsn_tx;
+    assert!(ftsn_after_loss >= 1, "the skip must be announced");
+
+    // Channel B takes stream 2, then BOTH channels close (RFC 8831 §6.7):
+    // resets complete, ids 0 and 2 are freed.
+    let b = h
+        .client
+        .open_data_channel("b", "", ChannelType::MaxRetransmits(0), h.now)
+        .unwrap();
+    assert_eq!(b, 2);
+    h.drain_to_net();
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+    h.client.close_channel(0, h.now).unwrap();
+    for _ in 0..3 {
+        h.drain_to_net();
+        h.deliver_all();
+    }
+    // One reset request at a time: close B only after A's reset completed.
+    h.client.close_channel(2, h.now).unwrap();
+    for _ in 0..3 {
+        h.drain_to_net();
+        h.deliver_all();
+    }
+    assert_eq!(closed_streams(&h.take_client_events()), vec![0, 2]);
+
+    // Reopen: the allocator's first pass finds nothing (high-water at the
+    // limit), the wrap pass reuses stream 0 — with its SSNs restarting at 0.
+    let c = h
+        .client
+        .open_data_channel("c", "", ChannelType::MaxRetransmits(0), h.now)
+        .unwrap();
+    assert_eq!(c, 0, "the parity space wrapped back to the reused id");
+    h.drain_to_net();
+    h.deliver_all();
+    h.drain_to_net();
+    h.deliver_all();
+
+    // On the REUSED stream: an ordered message is lost and abandoned. The
+    // stale skip point must not suppress the new (0, 0) announcement.
+    h.client_send(0, b"dead-2".to_vec());
+    assert!(h.drop_first(true));
+    h.deliver_all();
+    h.advance(RTO);
+    h.drain_to_net();
+    h.deliver_all();
+    assert!(
+        h.client.stats().ftsn_tx > ftsn_after_loss,
+        "the reused stream's skip must be announced again"
+    );
+
+    // And the next ordered message must DELIVER — no head-of-line stall.
+    h.client_send(0, b"alive-2".to_vec());
+    h.deliver_all();
+    assert_eq!(
+        msgs(&h.take_server_events()),
+        vec![(0u16, b"alive-2".to_vec())]
+    );
+}

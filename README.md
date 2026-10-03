@@ -13,7 +13,7 @@ transcoding media bridge, outbound trunk support (IP / Digest / Bearer /
 mTLS auth), an AI media tap, a REST/WebSocket control plane, and in-process
 observability (pcap + per-call traces + CDRs, all correlated by SIP Call-ID).
 
-**Current state: 692 tests passing across 74 suites in 22 crates;
+**Current state: 704 tests passing across 74 suites in 22 crates;
 `clippy -D warnings` clean; `cargo audit` clean. The external security/interop
 audit (42 findings) is fully closed — every Critical, High and P2 (Medium/Low)
 finding is fixed with regression tests
@@ -101,7 +101,7 @@ with the call surviving (leg B rolled back to its original offer).
 # Prereqs: rustup (stable) + libopus + OpenSSL dev
 sudo apt-get install -y pkg-config libopus-dev libssl-dev
 
-cargo test --workspace                    # 692 tests: unit + integration + RFC vectors
+cargo test --workspace                    # 704 tests: unit + integration + RFC vectors
 ./demo/run_loopback_demo.sh               # B2BUA loopback call (UAC→B2BUA→UAS + CDR)
 ./demo/run.sh                             # full zrtc daemon demo: REGISTER, TCP/TLS/WSS
                                           # listener probes, inbound + outbound calls,
@@ -325,7 +325,16 @@ Wireshark) and per-call `trace-*.log` files with per-leg media counters
    the leg terminates and a synthetic **430 Flow Failed** enters the
    fork's response context, so the upstream receives another leg's
    answer or the 430 — the missing piece for real-browser calls through
-   the proxy.
+   the proxy. **Audit round hardened ✅** (Task 59): completed forks
+   carry a tombstone so a late sibling final is dropped (§16.7 step 5)
+   and a retransmitted original INVITE replays the forwarded final
+   instead of re-forking (RFC 6026); every proxy-generated request (§16.8
+   CANCELs, leg ACKs) reaches flow targets over their connection; a
+   CANCEL with no matching state answers 481 (§16.10) and targets only
+   pending legs; an ACK with Max-Forwards: 0 can no longer underflow the
+   decrement; fork Via transports match the leg transport (§18.1.1); a
+   reliable leg is released by Timer D after its 2xx (no leak); and
+   IPv6 contacts resolve.
 5. WebRTC hardening — library layer ✅ (RFC 4585 NACK, RFC 4588 RTX,
    transport-cc feedback in `crates/rtp`) **and B2BUA RTCP plumbing ✅**
    (SR/RR + NACK answer/ask + TWCC feedback live on every media leg)

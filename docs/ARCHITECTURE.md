@@ -104,7 +104,7 @@ the seam.
 | Transport | UDP/TCP/TLS/WS/WSS inside the `zrtc` daemon (message-layer framing in `sip-core`) | 1–2 |
 | Media transport | `rtp` (packets, jitter buffer, DTMF), `srtp`, `dtls`, `ice` (+STUN/TURN), `sctp` (data-channel engine) | 1–2 |
 | Codecs | `codecs` (G.711/G.722/G.729/Opus/L16/CN/PLC/resample) | 1 |
-| Roles | `b2bua`, `registrar`, `proxy`, `sbc` (the proxy drives §17 legs per fork, §16.7 step 6 best-response selection, and RFC 5626 §5.2 flow delivery over registered reliable connections) | 1, 3 |
+| Roles | `b2bua`, `registrar`, `proxy`, `sbc` (the proxy drives §17 legs per fork, §16.7 step 6 best-response selection with completion tombstones that replay the forwarded final to retransmissions, and RFC 5626 §5.2 flow delivery over registered reliable connections — every proxy-generated request, CANCELs and leg ACKs included, rides the flow) | 1, 3 |
 | Media services | `media` (mix, record, transcode, VAD) | 4 |
 | Business | `dialer`, `cdr`, `ai-bridge` | 5 |
 | Control plane | `api` (REST + WS, metrics), `zrtc` binary | 6 |

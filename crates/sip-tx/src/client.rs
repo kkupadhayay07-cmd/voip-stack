@@ -168,11 +168,15 @@ impl ClientInviteTx {
                 self.timer_b = None;
                 if resp.class() == 2 {
                     // 2xx: the transaction ends; the dialog layer owns ACK
-                    // retransmission. Timer D only gates memory release.
+                    // retransmission (§17.2.3 — no ACK transaction here).
+                    // Timer D is armed on EVERY transport: it gates memory
+                    // release only, but without it a reliable-transport
+                    // transaction reaches Terminated with no deadline and
+                    // no DeleteTransaction action — a caller that removes
+                    // transactions on that action (the proxy's leg map)
+                    // leaks the entry forever. On UDP Timer D additionally
+                    // absorbs retransmitted 2xx (§17.1.1.2).
                     self.state = TxState::Terminated;
-                    if self.transport.is_reliable() {
-                        return vec![TxAction::PassToTu(SipMessage::Response(resp))];
-                    }
                     self.timer_d = Some(add(now, self.cfg.timer_d()));
                     return vec![TxAction::PassToTu(SipMessage::Response(resp))];
                 }

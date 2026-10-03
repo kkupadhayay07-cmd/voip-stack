@@ -230,6 +230,12 @@ struct Call {
     /// Pending caller-initiated renegotiation (RFC 3264 §8): the caller's
     /// re-INVITE is parked until leg B answers our relayed offer.
     a_reneg: Option<AReneg>,
+    /// The final response of the last COMPLETED caller renegotiation
+    /// (CSeq, response as sent). A UDP retransmission of that re-INVITE is
+    /// answered by replaying these bytes verbatim — never by starting a
+    /// second relay (a fresh leg-B CSeq + offer per retransmission would
+    /// multiply B-side transactions and glare windows on every loss).
+    a_reneg_done: Option<(u32, sip_core::Response)>,
     /// The leg-B re-INVITE currently in flight is a ROLLBACK (its answer
     /// changed the negotiated media): the 2xx restores the original media
     /// and must NOT be relayed to leg A (already failed 488).
@@ -264,6 +270,7 @@ impl Call {
             b_421_retried: false,
             a_ack_deadline: None,
             a_reneg: None,
+            a_reneg_done: None,
             b_reneg_rollback: false,
             created: Instant::now(),
         }
@@ -1564,11 +1571,28 @@ impl B2bua {
                                     .and_then(|a| a.value.as_deref())
                                     .and_then(|v| v.parse::<u16>().ok())
                                     .unwrap_or(datachan::DEFAULT_SCTP_PORT);
+                                // RFC 8841: the answer's a=max-message-size
+                                // is the PEER's inbound limit — sending
+                                // past it makes the peer ABORT the whole
+                                // association. Honor it (bounded by our
+                                // own default) instead of keeping 256 KiB
+                                // blind.
+                                let answer_mis = dc_m
+                                    .attributes
+                                    .iter()
+                                    .find(|a| a.name == "max-message-size")
+                                    .and_then(|a| a.value.as_deref())
+                                    .and_then(|v| v.parse::<usize>().ok());
+                                let max_message_size = match answer_mis {
+                                    Some(m) if m > 0 => m.clamp(1024, 256 * 1024),
+                                    _ => 256 * 1024,
+                                };
                                 let (dtls_tx, dtls_rx) = tokio::sync::mpsc::unbounded_channel();
                                 dc_handle = Some(datachan::spawn(
                                     datachan::DataChannelConfig {
                                         remote_sctp_port,
                                         we_are_dtls_client: est.we_are_dtls_client,
+                                        max_message_size,
                                         ..datachan::DataChannelConfig::default()
                                     },
                                     est.dtls,
@@ -2132,7 +2156,7 @@ impl B2bua {
         let ack = RequestBuilder::new(Method::Ack, req_uri)
             .via(TransportKind::Udp, &via_sent_by(), Some(&new_branch()))
             .from(&format!("<sip:zrtc@b2bua>;tag={}", b.dialog.local_tag()))
-            .to(&format!("<sip:peer>;tag={}", b.dialog.remote_tag_value()))
+            .to(&dialog_to_header(&b.dialog))
             .call_id(Some(b.dialog.call_id()))
             .cseq(cseq)
             .build();
@@ -2151,7 +2175,7 @@ impl B2bua {
         let bye = RequestBuilder::new(Method::Bye, req_uri)
             .via(TransportKind::Udp, &via_sent_by(), Some(&new_branch()))
             .from(&format!("<sip:zrtc@b2bua>;tag={}", leg.dialog.local_tag()))
-            .to(&format!("<sip:peer>;tag={}", leg.dialog.remote_tag_value()))
+            .to(&dialog_to_header(&leg.dialog))
             .call_id(Some(leg.dialog.call_id()))
             .cseq(cseq)
             .build();
@@ -2297,6 +2321,9 @@ impl B2bua {
         // Pending renegotiation CSeq, read before the leg borrow: an equal
         // CSeq below is held, a higher one glares.
         let reneg_cseq = call.a_reneg.as_ref().map(|r| r.cseq);
+        // The last COMPLETED renegotiation (read before the leg borrow): an
+        // equal CSeq is that re-INVITE retransmitted — replay its final.
+        let reneg_done = call.a_reneg_done.as_ref().map(|(s, r)| (*s, r.clone()));
         let Some(a) = call.leg_a.as_mut() else {
             return;
         };
@@ -2340,6 +2367,19 @@ impl B2bua {
                 .send_to(&serialize(&SipMessage::Response(resp)), src)
                 .await;
             return;
+        }
+        // §12.2.2: an equal CSeq whose transaction already COMPLETED is the
+        // re-INVITE retransmitted (the caller lost our final). Replay the
+        // cached response verbatim instead of re-running the relay — a
+        // second relay would consume a fresh leg-B CSeq and multiply B-side
+        // glare windows per loss.
+        if let Some((done_seq, done_resp)) = &reneg_done {
+            if *done_seq == seq {
+                let _ = sock
+                    .send_to(&serialize(&SipMessage::Response(done_resp.clone())), src)
+                    .await;
+                return;
+            }
         }
         // §12.2.2: a Contact on an in-dialog request refreshes the target.
         if let Some(c) = req.headers.get("Contact") {
@@ -2904,8 +2944,14 @@ impl B2bua {
             );
         }
         let _ = sock
-            .send_to(&serialize(&SipMessage::Response(response)), reneg.src)
+            .send_to(
+                &serialize(&SipMessage::Response(response.clone())),
+                reneg.src,
+            )
             .await;
+        // Cache the final so a retransmitted re-INVITE replays it verbatim
+        // (§12.2.2 idempotence — no second relay, no new leg-B CSeq).
+        call.a_reneg_done = Some((reneg.cseq, response));
         // Adopt the new session state and re-anchor the RFC 4028 clock.
         if let Some(plan) = reneg.a_plan.clone() {
             a.plan = Some(plan);
@@ -2953,6 +2999,8 @@ impl B2bua {
             Vec::new(),
             Some(a.dialog.local_tag()),
         );
+        // Cache the final so a retransmitted re-INVITE replays it verbatim.
+        call.a_reneg_done = Some((reneg.cseq, response.clone()));
         let _ = sock
             .send_to(&serialize(&SipMessage::Response(response)), reneg.src)
             .await;
@@ -3174,7 +3222,7 @@ impl B2bua {
                 let prack = RequestBuilder::new(Method::Prack, req_uri)
                     .via(TransportKind::Udp, &via_sent_by(), Some(&new_branch()))
                     .from(&format!("<sip:zrtc@b2bua>;tag={}", b.dialog.local_tag()))
-                    .to(&format!("<sip:peer>;tag={}", b.dialog.remote_tag_value()))
+                    .to(&dialog_to_header(&b.dialog))
                     .call_id(Some(b.dialog.call_id()))
                     .cseq(cseq)
                     .header("RAck", &format!("{rseq} {invite_cseq} INVITE"))
@@ -3484,6 +3532,22 @@ fn leg_timer_action(leg: &Leg, now: Instant) -> Option<TimerAction> {
     }
 }
 
+/// The To header value for an in-dialog request (RFC 3261 §12.2): the
+/// dialog's remote target URI (the peer's Contact) with its tag — never a
+/// placeholder host. Most stacks match on tag alone, but a strict UAS/edge
+/// that routes on the To user-part mis-processes requests addressed to a
+/// bogus `sip:peer` URI.
+fn dialog_to_header(dialog: &Dialog) -> String {
+    let tag = dialog.remote_tag_value();
+    match dialog.remote_target() {
+        Some(t) => {
+            let bare = t.trim().trim_start_matches('<').trim_end_matches('>');
+            format!("<{bare}>;tag={tag}")
+        }
+        None => format!("<sip:peer>;tag={tag}"),
+    }
+}
+
 /// Builds a no-change session-refresh re-INVITE (RFC 4028 §7.2) for a leg.
 /// The body, when present, is the leg's original offer byte-for-byte.
 fn refresh_reinvite(leg: &Leg, cseq: u32, we_are_uas: bool, offer: Vec<u8>) -> Request {
@@ -3491,7 +3555,7 @@ fn refresh_reinvite(leg: &Leg, cseq: u32, we_are_uas: bool, offer: Vec<u8>) -> R
     let mut invite = RequestBuilder::new(Method::Invite, req_uri)
         .via(TransportKind::Udp, &via_sent_by(), Some(&new_branch()))
         .from(&format!("<sip:zrtc@b2bua>;tag={}", leg.dialog.local_tag()))
-        .to(&format!("<sip:peer>;tag={}", leg.dialog.remote_tag_value()))
+        .to(&dialog_to_header(&leg.dialog))
         .call_id(Some(leg.dialog.call_id()))
         .cseq(cseq)
         .contact("<sip:zrtc@b2bua>")

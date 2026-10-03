@@ -239,6 +239,15 @@ configured bounds. Guidance:
    the registered connection (write-confirmed delivery stops leg
    retransmissions) and a dead flow becomes a 430 Flow Failed candidate in
    the fork's best-response context — the path real browsers will use.
+   **Audit round (Task 59)**: completed forks tombstone their forwarded
+   final — late sibling finals are dropped (§16.7 step 5) and a
+   retransmitted INVITE replays it instead of re-forking (RFC 6026);
+   CANCELs and leg ACKs toward flow targets ride the connection too (the
+   whole request dispatch is conn-aware, and a Contact-resolved fork
+   target aliases back to the flow's peer address for the NAT case); a
+   stateless CANCEL answers 481 (§16.10) and only pending legs are
+   CANCELed; an ACK with Max-Forwards: 0 no longer underflows the
+   decrement; fork Via transports match the leg transport (§18.1.1).
 3. **In-dialog SDP renegotiation** (RFC 3264 §8) ✅ shipped — the caller's
    changed re-INVITE offer is relayed to leg B and the answer completes
    the caller's 200; media-preserving (codec/PT must be unchanged — the

@@ -642,13 +642,20 @@ fn encode_chunk_into(chunk: &Chunk, out: &mut Vec<u8>) {
             let mut body = Vec::with_capacity(12 + s.gaps.len() * 4 + s.dups.len() * 4);
             body.extend_from_slice(&s.cum_tsn.to_be_bytes());
             body.extend_from_slice(&s.a_rwnd.to_be_bytes());
-            body.extend_from_slice(&(s.gaps.len() as u16).to_be_bytes());
-            body.extend_from_slice(&(s.dups.len() as u16).to_be_bytes());
-            for g in &s.gaps {
+            // The SACK header fields are u16 COUNTS: a non-default receive
+            // window under heavy reordering could in principle exceed 65535
+            // gap runs — truncating would wrap the chunk length and corrupt
+            // the wire. Clamp instead (the peer re-requests the dropped
+            // gap blocks via its own duplicate detection).
+            let gap_count = std::cmp::min(s.gaps.len(), u16::MAX as usize);
+            let dup_count = std::cmp::min(s.dups.len(), u16::MAX as usize);
+            body.extend_from_slice(&(gap_count as u16).to_be_bytes());
+            body.extend_from_slice(&(dup_count as u16).to_be_bytes());
+            for g in s.gaps.iter().take(gap_count) {
                 body.extend_from_slice(&g.start.to_be_bytes());
                 body.extend_from_slice(&g.end.to_be_bytes());
             }
-            for d in &s.dups {
+            for d in s.dups.iter().take(dup_count) {
                 body.extend_from_slice(&d.to_be_bytes());
             }
             encode_chunk(CT_SACK, 0, &body, out);

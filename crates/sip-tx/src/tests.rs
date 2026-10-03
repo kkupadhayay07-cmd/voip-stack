@@ -773,3 +773,33 @@ fn reset_timer_c_extends_pending_invite() {
         "Completed: Timer D stands, reset is a no-op"
     );
 }
+
+// 17. Audit round (Task 59): a 2xx on a RELIABLE transport arms Timer D
+//     (memory-release gate) so the transaction reaches DeleteTransaction —
+//     a Terminated transaction with no deadline leaks in callers that
+//     remove entries on that action (the proxy's leg map).
+#[test]
+fn reliable_2xx_arms_timer_d_for_release() {
+    let c = Clock::new();
+    let mut tx = ClientInviteTx::new(base_req(Method::Invite), Transport::Tcp);
+    assert_send_request(&tx.on_event(TxEvent::Send, c.at(0)), 1);
+    let actions = tx.on_event(
+        TxEvent::Received(resp_for(tx.request(), 200, BRANCH, Some("t"))),
+        c.at(100),
+    );
+    assert_pass_to_tu(&actions, 200);
+    assert!(
+        !actions.contains(&TxAction::DeleteTransaction),
+        "no immediate delete: Timer D gates the release"
+    );
+    assert_eq!(
+        tx.next_deadline(),
+        Some(c.at(32_100)),
+        "Timer D armed on the reliable transport too"
+    );
+    assert!(tx.on_event(TxEvent::Timeout, c.at(32_099)).is_empty());
+    assert_eq!(
+        tx.on_event(TxEvent::Timeout, c.at(32_100)),
+        vec![TxAction::DeleteTransaction]
+    );
+}

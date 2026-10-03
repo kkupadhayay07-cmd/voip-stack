@@ -280,7 +280,10 @@ impl NackTracker {
 /// with the TWCC monitor's extended-sequence bookkeeping.
 pub(crate) fn wrap_diff(new: u16, old: u16) -> i64 {
     let d = new as i64 - old as i64;
-    if d > 32768 {
+    // RFC 3550 §A.1 canonical comparison: backward wrap above 32767, forward
+    // wrap below -32768 — so the ±32768 boundary classifies CONSISTENTLY
+    // (half a cycle behind), not one-of-two by sign.
+    if d > 32767 {
         d - 65536
     } else if d < -32768 {
         d + 65536

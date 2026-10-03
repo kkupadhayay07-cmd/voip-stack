@@ -127,7 +127,10 @@ pub fn parse(buf: &[u8]) -> Result<Option<DataChannelOpen>, SctpError> {
         return Err(SctpError::BadChunk("DCEP message empty"));
     }
     match buf[0] {
-        MSG_ACK => Ok(None),
+        // §5: an ACK is EXACTLY one byte — a longer 0x02-prefixed buffer is
+        // garbage that would otherwise forge a channel acknowledgment.
+        MSG_ACK if buf.len() == 1 => Ok(None),
+        MSG_ACK => Err(SctpError::BadChunk("DCEP ACK with trailing bytes")),
         MSG_OPEN => {
             if buf.len() < 12 {
                 return Err(SctpError::BadChunk("DCEP OPEN < 12 bytes"));
@@ -139,6 +142,9 @@ pub fn parse(buf: &[u8]) -> Result<Option<DataChannelOpen>, SctpError> {
             let proto_len = u16::from_be_bytes([buf[10], buf[11]]) as usize;
             if buf.len() < 12 + label_len + proto_len {
                 return Err(SctpError::BadChunk("DCEP OPEN label/protocol truncated"));
+            }
+            if buf.len() > 12 + label_len + proto_len {
+                return Err(SctpError::BadChunk("DCEP OPEN with trailing bytes"));
             }
             let label = String::from_utf8_lossy(&buf[12..12 + label_len]).into_owned();
             let protocol =

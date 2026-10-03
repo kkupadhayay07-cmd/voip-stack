@@ -268,11 +268,21 @@ pub fn start_with_socket_session(
 pub fn start_with_socket_session_crypto(
     cfg: PumpConfig,
     rtp: Arc<UdpSocket>,
-    crypto: Option<CryptoPair>,
+    mut crypto: Option<CryptoPair>,
     bridge_out: mpsc::Sender<BridgeMsg>,
     bridge_in: mpsc::Receiver<BridgeMsg>,
     session: observ::CallSession,
 ) -> Result<PumpHandle, codecs::CodecError> {
+    // RFC 4588/4585 interplay: on a NACK-negotiated leg the peer may
+    // retransmit a packet FAR beyond the RFC 3711 default 64-packet replay
+    // window (at 50 pps audio that is ~1.3 s of loss; NackConfig holds out
+    // 2 s). Widen the receive window to the libwebrtc-class 4096 so late
+    // retransmissions are accepted instead of counted as replay failures.
+    if cfg.nack {
+        if let Some(cp) = crypto.as_mut() {
+            cp.rx.set_window_size(4096);
+        }
+    }
     let remote = Arc::new(Mutex::new(None::<SocketAddr>));
     let stats = Arc::new(MediaStats::default());
     let (stop_tx, stop) = watch::channel(false);
@@ -587,6 +597,32 @@ async fn run_pump(
                     }
                     let now_ms = started.elapsed().as_millis() as u64;
                     nack_tracker.on_packet(pkt.ssrc(), pkt.header.sequence, now_ms);
+                    // RFC 4585 Generic NACK send path — SAME as the
+                    // plaintext branch below. The SRTP split must not lose
+                    // it: a secured leg that negotiated a=rtcp-fb:nack
+                    // still has to request retransmissions (the tracker
+                    // alone would just grow its missing set while the leg
+                    // silently degrades to concealment).
+                    if cfg.nack {
+                        let media_ssrc = pkt.ssrc();
+                        let ready = nack_tracker.take_ready(now_ms);
+                        if !ready.is_empty() {
+                            stats.nacks_tx.fetch_add(ready.len() as u64, Relaxed);
+                            let p = nack_packet(ssrc, media_ssrc, &ready);
+                            // RFC 3550 §6.1 / RFC 4585 §6.1: a compound
+                            // starts with SR/RR — prefix an empty RR.
+                            let rr = RtcpPacket::ReceiverReport {
+                                ssrc,
+                                blocks: Vec::new(),
+                            };
+                            let mut nack_wire = encode_compound(&[rr, p]);
+                            if seal(&mut crypto, &mut nack_wire, true) {
+                                let _ = rtp.send_to(&nack_wire, src).await;
+                            } else {
+                                stats.srtp_failures.fetch_add(1, Relaxed);
+                            }
+                        }
+                    }
                     if let (Some(ext_id), Some(ext)) = (cfg.twcc_ext, pkt.extension.as_ref()) {
                         if let Some(tseq) = onebyte_ext_value(ext, ext_id) {
                             twcc.on_packet(tseq, Some(started.elapsed().as_micros() as u64));

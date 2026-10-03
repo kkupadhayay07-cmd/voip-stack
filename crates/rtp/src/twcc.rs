@@ -345,6 +345,11 @@ pub struct TwccRxMonitor {
     last_ext: i64,
     started: bool,
     pending: Vec<(i64, Option<u64>)>,
+    /// The most recent arrival time seen (µs): anchors the feedback
+    /// reference time when an all-loss window has no arrival of its own —
+    /// otherwise ref_time would encode the epoch (0), a spec oddity for
+    /// third-party senders reconstructing the arrival timeline.
+    last_seen_us: Option<u64>,
 }
 
 impl TwccRxMonitor {
@@ -354,11 +359,15 @@ impl TwccRxMonitor {
             last_ext: -1,
             started: false,
             pending: Vec::new(),
+            last_seen_us: None,
         }
     }
 
     /// Observe a packet (or a gap, via `arrival_us = None`).
     pub fn on_packet(&mut self, seq: u16, arrival_us: Option<u64>) {
+        if let Some(a) = arrival_us {
+            self.last_seen_us = Some(a);
+        }
         if !self.started {
             self.started = true;
             self.last_ext = seq as i64;
@@ -415,7 +424,15 @@ impl TwccRxMonitor {
             return None;
         }
         let base_ext = self.pending[0].0;
-        let ref_us = self.pending.iter().find_map(|(_, a)| *a).unwrap_or(0);
+        // Reference time anchors on the first arrival in the window; an
+        // all-loss window falls back to the most recent arrival ever seen
+        // (the window still reports the gap on the receive timeline).
+        let ref_us = self
+            .pending
+            .iter()
+            .find_map(|(_, a)| *a)
+            .or(self.last_seen_us)
+            .unwrap_or(0);
         // Reference time lives on the 64 ms grid, at or below the first
         // arrival, so the first delta stays non-negative.
         let ref_time_ms = (ref_us / 1_000 / REF_SCALE_MS as u64) * REF_SCALE_MS as u64;

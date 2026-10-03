@@ -89,7 +89,7 @@ Note: the `RequestBuilder::via` host:port mis-parse reported under P2 was
 
 ## Verification
 
-`cargo test --workspace` → **692 passing** across 74 suites, `clippy -D warnings`
+`cargo test --workspace` → **704 passing** across 74 suites, `clippy -D warnings`
 clean, `cargo fmt --check` clean, `./demo/run.sh` PASS.
 
 **The external audit is fully closed**: every finding at every severity —
@@ -457,3 +457,164 @@ by the borrow checker). Design notes recorded for the next auditor:
 
 Net after Task 58: **692 tests / 74 suites** (was 688/74) — proxy 25→29.
 No external-audit items affected; all previous fixes re-verified green.
+
+---
+
+## Task 59 — whole-codebase audit round (this commit)
+
+A fresh parallel deep-scan of all 22 crates (two independent reviewers: one on
+the proxy/zrtc/sip-tx path, one on the media/SCTP/data-channel path), with every
+candidate finding re-verified against the actual code before fixing. Two
+candidate findings were REJECTED on verification (SCTP `allocate_stream`'s
+`id < limit` excludes stream id 65535 — MIS is a stream COUNT, so ids 0..MIS-1
+are exactly right; the datachan timer loop's recompute was the only deadline
+source). Everything below was fixed in this commit, tests included.
+
+### Proxy / zrtc / sip-tx
+
+- **T59-1 (Major, leak):** a reliable-transport fork leg survived its own 2xx
+  forever. `ClientInviteTx` on a 2xx went `Terminated` with NO timer and NO
+  `DeleteTransaction` on reliable transports (Timer D was UDP-only), so the
+  proxy's poll — which removes legs on that action or on a deadline — never
+  fired. Every answered call forked to a flow target leaked its `Leg` (tx +
+  full forked INVITE clone). Fix: Timer D arms on EVERY transport on the 2xx
+  path (memory-release gate; on UDP it additionally absorbs retransmitted 2xx,
+  unchanged). sip-tx test + proxy `reliable_leg_removed_after_2xx_by_poll`.
+- **T59-2 (Major, fork race):** a sibling's non-2xx final arriving AFTER the
+  fork's 200 was forwarded leaked through the pass-through path upstream
+  (486 on an established dialog). Root cause: the 2xx path deletes the server
+  tx immediately, and the stray-final filter required a LIVE tx. Fix: a
+  per-fork tombstone (`completed: server_key → (forwarded final, instant)`)
+  survives the deleted tx and drops every later final (§16.7 step 5), leg ACK
+  still flowing. Test `late_final_after_2xx_is_dropped`.
+- **T59-3 (Major, non-INVITE fork):** the immediate-forward path's
+  `(!final_already || is_2xx)` applied the 2xx bypass to ALL methods, so a
+  second 200 on a forked REGISTER/MESSAGE both forwarded AND re-armed Timer J
+  on a Completed tx (§17.2.2 forbids any response but retransmissions of the
+  final). Fix: `forwards_now = !final_already` (the tombstone covers the
+  deleted-tx cases). Test `second_200_on_non_invite_fork_not_forwarded`.
+- **T59-4 (Major, re-fork):** a retransmitted INVITE after fork completion
+  (final forwarded, server tx deleted on the 2xx) was treated as brand-new:
+  fresh server tx + re-fork to all targets + second 100 mid-call. Fix: the
+  tombstone answers a retransmitted original request with the forwarded final
+  (RFC 6026), with the 64·T1 window enforced at LOOKUP (poll only bulk-sweeps)
+  so a post-window request forks fresh. Test
+  `retransmitted_invite_after_2xx_replays_final_not_refork`.
+- **T59-5 (Major, flow delivery):** proxy-generated REQUEST actions from the
+  pump ticker (§16.8 Timer-C CANCELs) and from `handle_response` (leg ACKs)
+  went out `send_datagram` unconditionally — a WSS/TCP flow target has no UDP
+  endpoint, so the CANCEL was lost (callee rings forever after the fork
+  completed) and the 487-ACK was lost (downstream retransmits until Timer H).
+  Fix: zrtc's dispatch unified — `dispatch_proxy_action` / `send_leg_request`
+  route every proxy-generated request (forks, CANCELs, ACKs, retransmissions)
+  through the same conn-aware flow delivery with §5.2 feedback.
+- **T59-6 (Major, NAT):** `reliable_targets` was keyed by the flow
+  registration's SOURCE address while fork targets resolve from the CONTACT —
+  in the normal NAT/WebRTC case (Contact host:port ≠ connection peer) the
+  flow lookup missed and the INVITE went out as a doomed UDP datagram. Fix:
+  `sync_bindings` marks BOTH the source and the Contact-resolved address as
+  reliable targets and maintains `flow_alias: contact → source` so delivery
+  finds the actual connection.
+- **T59-7 (Major, u32 underflow):** an ACK carrying `Max-Forwards: 0` skipped
+  the §16.3 483 check (an ACK is never answered) and hit `mf - 1` in
+  `prepare_base` — a debug-build PANIC inside the pump on wire-reachable
+  input (release: wraps to 4294967295). Fix: `saturating_sub(1)`. Test
+  `ack_with_max_forwards_zero_does_not_underflow`.
+- **T59-8 (Minor):** a CANCEL matched legs by call-id+branch regardless of tx
+  state, CANCELing already-completed legs (§9.1 authorizes CANCELs only for
+  pending transactions). Fix: filter to Trying/Proceeding. Test
+  `cancel_targets_only_pending_legs`.
+- **T59-9 (Minor):** a CANCEL matching no INVITE state was answered 200; §16.10
+  requires 481 when the proxy has no matching transaction. Fix: 481 (through
+  the CANCEL's own server tx so retransmissions are absorbed) unless a pending
+  leg, a live INVITE server tx, or a tombstone matches. Test
+  `cancel_without_state_answers_481`.
+- **T59-10 (Minor, forgery):** `process_response` relayed any final whose
+  top Via carried a branch, even a foreign one — a one-shot response
+  amplifier through a forged top Via. zrtc already dropped foreign responses
+  at its boundary; the proxy crate now enforces §16.7 step 1 itself (top Via
+  host must be ours). Test `foreign_response_is_discarded`.
+- **T59-11 (Minor, leak):** zrtc's learned `clients` map removed an entry only
+  when the CALLER sent BYE/CANCEL — a callee-side BYE (relayed from the
+  b2bua) leaked one Responder (writer-channel handle) per call. Fix: the
+  core→client BYE/CANCEL path drops the entry too.
+- **T59-12 (Minor):** `resolve_target` split host:port with `rsplit_once(':')`:
+  a bare IPv6 literal became port `1` on a mangled host, a bracketed literal
+  failed to parse and fell back to 127.0.0.1. Fix: bracket-aware parsing +
+  bare-v6 whole-host handling; `resolve_target` is now `pub` (shared with
+  zrtc's flow-alias mapping). Test `resolve_target_parses_ipv6`.
+- **T59-13 (Minor):** forked requests always stamped a UDP Via even for
+  reliable (flow) legs (§18.1.1: the sent-by transport must match the one
+  used). Fix: `make_via` takes the leg transport; flow legs stamp TCP. Test
+  `via_transport_matches_leg_transport`.
+- **Deferred (documented honest gap, not fixed):** RFC 2543 (cookie-less)
+  retransmission matching is not implemented — non-`z9hG4bK` requests never
+  match a server tx and would re-fork; legacy-only, and §17.2.3 cookie-less
+  matching needs sent-by+CSeq+To-tag state the tx keys do not carry.
+- **Deferred:** RFC 3264 direction attributes are honored in SDP answers but
+  not end-to-end: a re-INVITE hold (sendonly/inactive) is not propagated to
+  leg B's offer and the pumps do not gate sends on the negotiated direction
+  (session state and media behavior can disagree during hold).
+
+### SCTP / b2bua / rtp
+
+- **T59-14 (Major, stall):** `ftsn_reported` (RFC 3758 per-stream skip
+  points) survived stream resets and channel removal. After an id was reused,
+  the stale skip point suppressed the new stream's FORWARD-TSN skips
+  (`ssn_le(0, stale)` is always true) and the receiver parked every later
+  ordered message forever — a silent permanent head-of-line stall. Fix: the
+  entry is invalidated on reset completion (both outgoing paths), on
+  incoming-reset, and on the abandoned-reset timeout path. Loopback test
+  `forward_tsn_skip_survives_stream_id_reuse` (os_streams=4 wrap-reuse).
+- **T59-15 (Major):** Generic NACK requests were never SENT on SRTP-secured
+  legs — the tracker ran (`on_packet`) but the `take_ready` + send block
+  existed only in the plaintext branch (an omission from the SRTP split), so
+  a lossy WebRTC leg silently degraded to concealment. Fix: the same NACK
+  send path (RR-prefixed compound, `seal`-protected) added to the secured
+  branch.
+- **T59-16 (Major):** NACK retransmissions ride the ORIGINAL sequence
+  numbers re-protected fresh, but the SRTP replay window was hard-capped at
+  64 packets — beyond ~1.3 s of audio loss (0.2 s at video rates) every late
+  retransmission failed the peer's replay check. Fix: `set_window_size`
+  clamp raised to 4096 (libwebrtc class; RFC 3711 allows any receiver
+  window; the constructor default stays 64) and the pump widens the rx
+  window to 4096 when the leg negotiated NACK.
+- **T59-17 (Minor):** the b2bua data-channel loop computed the engine timer
+  only when it was `None`, so deadlines created by inputs (close_channel's
+  RFC 6525 retransmission timer, T3/FTSN) were slept through until the
+  stale earlier deadline elapsed. Fix: recompute every iteration.
+- **T59-18 (Minor):** leg B parsed only `a=sctp-port` from the answer — a
+  peer's `a=max-message-size` was ignored and an oversized send would ABORT
+  the peer's association (killing ALL channels). Fix: the answer's MIS is
+  honored (clamped 1 KiB–256 KiB).
+- **T59-19 (Minor):** a retransmitted re-INVITE whose final was already sent
+  re-executed the whole renegotiation relay (fresh leg-B CSeq + offer per
+  retransmission). Fix: the completed re-INVITE's final is cached per call
+  and replayed verbatim on an equal CSeq (§12.2.2 idempotence).
+- **T59-20 (Minor):** in-dialog requests (BYE, re-INVITE, PRACK) wrote the To
+  header as the placeholder `<sip:peer>;tag=…` instead of the dialog's remote
+  target URI (§12.2). Fix: `dialog_to_header` uses the stored remote target.
+- **T59-21 (Minor, latent wire):** the SACK encoder cast gap/dup counts to
+  u16 unguarded — a non-default receive window under heavy reordering could
+  wrap the chunk length and corrupt the wire. Fix: counts clamped (dropped
+  gap blocks re-request naturally).
+- **T59-22 (Minor):** DCEP accepted any 0x02-prefixed buffer as an ACK and
+  trailing garbage after an OPEN — inconsistent with the strict
+  malformed-DCEP-aborts policy. Fix: exact-length checks for both.
+- **T59-23 (Nit):** `stats.retransmits_tx` counted retransmissions that the
+  same T3 pass abandoned (never sent). Fix: the counter increments only when
+  a retransmission actually goes out.
+- **T59-24 (Nit):** `wrap_diff` classified the ±32768 boundary
+  inconsistently (+32768 forward, −32768 backward). Fix: RFC 3550 §A.1
+  canonical comparison (backward above 32767, forward below −32768).
+- **T59-25 (Nit):** `TwccRxMonitor::build_feedback` on an all-loss window
+  emitted `ref_time_ms = 0` (epoch 1970). Fix: fall back to the most recent
+  arrival ever seen.
+- **Accepted (documented, not fixed):** dialog `take_cseq` saturates at
+  u32::MAX (unreachable in practice) and a UAC dialog treats a peer CSeq of
+  0 as a retransmission (grammar-legal, never seen); DCEP `stats` parity
+  counter nits; TWCC reference-time is receive-wall-time only when arrivals
+  exist (documented in-code).
+
+Net after Task 59: **704 tests / 74 suites** (was 692/74) — proxy 29→39,
+sip-tx 19→20, sctp 63→64.

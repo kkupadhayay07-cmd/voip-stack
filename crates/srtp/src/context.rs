@@ -557,9 +557,13 @@ impl SrtpSession {
         self.profile
     }
 
-    /// Set the replay window size (RFC 3711 §3.3.3 default 64; ≤ 64).
+    /// Set the replay window size. RFC 3711 §3.3.3's default is 64, but the
+    /// RFC allows any window the receiver chooses; NACK-retransmission
+    /// interop (RFC 4585 verbatim retransmissions) needs windows of
+    /// thousands of packets (libwebrtc uses 4096), so the clamp admits
+    /// that class. The constructor default stays 64.
     pub fn set_window_size(&mut self, size: u64) {
-        self.window_size = size.clamp(1, 64);
+        self.window_size = size.clamp(1, 4096);
         for st in self.recv.values_mut() {
             st.replay = ReplayWindow::new(self.window_size);
         }

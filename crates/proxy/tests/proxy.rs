@@ -345,11 +345,16 @@ fn leg_transaction_drives_200_and_cleans_up() {
     assert_eq!(acts.len(), 1);
     assert!(matches!(&acts[0], Action::Send(SipMessage::Response(r), _) if r.code == 200));
 
-    // A retransmitted 200: the client tx feeds it to the Terminated state
-    // (no duplicate ACK), but §16.7 pass-through still forwards it — the
-    // upstream dialog layer owns duplicate-2xx absorption.
+    // A retransmitted 200: the leg's client tx absorbs it in Terminated
+    // (no duplicate ACK) and the tombstone (§16.7 step 5 — once a final
+    // was forwarded, nothing else forwards) drops it at the proxy layer:
+    // a re-forwarded 200 would confuse the upstream dialog layer's 2xx
+    // matching and duplicate the ACK targets.
     let acts = proxy.process_response(&resp200, "10.5.5.5:5060".parse().unwrap(), Instant::now());
-    assert_eq!(acts.len(), 1, "pass-through forward of the duplicate 200");
+    assert!(
+        acts.is_empty(),
+        "duplicate 200 is absorbed, not re-forwarded"
+    );
 
     // Timer D releases the leg (leak regression).
     proxy.poll(Instant::now() + Duration::from_secs(33));
@@ -985,4 +990,292 @@ fn dead_flow_430_loses_to_a_sibling_twoxx() {
     let acts = proxy.process_response(&resp200, "192.168.1.11:5060".parse().unwrap(), t0);
     assert_eq!(acts.len(), 1);
     assert!(matches!(&acts[0], Action::Send(SipMessage::Response(r), _) if r.code == 200));
+}
+
+// ---- Task 59 audit round regressions ----------------------------------
+
+/// §16.7 step 5: a sibling's non-2xx final arriving AFTER the fork's 200
+/// was forwarded must be dropped — not relayed upstream on an established
+/// dialog. The tombstone outlives the deleted server tx (2xx deletes it).
+#[test]
+fn late_final_after_2xx_is_dropped() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    two_targets(&mut proxy);
+    let req = invite_req("sip:bob@example.com", "bob");
+    let t0 = Instant::now();
+    let actions = proxy.process_request(&req, SRC, false, t0);
+    let fwds = forked_requests(&actions);
+    assert_eq!(fwds.len(), 2);
+
+    // Leg A answers 200 → forwarded immediately, server tx deleted.
+    let resp200 = leg_response(&fwds[0], 200, "OK");
+    let acts = proxy.process_response(&resp200, "192.168.1.10:5060".parse().unwrap(), t0);
+    assert_eq!(acts.len(), 1, "200 forwards");
+
+    // Leg B answers 486 later: MUST NOT forward (§16.7 step 5) — but the
+    // leg ACK still goes downstream so B stops retransmitting.
+    let resp486 = leg_response(&fwds[1], 486, "Busy Here");
+    let acts = proxy.process_response(&resp486, "192.168.1.11:5060".parse().unwrap(), t0);
+    assert_eq!(acts.len(), 1, "only the leg ACK flows");
+    assert!(matches!(&acts[0], Action::Send(SipMessage::Request(r), _) if r.method == Method::Ack));
+}
+
+/// A retransmission of the original INVITE after the fork completed (final
+/// forwarded, server tx deleted on the 2xx) must never re-fork — the
+/// tombstone replays the forwarded final instead (RFC 6026).
+#[test]
+fn retransmitted_invite_after_2xx_replays_final_not_refork() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    two_targets(&mut proxy);
+    let req = invite_req("sip:bob@example.com", "bob");
+    let t0 = Instant::now();
+    let actions = proxy.process_request(&req, SRC, false, t0);
+    let fwds = forked_requests(&actions);
+    let resp200 = leg_response(&fwds[0], 200, "OK");
+    proxy.process_response(&resp200, "192.168.1.10:5060".parse().unwrap(), t0);
+
+    // The upstream lost the 200 and retransmits the INVITE: the tombstone
+    // answers with the forwarded 200 — no re-fork, no second 100.
+    let acts = proxy.process_request(&req, SRC, false, t0 + Duration::from_millis(100));
+    assert_eq!(fork_targets(&acts).len(), 0, "no re-fork after completion");
+    assert_eq!(acts.len(), 1);
+    assert!(matches!(&acts[0], Action::Send(SipMessage::Response(r), _) if r.code == 200));
+
+    // The same after the tombstone window: still absorbed by nothing —
+    // this is a NEW transaction by definition (64·T1 of silence).
+    let acts = proxy.process_request(&req, SRC, false, t0 + T64 + Duration::from_secs(1));
+    assert_eq!(
+        fork_targets(&acts).len(),
+        2,
+        "post-window request forks fresh"
+    );
+}
+
+/// A second 200 on a NON-INVITE fork (both targets answered) must not be
+/// forwarded: the server tx in Completed retransmits its own final only
+/// (§17.2.2), and §16.7 step 5 forbids forwarding any other final.
+#[test]
+fn second_200_on_non_invite_fork_not_forwarded() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    two_targets(&mut proxy);
+    let req = RequestBuilder::new(
+        Method::Message,
+        SipUri::parse("sip:bob@example.com").unwrap(),
+    )
+    .via(TransportKind::Udp, "10.0.0.9:5060", Some("z9hG4bKmsg1"))
+    .from("<sip:alice@example.com>;tag=m1")
+    .to("<sip:bob@example.com>")
+    .call_id(Some("msg-call-1"))
+    .cseq(1)
+    .build();
+    let t0 = Instant::now();
+    let actions = proxy.process_request(&req, SRC, false, t0);
+    let fwds = forked_requests(&actions);
+    assert_eq!(fwds.len(), 2);
+
+    let resp1 = leg_response(&fwds[0], 200, "OK");
+    let acts = proxy.process_response(&resp1, "192.168.1.10:5060".parse().unwrap(), t0);
+    assert_eq!(acts.len(), 1, "first 200 forwards");
+
+    let resp2 = leg_response(&fwds[1], 200, "OK");
+    let acts = proxy.process_response(&resp2, "192.168.1.11:5060".parse().unwrap(), t0);
+    assert!(acts.is_empty(), "second 200 on the fork is absorbed");
+}
+
+/// An ACK with Max-Forwards: 0 skips the §16.3 483 check (an ACK is never
+/// answered) and MUST NOT underflow the decrement — a u32 wrap would
+/// inject Max-Forwards: 4294967295 into the forwarded copy.
+#[test]
+fn ack_with_max_forwards_zero_does_not_underflow() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    proxy
+        .routes
+        .exact
+        .insert("bob".into(), vec!["10.5.5.5:5060".into()]);
+    let invite = invite_req("sip:bob@example.com", "bob");
+    let t0 = Instant::now();
+    let actions = proxy.process_request(&invite, SRC, false, t0);
+    let fwd = forked_requests(&actions).remove(0);
+
+    // 2xx + the generic-ACK path (the ACK mirrors the 200's Via stack —
+    // built here from the forwarded request, single Via).
+    let resp200 = leg_response(&fwd, 200, "OK");
+    proxy.process_response(&resp200, "10.5.5.5:5060".parse().unwrap(), t0);
+    let mut ack = RequestBuilder::new(Method::Ack, fwd.uri.clone())
+        .via(TransportKind::Udp, "10.0.0.9:5060", Some("z9hG4bKack1"))
+        .from("<sip:bob@example.com>;tag=c1")
+        .to("<sip:bob@example.com>;tag=t")
+        .call_id(Some("pcall-1"))
+        .cseq(1)
+        .build();
+    ack.headers.remove_all("Max-Forwards");
+    ack.headers.add("Max-Forwards", "0");
+    let acts = proxy.process_request(&ack, SRC, false, t0);
+    let ack_fwd = forked_requests(&acts)
+        .into_iter()
+        .next()
+        .expect("ACK forwarded by the generic path");
+    assert_eq!(
+        ack_fwd.headers.max_forwards(),
+        Some(0),
+        "saturating decrement — no u32 wrap"
+    );
+}
+
+/// §16.10: a CANCEL with NO matching INVITE state (no pending legs, no
+/// live server tx, no tombstone) is answered 481 — not 200.
+#[test]
+fn cancel_without_state_answers_481() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    let cancel = RequestBuilder::new(
+        Method::Cancel,
+        SipUri::parse("sip:bob@example.com").unwrap(),
+    )
+    .via(TransportKind::Udp, "10.0.0.9:5060", Some("z9hG4bKcancel-x"))
+    .from("<sip:alice@example.com>;tag=c9")
+    .to("<sip:bob@example.com>")
+    .call_id(Some("ghost-call"))
+    .cseq(3)
+    .build();
+    let acts = proxy.process_request(&cancel, SRC, false, Instant::now());
+    assert_eq!(acts.len(), 1);
+    assert!(matches!(&acts[0], Action::Send(SipMessage::Response(r), _) if r.code == 481));
+}
+
+/// §9.1/§16.7 step 2: a CANCEL targets only PENDING legs (Trying/
+/// Proceeding). A leg that already answered 486 gets no spurious CANCEL;
+/// the CANCEL itself is still 200ed (the fork is alive via the sibling).
+#[test]
+fn cancel_targets_only_pending_legs() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    two_targets(&mut proxy);
+    let req = invite_req("sip:bob@example.com", "bob");
+    let t0 = Instant::now();
+    let actions = proxy.process_request(&req, SRC, false, t0);
+    let fwds = forked_requests(&actions);
+
+    // Leg A completed with 486; leg B is still ringing.
+    let resp486 = leg_response(&fwds[0], 486, "Busy Here");
+    proxy.process_response(&resp486, "192.168.1.10:5060".parse().unwrap(), t0);
+
+    let cancel = RequestBuilder::new(
+        Method::Cancel,
+        SipUri::parse("sip:bob@example.com").unwrap(),
+    )
+    .via(TransportKind::Udp, "10.0.0.9:5060", Some("z9hG4bKp1"))
+    .from("<sip:bob@example.com>;tag=c1")
+    .to("<sip:bob@example.com>")
+    .call_id(Some("pcall-1"))
+    .cseq(1)
+    .build();
+    let acts = proxy.process_request(&cancel, SRC, false, t0);
+    let cancels: Vec<&SipMessage> = acts
+        .iter()
+        .filter_map(|a| match a {
+            Action::Send(m, _) if matches!(m, SipMessage::Request(r) if r.method == Method::Cancel) => Some(m),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cancels.len(), 1, "only the pending leg is CANCELed");
+    assert!(acts
+        .iter()
+        .any(|a| matches!(a, Action::Send(SipMessage::Response(r), _) if r.code == 200)));
+}
+
+/// §16.7 step 1: a response whose top Via is not ours never traversed
+/// this proxy — it is discarded, never relayed (no response amplification
+/// through a forged top Via).
+#[test]
+fn foreign_response_is_discarded() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    two_targets(&mut proxy);
+    let req = invite_req("sip:bob@example.com", "bob");
+    let actions = proxy.process_request(&req, SRC, false, Instant::now());
+    let fwd = forked_requests(&actions).remove(0);
+
+    // Build a response that does NOT mirror our Via stack (a forged top
+    // via from somewhere else entirely).
+    let forged = respond_to(&fwd, 200, "OK", Vec::new(), None);
+    let mut forged = forged;
+    forged.headers.remove_all("Via");
+    forged
+        .headers
+        .add("Via", "SIP/2.0/UDP evil.example.com;branch=z9hG4bKforged");
+    let acts = proxy.process_response(&forged, "203.0.113.9:5060".parse().unwrap(), Instant::now());
+    assert!(acts.is_empty(), "a foreign response is silently discarded");
+}
+
+/// The Via a fork leg stamps must name the transport the request is
+/// actually sent on (§18.1.1): a flow (reliable) target gets a TCP Via,
+/// a UDP target a UDP Via.
+#[test]
+fn via_transport_matches_leg_transport() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    proxy
+        .reliable_targets
+        .insert("10.7.7.7:5060".parse().unwrap());
+    proxy.routes.exact.insert(
+        "bob".into(),
+        vec!["10.7.7.7:5060".into(), "192.168.1.11:5060".into()],
+    );
+    let actions = proxy.process_request(
+        &invite_req("sip:bob@example.com", "bob"),
+        SRC,
+        false,
+        Instant::now(),
+    );
+    let fwds = forked_requests(&actions);
+    assert_eq!(fwds.len(), 2);
+    let top_via_flow = &fwds[0].headers.get_all("Via")[0];
+    let top_via_udp = &fwds[1].headers.get_all("Via")[0];
+    assert!(
+        top_via_flow.contains("SIP/2.0/TCP"),
+        "flow leg stamps TCP: {top_via_flow}"
+    );
+    assert!(
+        top_via_udp.contains("SIP/2.0/UDP"),
+        "udp leg stamps UDP: {top_via_udp}"
+    );
+}
+
+/// A reliable (flow) leg must be released after its 2xx: Timer D arms on
+/// every transport since the leak fix, so poll() removes the leg instead
+/// of leaking it forever (no deadline = no DeleteTransaction ever).
+#[test]
+fn reliable_leg_removed_after_2xx_by_poll() {
+    let mut proxy = Proxy::new(ProxyConfig::default());
+    proxy
+        .reliable_targets
+        .insert("10.7.7.7:5060".parse().unwrap());
+    proxy
+        .routes
+        .exact
+        .insert("bob".into(), vec!["10.7.7.7:5060".into()]);
+    let t0 = Instant::now();
+    let actions = proxy.process_request(&invite_req("sip:bob@example.com", "bob"), SRC, false, t0);
+    let fwd = forked_requests(&actions).remove(0);
+    assert_eq!(proxy.leg_count(), 1);
+
+    let resp200 = leg_response(&fwd, 200, "OK");
+    let acts = proxy.process_response(&resp200, "10.7.7.7:5060".parse().unwrap(), t0);
+    assert_eq!(acts.len(), 1, "200 forwards");
+    assert_eq!(proxy.leg_count(), 1, "still retained until Timer D");
+
+    proxy.poll(t0 + T64);
+    assert_eq!(proxy.leg_count(), 0, "Timer D releases the reliable leg");
+}
+
+/// Target resolution handles bracketed IPv6, bare IPv6 and IPv4:port — a
+/// bare v6 literal must not be split at its last colon into a bogus port.
+#[test]
+fn resolve_target_parses_ipv6() {
+    use proxy::resolve_target;
+    let v6p = resolve_target("[2001:db8::1]:5070", 5060);
+    assert_eq!(v6p.to_string(), "[2001:db8::1]:5070");
+    let v6 = resolve_target("2001:db8::1", 5060);
+    assert_eq!(v6.to_string(), "[2001:db8::1]:5060");
+    let v4 = resolve_target("sip:alice@10.1.2.3:6060", 5060);
+    assert_eq!(v4.to_string(), "10.1.2.3:6060");
+    let host = resolve_target("sip:alice@host.example.com", 5060);
+    assert_eq!(host.port(), 5060);
 }

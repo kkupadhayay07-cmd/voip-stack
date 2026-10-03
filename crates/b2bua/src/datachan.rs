@@ -186,12 +186,15 @@ async fn run(
     send_sctp(&mut dtls, &mut sctp, &socket, remote, &stats).await;
 
     let mut app_buf = vec![0u8; APP_BUF_SIZE];
-    let mut timer: Option<tokio::time::Instant> = None;
 
     loop {
-        if timer.is_none() {
-            timer = sctp.poll_timeout().map(tokio::time::Instant::from_std);
-        }
+        // Recompute the deadline EVERY iteration: inputs that create a
+        // NEWER deadline than the one currently being slept on (a channel
+        // close's RFC 6525 retransmission timer, an inbound-loss T3, an
+        // FTSN ride-along) must wake the select immediately, not after the
+        // stale earlier deadline elapses.
+        let mut timer: Option<tokio::time::Instant> =
+            sctp.poll_timeout().map(tokio::time::Instant::from_std);
         tokio::select! {
             rec = inbound.recv() => {
                 match rec {

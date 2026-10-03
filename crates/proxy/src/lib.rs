@@ -37,7 +37,13 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// How long a completed fork's tombstone (the last forwarded final) is
+/// kept to absorb retransmissions of the original request — 64·T1, the
+/// RFC 3261 retransmission window (Timer B/F span). After this, a
+/// repeated request is genuinely new state, not a retransmission.
+const RETRANSMIT_WINDOW: Duration = Duration::from_secs(32);
 
 use sip_core::builder::respond_to;
 use sip_core::ids::new_branch;
@@ -238,6 +244,15 @@ pub struct Proxy {
     /// server-transaction key. Forwarded as the "best" final once every leg
     /// terminates (§16.7 step 6).
     contexts: HashMap<String, Vec<Response>>,
+    /// Tombstones for COMPLETED forks (§16.7 step 5: once a final response
+    /// has been forwarded, the proxy MUST NOT forward any other final).
+    /// server_key → (the forwarded final, when). Survives the server
+    /// transaction's own deletion (the 2xx path deletes it immediately),
+    /// so a late final from a sibling leg cannot leak through the
+    /// pass-through path and a retransmitted original request is answered
+    /// with the forwarded final instead of re-forking (RFC 6026). Entries
+    /// expire after [`RETRANSMIT_WINDOW`] via [`Proxy::poll`].
+    completed: HashMap<String, (Response, Instant)>,
     /// Fork targets that are RFC 5626 flows (reliable-transport
     /// registrations): legs toward them use the reliable timer class and
     /// the transport confirms delivery / reports flow failure (§5.2).
@@ -254,9 +269,15 @@ impl Proxy {
             legs: HashMap::new(),
             server_txs: HashMap::new(),
             contexts: HashMap::new(),
+            completed: HashMap::new(),
             reliable_targets: std::collections::HashSet::new(),
             bindings: HashMap::new(),
         }
+    }
+
+    /// Number of completed-fork tombstones currently retained.
+    pub fn completed_count(&self) -> usize {
+        self.completed.len()
     }
 
     /// Number of live downstream fork legs (per-leg client transactions).
@@ -445,11 +466,14 @@ impl Proxy {
         None
     }
 
-    /// CANCEL processing (§16.7 step 2): one generated CANCEL per pending
-    /// fork leg — built from the leg's forked INVITE so the top Via branch
-    /// matches what the leg received (RFC 3261 §9.1) — plus a 200 for the
-    /// CANCEL itself, sent through the CANCEL's own server transaction so
-    /// retransmitted CANCELs are absorbed and re-answered.
+    /// CANCEL processing (§16.7 step 2): one generated CANCEL per PENDING
+    /// fork leg (tx in Trying/Proceeding — §9.1 authorizes CANCELs only for
+    /// pending transactions) — built from the leg's forked INVITE so the
+    /// top Via branch matches what the leg received (RFC 3261 §9.1) — plus
+    /// a 200 for the CANCEL itself through the CANCEL's own server
+    /// transaction so retransmitted CANCELs are absorbed and re-answered.
+    /// A CANCEL that matches no live INVITE state (no pending legs, no live
+    /// INVITE server tx, no completed tombstone) is answered 481 (§16.10).
     fn process_cancel(
         &mut self,
         req: &Request,
@@ -466,14 +490,17 @@ impl Proxy {
             .and_then(|v| v.branch.clone())
             .unwrap_or_default();
 
-        // One CANCEL per forked leg, generated from THAT leg's forked
-        // INVITE (same branch/Route/Request-URI/Call-ID/From/To/CSeq-seq,
-        // method CANCEL — §16.7 step 2 + §9.1).
+        // One CANCEL per forked leg still in Trying/Proceeding, generated
+        // from THAT leg's forked INVITE (same branch/Route/Request-URI/
+        // Call-ID/From/To/CSeq-seq, method CANCEL — §16.7 step 2 + §9.1).
         let leg_keys: Vec<String> = self
             .legs
             .iter()
             .filter(|(_, l)| {
-                l.call_id == call_id && l.incoming_branch == incoming_branch && l.tx.is_invite()
+                l.call_id == call_id
+                    && l.incoming_branch == incoming_branch
+                    && l.tx.is_invite()
+                    && matches!(l.tx.state(), TxState::Trying | TxState::Proceeding)
             })
             .map(|(k, _)| k.clone())
             .collect();
@@ -485,10 +512,23 @@ impl Proxy {
             actions.push(Action::Send(SipMessage::Request(cancel), leg.target));
         }
 
-        // 200 the CANCEL locally (§16.7 step 2), through its server
-        // transaction so retransmissions are absorbed and re-answered.
+        // §16.10: a stateful proxy answers 481 when it has NO matching
+        // transaction state — no pending legs, no live INVITE server tx,
+        // and no tombstone for a fork that just completed. The CANCEL's
+        // own server tx still absorbs its retransmissions (§17.2.2).
+        let cseq = req.headers.cseq().map(|c| c.seq).unwrap_or(0);
+        let invite_key = format!("{call_id}|{incoming_branch}|INVITE|{cseq}");
+        let fork_alive = !leg_keys.is_empty()
+            || self.server_txs.contains_key(&invite_key)
+            || self.completed.contains_key(&invite_key);
+        let code = if fork_alive { 200 } else { 481 };
+        let reason = if fork_alive {
+            "OK"
+        } else {
+            "Call/Transaction Does Not Exist"
+        };
         self.create_server_tx(req, source, reliable);
-        actions.extend(self.respond_local(req, source, 200, "OK", now));
+        actions.extend(self.respond_local(req, source, code, reason, now));
         actions
     }
 
@@ -531,10 +571,14 @@ impl Proxy {
 
         self.add_record_route(&mut base);
 
-        // Decrement Max-Forwards (§16.6 step 3).
+        // Decrement Max-Forwards (§16.6 step 3). Saturating: an ACK with
+        // Max-Forwards: 0 skips the §16.3 483 check (an ACK is never
+        // answered) and must not underflow here — a u32 wrap would inject
+        // Max-Forwards: 4294967295 into the forwarded copy.
         let mf = base.headers.max_forwards().unwrap_or(70);
         base.headers.remove_all("Max-Forwards");
-        base.headers.add("Max-Forwards", (mf - 1).to_string());
+        base.headers
+            .add("Max-Forwards", mf.saturating_sub(1).to_string());
 
         (base, incoming_branch)
     }
@@ -569,9 +613,22 @@ impl Proxy {
 
         // Retransmission absorption (§17.2): a repeated request must NOT
         // fork again — its server transaction re-sends the staged response.
+        // When the fork already COMPLETED (final forwarded, server tx gone),
+        // the tombstone answers with the forwarded final — a retransmission
+        // of the original INVITE must never fork a second time (RFC 6026).
         if !is_ack {
             if let Some(actions) = self.absorb_retransmission(req, source, now) {
                 return actions;
+            }
+            if let Some(key) = Self::server_key_from_req(req) {
+                if let Some((last, at)) = self.completed.get(&key) {
+                    // The window is enforced at LOOKUP (poll only bulk-sweeps
+                    // the map): a request arriving after 64·T1 of silence is
+                    // new state even before the next sweep retires it.
+                    if now.saturating_duration_since(*at) < RETRANSMIT_WINDOW {
+                        return vec![Action::Send(SipMessage::Response(last.clone()), source)];
+                    }
+                }
             }
         }
 
@@ -616,18 +673,32 @@ impl Proxy {
         for t in &targets {
             let target = resolve_target(t, self.config.default_port);
             let branch = new_branch();
-            let fwd = prepend_via(base.clone(), &make_via(PROXY_VIA_HOST, &branch).to_string());
 
             if is_ack {
+                // An ACK copy carries the same UDP Via the fork used (ACK
+                // routing never creates transaction state); flow-target ACK
+                // copies are transport-agnostic because the response that
+                // triggered the ACK already reached the upstream.
+                let fwd = prepend_via(
+                    base.clone(),
+                    &make_via(PROXY_VIA_HOST, &branch, Transport::Udp).to_string(),
+                );
                 actions.push(Action::Send(SipMessage::Request(fwd), target));
                 continue;
             }
 
+            // §18.1.1: the Via sent-by transport must name the transport the
+            // request is actually sent on — a flow (reliable) leg stamps
+            // TCP so the peer's responses route back over the flow.
             let transport = if self.reliable_targets.contains(&target) {
                 Transport::Tcp
             } else {
                 Transport::Udp
             };
+            let fwd = prepend_via(
+                base.clone(),
+                &make_via(PROXY_VIA_HOST, &branch, transport).to_string(),
+            );
             let (tx, key) = if req.method == Method::Invite {
                 let mut tx = ClientInviteTx::new(fwd.clone(), transport);
                 for a in tx.on_event(TxEvent::Send, now) {
@@ -712,6 +783,20 @@ impl Proxy {
         let Some(ours) = resp.headers.first_via().and_then(|v| v.branch.clone()) else {
             return Vec::new(); // not ours (no Via branch) — drop
         };
+        // §16.7 step 1: a response that matches no client transaction this
+        // proxy created is silently discarded. Every response traversing us
+        // carries OUR Via host on top (stamped on the forked request and
+        // echoed by the leg) — anything else never traversed this proxy and
+        // MUST NOT be relayed (a forged top Via would otherwise turn the
+        // proxy into a one-shot response amplifier).
+        let top_host = resp
+            .headers
+            .first_via()
+            .map(|v| v.sent_by.host.to_string())
+            .unwrap_or_default();
+        if top_host != PROXY_VIA_HOST {
+            return Vec::new();
+        }
         let call_id = resp.headers.call_id().unwrap_or("").to_string();
         let method = resp
             .headers
@@ -774,13 +859,33 @@ impl Proxy {
         // top Via is now the upstream's own — the server key's branch).
         let derived_key = Self::server_key_from_popped(&resp, &method);
 
+        // §16.7 step 5: once a final response has been forwarded for this
+        // fork, nothing else forwards. The tombstone outlives the deleted
+        // server transaction (the 2xx path deletes it on send), closing the
+        // fork race where a sibling's 486/200 arrives after our 200 — it
+        // must be dropped, not relayed upstream on an established dialog.
+        if code >= 200
+            && server_key
+                .as_ref()
+                .or(derived_key.as_ref())
+                .is_some_and(|k| self.completed.contains_key(k))
+        {
+            // The leg ACK still goes downstream (§17.1.1) so the leg's own
+            // retransmission timer stops.
+            let mut actions = Vec::new();
+            if let Some((ack, target)) = ack_to_leg {
+                actions.push(Action::Send(SipMessage::Request(ack), target));
+            }
+            return actions;
+        }
+
         // 3) Forward per §16.7 step 5:
         //    - any provisional other than 100 → immediately
         //    - any 2xx → immediately
         //    - non-2xx finals (incl. 6xx) → stored in the response context;
         //      6xx additionally CANCELs the still-pending sibling legs
-        //    - once a final was forwarded on the server tx, ONLY a 2xx to an
-        //      INVITE still forwards (a stray late non-2xx is dropped)
+        //    - once a final was forwarded on the server tx, NOTHING else
+        //      forwards (a stray late non-2xx is dropped — tombstone above)
         let mut actions = Vec::new();
         let is_2xx = (200..300).contains(&code);
         let is_final = code >= 200;
@@ -827,11 +932,13 @@ impl Proxy {
         let mut staged = false;
         if let Some(k) = server_key.as_ref().or(derived_key.as_ref()) {
             if let Some(sv) = self.server_txs.get_mut(k) {
-                // After a final was sent on the server tx, only a 2xx to an
-                // INVITE forwards (§16.7 step 5).
+                // §16.7 step 5: after ANY final was sent on the server tx,
+                // nothing else forwards — the tx retransmits its own final
+                // (Timer G/J) and MUST NOT send a different response
+                // (§17.2.2). A second 200 on a fork race is absorbed here.
                 let final_already =
                     matches!(sv.tx.state(), TxState::Completed | TxState::Terminated);
-                let forwards_now = (!final_already || is_2xx) && code != 100;
+                let forwards_now = !final_already && code != 100;
                 if forwards_now {
                     sv.tx.stage(resp.clone());
                     for a in sv.tx.on_event(TxEvent::Send, now) {
@@ -844,6 +951,11 @@ impl Proxy {
                         }
                     }
                     staged = true;
+                    // A forwarded final completes the fork: tombstone it so
+                    // late finals and retransmitted originals are absorbed.
+                    if code >= 200 {
+                        self.completed.insert(k.clone(), (resp.clone(), now));
+                    }
                 }
             }
         }
@@ -945,6 +1057,11 @@ impl Proxy {
                 respond_to(sv.tx.request(), 408, "Request Timeout", Vec::new(), None)
             }
         };
+        // The best final is now THE final (§16.7 step 5): tombstone the fork
+        // so later finals are dropped and a retransmitted original request
+        // gets this response replayed instead of re-forking.
+        self.completed
+            .insert(server_key.to_string(), (resp.clone(), now));
         sv.tx.stage(resp);
         let mut actions = Vec::new();
         for a in sv.tx.on_event(TxEvent::Send, now) {
@@ -1014,6 +1131,11 @@ impl Proxy {
     /// (Timer H/I/J). Returns the actions to execute.
     pub fn poll(&mut self, now: Instant) -> Vec<Action> {
         let mut actions = Vec::new();
+
+        // Tombstones expire once the retransmission window has passed: a
+        // repeated request after this is new state, not a retransmission.
+        self.completed
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) < RETRANSMIT_WINDOW);
 
         // Upstream-facing server transactions.
         let mut dead: Vec<String> = Vec::new();
@@ -1233,8 +1355,10 @@ fn dest_from_via(resp: &Response) -> Option<SocketAddr> {
 }
 
 /// Resolve a target string ("host" / "host:port" / "user@host") to a
-/// SocketAddr.
-fn resolve_target(target: &str, default_port: u16) -> SocketAddr {
+/// SocketAddr. Handles bracketed IPv6 ("[2001:db8::1]:5060"), bare IPv6
+/// (no port — ambiguous with a port suffix, so the default port applies),
+/// and IPv4/host:port forms.
+pub fn resolve_target(target: &str, default_port: u16) -> SocketAddr {
     let host_port = target
         .rsplit('@')
         .next()
@@ -1244,11 +1368,28 @@ fn resolve_target(target: &str, default_port: u16) -> SocketAddr {
     let host_port = host_port.strip_prefix("sip:").unwrap_or(host_port);
     let host_port = host_port.split(';').next().unwrap_or(host_port);
     // Strip params like ;transport=tcp
-    let (host, port) = match host_port.rsplit_once(':') {
-        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => {
-            (h, p.parse().unwrap_or(default_port))
+    let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
+        // Bracketed IPv6 literal: [v6] or [v6]:port.
+        match rest.split_once(']') {
+            Some((h, tail)) => {
+                let p = tail
+                    .strip_prefix(':')
+                    .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+                    .and_then(|t| t.parse::<u16>().ok());
+                (h, p.unwrap_or(default_port))
+            }
+            None => (host_port, default_port),
         }
-        _ => (host_port, default_port),
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((h, p)) if !h.contains(':') && p.chars().all(|c| c.is_ascii_digit()) => {
+                (h, p.parse().unwrap_or(default_port))
+            }
+            // A bare IPv6 literal contains colons and (without brackets)
+            // cannot carry a port suffix — take it whole.
+            _ if host_port.contains(':') => (host_port, default_port),
+            _ => (host_port, default_port),
+        }
     };
     let ip: std::net::IpAddr = host
         .parse()
@@ -1258,9 +1399,15 @@ fn resolve_target(target: &str, default_port: u16) -> SocketAddr {
 
 use sip_core::headers::Via;
 
-/// Build a Via header for this proxy hop.
-fn make_via(host_port: &str, branch: &str) -> Via {
-    let text = format!("SIP/2.0/UDP {host_port};branch={branch}");
+/// Build a Via header for this proxy hop. `transport` names the transport
+/// the forked request is actually sent on (§18.1.1 — the sent-by transport
+/// must match, so responses route back over the right transport).
+fn make_via(host_port: &str, branch: &str, transport: Transport) -> Via {
+    let t = match transport {
+        Transport::Udp => "UDP",
+        _ => "TCP", // reliable legs in this proxy are flow (TCP-class) legs
+    };
+    let text = format!("SIP/2.0/{t} {host_port};branch={branch}");
     Via::parse(&text).expect("static via text parses")
 }
 

@@ -1906,6 +1906,10 @@ impl SctpEndpoint {
                 }
             }
             self.channels.remove(&s);
+            // Our own SSNs for this stream restart at 0 (RFC 8831 §6.7 id
+            // reuse): the old FORWARD-TSN skip point must not suppress the
+            // reused stream's skips.
+            self.ftsn_reported.remove(&s);
         }
         self.start_next_reciprocal(now);
     }
@@ -2013,6 +2017,12 @@ impl SctpEndpoint {
             // Received-but-undelivered data on the stream is discarded.
             self.pre_dcep.remove(&stream);
             self.ordered.insert(stream, OrderedBuf::default());
+            // The stream's SSNs restart at 0 after the reset (RFC 6525
+            // §5.2.2 E3) — a stale FORWARD-TSN skip point recorded BEFORE
+            // the reset would suppress the new stream's skips (ssn_le(0,
+            // stale) is always true) and permanently stall ordered delivery
+            // after an id is reused.
+            self.ftsn_reported.remove(&stream);
             let stale: Vec<u32> = self
                 .ofo
                 .iter()
@@ -2179,12 +2189,16 @@ impl SctpEndpoint {
             for c in self.inflight.iter_mut() {
                 if c.sent && !c.abandoned {
                     c.retransmits += 1;
-                    self.stats.retransmits_tx += 1;
                     if let Policy::MaxRetrans(n) = c.policy {
                         if c.retransmits > n {
+                            // Abandoned in this same pass: the chunk is
+                            // retired, NOT retransmitted — it must not
+                            // inflate the retransmission counter.
                             exhausted.push(c.msg_id);
+                            continue;
                         }
                     }
+                    self.stats.retransmits_tx += 1;
                 }
             }
             for msg in exhausted {
@@ -2290,6 +2304,11 @@ impl SctpEndpoint {
                         }
                     }
                     self.channels.remove(&s);
+                    // Same id-reuse hygiene as the success path: the reset
+                    // never completed, but the channel is gone and the peer
+                    // may free the id — our stale skip point must not
+                    // suppress the reused stream's FORWARD-TSN skips.
+                    self.ftsn_reported.remove(&s);
                 }
             } else {
                 let (rsn, streams) = {
